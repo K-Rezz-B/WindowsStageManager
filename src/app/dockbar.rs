@@ -50,6 +50,10 @@ pub(super) struct DockUi {
     clock: (String, String),
     /// Volume (entre 0 et 1) et son coupé, relus chaque seconde.
     volume: Option<(f32, bool)>,
+    /// Le curseur de volume est ouvert au-dessus de l'horloge.
+    slider_open: bool,
+    /// On fait glisser le curseur de volume.
+    slider_drag: bool,
 }
 
 /// Les boutons des panneaux collés au Dock.
@@ -60,6 +64,10 @@ enum Control {
     Next,
     Volume,
     Clock,
+    /// Haut-parleur du curseur de volume : coupe ou rétablit le son.
+    Mute,
+    /// Piste du curseur de volume.
+    Slider,
 }
 
 /// Panneaux collés au Dock : le lecteur à gauche (s'il y a de la musique), l'horloge à droite.
@@ -70,10 +78,36 @@ struct Panels {
     volume: RECT,
     /// Heure et date.
     time: RECT,
+    /// Curseur de volume, ouvert au-dessus de l'horloge.
+    slider: Option<SliderLayout>,
+}
+
+struct SliderLayout {
+    panel: RECT,
+    mute: RECT,
+    track: RECT,
+    /// Zone cliquable de la piste, plus haute que la piste elle-même.
+    hit: RECT,
+    percent: RECT,
+}
+
+impl SliderLayout {
+    /// Volume correspondant à l'abscisse `x` sur la piste.
+    fn level_at(&self, x: i32) -> f32 {
+        ((x - self.track.left) as f32 / (self.track.right - self.track.left).max(1) as f32).clamp(0.0, 1.0)
+    }
 }
 
 impl Panels {
     fn control_at(&self, pt: POINT) -> Option<Control> {
+        if let Some(s) = &self.slider {
+            if contains(s.mute, pt) {
+                return Some(Control::Mute);
+            }
+            if contains(s.hit, pt) {
+                return Some(Control::Slider);
+            }
+        }
         if let Some(p) = &self.player {
             for (rect, control) in [(p.previous, Control::Previous), (p.button, Control::PlayPause), (p.next, Control::Next)] {
                 if contains(rect, pt) {
@@ -107,6 +141,8 @@ impl DockUi {
             tracking: false,
             trash_full: false,
             hover_control: None,
+            slider_open: false,
+            slider_drag: false,
             clock: clock_text(),
             volume: None,
         }
@@ -336,7 +372,19 @@ impl App {
             let progress = RECT { top: cy + s(17), bottom: cy + s(20), ..title };
             PlayerLayout { panel, art, title, artist, previous, button, next, progress }
         });
-        Panels { player, clock, volume, time }
+        // Curseur de volume : plaque centrée au-dessus de l'horloge.
+        let slider = self.dock.slider_open.then(|| {
+            let (w, h) = (s(250), s(46));
+            let cx = (clock.left + clock.right) / 2;
+            let panel = RECT { left: cx - w / 2, top: clock.top - s(10) - h, right: cx + w / 2, bottom: clock.top - s(10) };
+            let mid = (panel.top + panel.bottom) / 2;
+            let mute = RECT { left: panel.left + s(6), top: mid - s(17), right: panel.left + s(40), bottom: mid + s(17) };
+            let percent = RECT { left: panel.right - s(52), top: panel.top, right: panel.right - s(10), bottom: panel.bottom };
+            let track = RECT { left: mute.right + s(8), top: mid - s(3), right: percent.left - s(10), bottom: mid + s(3) };
+            let hit = RECT { left: track.left - s(8), top: panel.top, right: track.right + s(8), bottom: panel.bottom };
+            SliderLayout { panel, mute, track, hit, percent }
+        });
+        Panels { player, clock, volume, time, slider }
     }
 
     /// Disposition actuelle du Dock et de ses panneaux, en coordonnées de sa fenêtre.
@@ -421,6 +469,32 @@ impl App {
         }
         let (level, muted) = self.dock.volume.unwrap_or((0.0, false));
         draw_volume(&mut canvas, panels.volume, level, muted, dpi);
+        // Curseur de volume au-dessus de l'horloge.
+        if let Some(sl) = &panels.slider {
+            // Zone invisible mais « pleine » entre l'horloge et le curseur : la souris peut passer
+            // de l'un à l'autre sans quitter le Dock (ce qui fermerait le curseur).
+            let bridge = RECT { left: sl.panel.left.min(panels.clock.left), top: sl.panel.top, right: sl.panel.right.max(panels.clock.right), bottom: panels.clock.bottom };
+            canvas.round_rect(bridge, 0, (0, 0, 0), 1);
+            plate(&mut canvas, sl.panel, s(16) as f32, &look);
+            if self.dock.hover_control == Some(Control::Mute) {
+                canvas.round_rect(sl.mute, (sl.mute.right - sl.mute.left) / 2, white, 40);
+            }
+            draw_volume(&mut canvas, sl.mute, level, muted, dpi);
+            let track = sl.track;
+            let radius = (track.bottom - track.top) / 2;
+            canvas.round_rect(track, radius, white, 70);
+            let x = track.left + ((track.right - track.left) as f32 * level).round() as i32;
+            let fill = if muted { 120 } else { 240 };
+            if x > track.left {
+                canvas.round_rect(RECT { right: x.max(track.left + 2 * radius), ..track }, radius, white, fill);
+            }
+            // Bouton rond, avec une ombre douce.
+            let knob = s(16);
+            let cy = (track.top + track.bottom) / 2;
+            let knob_rect = RECT { left: x - knob / 2, top: cy - knob / 2, right: x + knob / 2, bottom: cy + knob / 2 };
+            canvas.round_rect(offset(inflate(knob_rect, s(1)), 0, s(1)), knob / 2 + s(1), (0, 0, 0), 70);
+            canvas.round_rect(knob_rect, knob / 2, white, 255);
+        }
         if let Some(x) = layout.separator {
             canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
         }
@@ -447,7 +521,7 @@ impl App {
             None => "Aucune sortie audio".to_owned(),
         };
         let label = match self.dock.hover_control {
-            Some(Control::Volume) => Some((volume_label.as_str(), panels.volume)),
+            Some(Control::Volume) if !self.dock.slider_open => Some((volume_label.as_str(), panels.volume)),
             _ => self.dock.model.hover.and_then(|i| Some((self.dock.model.items.get(i)?.name.as_str(), *layout.icons.get(i)?))),
         };
         let label_box = label.map(|(name, rect)| {
@@ -470,6 +544,12 @@ impl App {
                 let mut text: Vec<u16> = name.encode_utf16().collect();
                 let mut rect = r;
                 DrawTextW(dc, &mut text, &mut rect, centered);
+            }
+            // Pourcentage du curseur de volume.
+            if let Some(sl) = &panels.slider {
+                SelectObject(dc, self.font);
+                let text = if muted { "—".to_owned() } else { format!("{} %", (level * 100.0).round()) };
+                draw_text(dc, &text, sl.percent, centered, TEXT, 0);
             }
             // Horloge : l'heure en gras, la date en dessous.
             let c = panels.time;
@@ -529,6 +609,10 @@ impl App {
                     };
                     self.dock.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
                 }
+                if self.dock.slider_drag {
+                    self.drag_volume(pt.x);
+                    return;
+                }
                 let hover = self.dock_hit(pt.x as f32, pt.y);
                 // Le Dock ne grossit que sous la souris, pas quand elle passe sur le lecteur ou
                 // l'horloge.
@@ -540,9 +624,82 @@ impl App {
                 self.dock.tracking = false;
                 self.dock.model.set_hover(None, None);
                 self.dock.hover_control = None;
+                // La souris quitte le Dock : le curseur de volume se referme (sauf en plein glisser).
+                if !self.dock.slider_drag {
+                    self.dock.slider_open = false;
+                }
                 self.render_dock();
             }
+            WM_LBUTTONDOWN => {
+                if self.dock_panels().control_at(pt) == Some(Control::Slider) {
+                    self.dock.slider_drag = true;
+                    unsafe {
+                        // Garde la souris même si elle sort de la piste en glissant.
+                        SetCapture(self.dock.hwnd);
+                    }
+                    self.drag_volume(pt.x);
+                }
+            }
+            WM_LBUTTONUP if self.dock.slider_drag => {
+                self.dock.slider_drag = false;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
             WM_LBUTTONUP => match self.dock_panels().control_at(pt) {
+                // Clic sur l'icône du volume : ouvre ou ferme le curseur.
+                Some(Control::Volume) => {
+                    self.dock.slider_open = !self.dock.slider_open;
+                    self.dock.volume = volume::get();
+                    self.render_dock();
+                }
+                Some(Control::Mute) => {
+                    volume::toggle_mute();
+                    self.dock.volume = volume::get();
+                    self.render_dock();
+                }
+                Some(Control::Slider) => {}
+                // Ailleurs : le curseur se referme, et le clic fait son effet habituel.
+                control => {
+                    if self.dock.slider_open {
+                        self.dock.slider_open = false;
+                        self.render_dock();
+                    }
+                    self.dock_control_click(control, pt);
+                }
+            },
+            WM_MOUSEWHEEL => {
+                // La molette au-dessus de l'horloge (ou du curseur) règle le volume, par pas de 2 %.
+                // (Pour cette molette, Windows donne la position à l'écran.)
+                let win = self.dock.window;
+                let local = POINT { x: pt.x - win.left, y: pt.y - win.top };
+                let panels = self.dock_panels();
+                if contains(panels.clock, local) || panels.slider.as_ref().is_some_and(|s| contains(s.panel, local)) {
+                    let notches = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                    let (level, _) = volume::get().unwrap_or((0.0, false));
+                    volume::set(level + notches * 0.02);
+                    self.dock.volume = volume::get();
+                    if !self.dock.slider_open {
+                        self.dock.hover_control = Some(Control::Volume);
+                    }
+                    self.render_dock();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Règle le volume d'après la position de la souris sur la piste du curseur.
+    fn drag_volume(&mut self, x: i32) {
+        let Some(slider) = self.dock_panels().slider else { return };
+        volume::set(slider.level_at(x));
+        self.dock.volume = volume::get();
+        self.render_dock();
+    }
+
+    /// Clic sur un bouton du lecteur ou de l'horloge, ou sur une icône du Dock.
+    fn dock_control_click(&mut self, control: Option<Control>, pt: POINT) {
+        match control {
                 Some(Control::PlayPause) => {
                     self.media.toggle_play_pause();
                     // Affiché tout de suite, sans attendre la confirmation du lecteur.
@@ -553,34 +710,15 @@ impl App {
                 }
                 Some(Control::Previous) => self.media.previous(),
                 Some(Control::Next) => self.media.next(),
-                Some(Control::Volume) => {
-                    volume::toggle_mute();
-                    self.dock.volume = volume::get();
-                    self.render_dock();
-                }
                 // Comme l'horloge de la barre des tâches : calendrier et notifications.
                 Some(Control::Clock) => shell::open("ms-actioncenter:"),
+                // Gérés par `dock_mouse`.
+                Some(Control::Volume | Control::Mute | Control::Slider) => {}
                 None => {
                     if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
                         self.dock_click(index);
                     }
                 }
-            },
-            WM_MOUSEWHEEL => {
-                // La molette au-dessus de l'horloge règle le volume, par pas de 2 %.
-                // (Pour cette molette, Windows donne la position à l'écran.)
-                let win = self.dock.window;
-                let local = POINT { x: pt.x - win.left, y: pt.y - win.top };
-                if contains(self.dock_panels().clock, local) {
-                    let notches = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
-                    let (level, _) = volume::get().unwrap_or((0.0, false));
-                    volume::set(level + notches * 0.02);
-                    self.dock.volume = volume::get();
-                    self.dock.hover_control = Some(Control::Volume);
-                    self.render_dock();
-                }
-            }
-            _ => {}
         }
     }
 

@@ -27,8 +27,9 @@ cargo run --release
   Boutons précédent / lecture-pause / suivant, et barre de progression quand le lecteur
   donne la durée du morceau.
 - **Horloge** collée à droite du Dock : l'heure et la date ; un clic ouvre le calendrier et
-  les notifications de Windows. À sa gauche, le **volume** : la molette le règle, un clic
-  coupe ou rétablit le son, le pourcentage s'affiche au survol.
+  les notifications de Windows. À sa gauche, le **volume** : un clic ouvre un curseur au-dessus
+  de l'horloge (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
+  le règle aussi, le pourcentage s'affiche au survol.
 - **Lanceur façon Spotlight** : **Alt + Espace** ouvre une barre de recherche en verre ; tapez
   quelques lettres (accents et majuscules ignorés), ↑ ↓ pour choisir, Entrée pour lancer,
   Échap pour fermer. Il trouve toutes les applis installées, y compris celles du Store.

@@ -109,10 +109,12 @@ impl Canvas {
                 // Distance au centre de l'arrondi le plus proche (nulle hors des coins).
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 let d = (px - px.clamp(left, right)).hypot(py - py.clamp(top, bottom));
-                let cover = (rad - d + 0.5).clamp(0.0, 1.0);
+                // Hors des coins, le pixel est plein ; dans un coin, on lisse le bord de l'arrondi.
+                // (Sans ce cas à part, un rectangle sans arrondi n'était couvert qu'à moitié.)
+                let cover = if d <= 0.0 { 1.0 } else { (rad - d + 0.5).clamp(0.0, 1.0) };
                 if cover > 0.0 {
                     let i = (y * self.w + x) as usize;
-                    self.px[i] = over(premul(rgb, (alpha as f32 * cover) as u8), self.px[i]);
+                    self.px[i] = over(premul(rgb, (alpha as f32 * cover).round() as u8), self.px[i]);
                 }
             }
         }
@@ -578,6 +580,17 @@ mod tests {
         assert_eq!(c.px[(2 * 20 + 16) as usize] >> 24, 0, "l'extérieur est vide");
         let edge = (0..20).map(|x| c.px[(10 * 20 + x) as usize] >> 24).filter(|a| *a > 0 && *a < 255).count();
         assert!(edge > 0, "les bords sont lissés");
+    }
+
+    #[test]
+    fn rectangle_sans_arrondi_entierement_couvert() {
+        // Zone « invisible mais pleine » : alpha 1 partout, jamais 0 (sinon la souris la traverse).
+        let mut c = Canvas::new(10, 10);
+        c.round_rect(RECT { left: 0, top: 0, right: 10, bottom: 10 }, 0, (0, 0, 0), 1);
+        assert!(c.px.iter().all(|p| p >> 24 == 1));
+        let mut c = Canvas::new(10, 10);
+        c.round_rect(RECT { left: 0, top: 0, right: 10, bottom: 10 }, 0, (255, 255, 255), 90);
+        assert_eq!(c.px[55] >> 24, 90);
     }
 
     #[test]
