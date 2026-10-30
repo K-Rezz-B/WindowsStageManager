@@ -80,7 +80,6 @@ impl Model {
         self.active
     }
 
-    #[cfg(test)]
     pub fn stage(&self, id: u64) -> Option<&Stage> {
         self.stages.iter().find(|s| s.id == id)
     }
@@ -184,6 +183,46 @@ impl Model {
             restore: moved[1..].iter().rev().copied().collect(),
             focus: moved.first().copied(),
         }
+    }
+
+    /// Peut-on sortir cette fenêtre de la scène active ? (il faut qu'il lui en reste une autre)
+    pub fn can_detach(&self, w: Wid) -> bool {
+        self.active
+            .and_then(|a| self.stage(a))
+            .is_some_and(|s| s.windows.len() > 1 && s.windows.contains(&w))
+    }
+
+    /// Sort une fenêtre de la scène active pour en faire une scène à part, rangée en tête de barre.
+    pub fn detach(&mut self, w: Wid) -> Transition {
+        if !self.can_detach(w) {
+            return Transition::default();
+        }
+        let Some(i) = self.active.and_then(|a| self.index(a)) else {
+            return Transition::default();
+        };
+        self.stages[i].windows.retain(|x| *x != w);
+        let focus = self.stages[i].windows.first().copied();
+        self.push_stage(vec![w]);
+        Transition { minimize: vec![w], restore: Vec::new(), focus }
+    }
+
+    /// Éclate une scène de la barre en une scène par fenêtre, à la même place dans la barre.
+    pub fn split(&mut self, id: u64) -> bool {
+        let Some(i) = self.index(id).filter(|_| self.active != Some(id)) else {
+            return false;
+        };
+        if self.stages[i].windows.len() < 2 {
+            return false;
+        }
+        let last_used = self.stages[i].last_used;
+        for w in self.stages[i].windows.split_off(1) {
+            let id = self.push_stage(vec![w]);
+            // Même ancienneté : le tri stable les garde juste après la scène d'origine.
+            if let Some(j) = self.index(id) {
+                self.stages[j].last_used = last_used;
+            }
+        }
+        true
     }
 
     /// Oublie une fenêtre (fermée, cachée ou réduite par l'utilisateur).
@@ -305,6 +344,30 @@ mod tests {
         assert_eq!(t, Transition { minimize: vec![], restore: vec![3], focus: Some(1) });
         assert_eq!(active_windows(&m), vec![1, 3, 2]);
         assert_eq!(m.sidebar().len(), 1);
+    }
+
+    #[test]
+    fn detacher_une_fenetre_de_la_scene_active() {
+        let (mut m, _) = model();
+        let edge = m.stage_of(1).unwrap();
+        m.activate(edge, Some(1));
+        let t = m.detach(1);
+        assert_eq!(t, Transition { minimize: vec![1], restore: vec![], focus: Some(3) });
+        assert_eq!(active_windows(&m), vec![3]);
+        assert_eq!(sidebar(&m)[0], vec![1], "la fenêtre détachée arrive en tête de barre");
+        // La dernière fenêtre d'une scène ne se détache pas.
+        assert!(m.detach(3).is_empty());
+        assert!(!m.can_detach(3));
+    }
+
+    #[test]
+    fn eclater_une_scene_de_la_barre() {
+        let (mut m, _) = model();
+        let edge = m.stage_of(1).unwrap();
+        assert!(m.split(edge));
+        assert_eq!(sidebar(&m), vec![vec![1], vec![3], vec![4]]);
+        // La scène active ne s'éclate pas depuis la barre.
+        assert!(!m.split(m.active().unwrap()));
     }
 
     #[test]

@@ -184,6 +184,28 @@ pub fn restored_rect(h: HWND) -> RECT {
     }
 }
 
+/// Fixe l'endroit où une fenêtre réduite reviendra quand on la restaurera.
+pub fn set_restore_position(h: HWND, rect: RECT, maximized: bool) {
+    unsafe {
+        let mut wp = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        if GetWindowPlacement(h, &mut wp).is_err() {
+            return;
+        }
+        wp.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
+        if maximized {
+            wp.flags = WINDOWPLACEMENT_FLAGS(wp.flags.0 | WPF_RESTORETOMAXIMIZED.0);
+        } else {
+            wp.flags = WINDOWPLACEMENT_FLAGS(wp.flags.0 & !WPF_RESTORETOMAXIMIZED.0);
+            // Coordonnées « espace de travail » : relatives à la zone de travail de l'écran.
+            let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let _ = GetMonitorInfoW(monitor, &mut mi);
+            wp.rcNormalPosition = offset(rect, mi.rcMonitor.left - mi.rcWork.left, mi.rcMonitor.top - mi.rcWork.top);
+        }
+        let _ = SetWindowPlacement(h, &wp);
+    }
+}
+
 /// Fenêtre plein écran transparente et traversable par la souris, qui porte les miniatures animées.
 pub unsafe fn create_overlay(instance: HINSTANCE) -> Result<HWND> {
     let class = w!("StageManagerOverlay");

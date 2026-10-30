@@ -16,7 +16,13 @@ cargo run --release
 - **Glisser une miniature hors de la barre** (ou Maj + clic, ou clic droit → « Ajouter à la
   scène active ») : regroupe les fenêtres de cette scène avec la scène active. La relâcher
   sur la barre annule.
+- **Séparer une fenêtre de sa scène** : la faire glisser par sa barre de titre jusque sur la
+  barre latérale (qui s'éclaire), ou **Ctrl + Alt + D** sur la fenêtre active. Elle rejoint la
+  barre comme scène à part, et reviendra à sa place d'origine quand on la rouvrira.
+- **Clic droit sur une carte → « Séparer les fenêtres »** : éclate une scène regroupée en une
+  scène par fenêtre.
 - **Ctrl + Alt + S** : active ou désactive le Stage Manager (toutes les fenêtres sont restaurées).
+  Désactiver puis réactiver recrée les scènes, une par application.
 - **Icône dans la zone de notification** (clic droit) : activer/désactiver, lancer au
   démarrage de Windows, quitter. Windows 11 la range d'abord dans les icônes cachées (^) :
   glissez-la dans la barre des tâches pour la garder visible.

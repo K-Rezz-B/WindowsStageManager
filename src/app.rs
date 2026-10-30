@@ -34,12 +34,15 @@ const WM_TRAY: u32 = WM_APP + 2;
 const WM_APPBAR: u32 = WM_APP + 3;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_RESCAN: usize = 1;
+const TIMER_WINDOW_DRAG: usize = 2;
 const HOTKEY_TOGGLE: i32 = 1;
+const HOTKEY_DETACH: i32 = 2;
 const MENU_TOGGLE: usize = 1;
 const MENU_QUIT: usize = 2;
 const MENU_SHOW: usize = 3;
 const MENU_MERGE: usize = 4;
 const MENU_AUTOSTART: usize = 5;
+const MENU_SPLIT: usize = 6;
 
 /// Largeur de la barre, en pixels à 100 %.
 const BAR_WIDTH: i32 = 200;
@@ -144,6 +147,21 @@ struct App {
     drag: Option<Drag>,
     /// Point de départ imposé au prochain changement de scène (la carte qu'on vient de lâcher).
     drag_source: Option<RECT>,
+    /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
+    /// la sort de sa scène.
+    window_drag: Option<WindowDrag>,
+    /// La souris survole la barre pendant ce déplacement : la barre s'éclaire.
+    drop_target: bool,
+    /// Positions à rendre aux fenêtres détachées une fois réduites (voir `detach`).
+    pending_placements: Vec<WindowDrag>,
+}
+
+/// Fenêtre déplacée par l'utilisateur, avec sa position d'avant le déplacement.
+#[derive(Clone, Copy)]
+struct WindowDrag {
+    window: Wid,
+    rect: RECT,
+    maximized: bool,
 }
 
 impl App {
@@ -175,6 +193,9 @@ impl App {
             arriving: None,
             drag: None,
             drag_source: None,
+            window_drag: None,
+            drop_target: false,
+            pending_placements: Vec::new(),
         }
     }
 
@@ -189,6 +210,7 @@ impl App {
         match msg {
             WM_WINEVENT => self.on_event(wp.0 as u32, HWND(lp.0 as _)),
             WM_TIMER if wp.0 == TIMER_RESCAN => self.rescan(),
+            WM_TIMER if wp.0 == TIMER_WINDOW_DRAG => self.set_drop_target(self.window_over_bar()),
             WM_MOUSEMOVE if self.drag.is_some() => self.drag_to(point(lp)),
             WM_MOUSEMOVE => self.on_mouse_move(point(lp)),
             WM_MOUSELEAVE => {
@@ -200,6 +222,10 @@ impl App {
             // Capture perdue (Alt+Tab, Échap…) : on annule le glisser.
             WM_CAPTURECHANGED => self.cancel_drag(),
             WM_HOTKEY if wp.0 == HOTKEY_TOGGLE as usize => self.toggle(),
+            WM_HOTKEY if wp.0 == HOTKEY_DETACH as usize => {
+                let foreground = wid_of(unsafe { GetForegroundWindow() });
+                self.detach(foreground, None);
+            }
             WM_APPBAR => match wp.0 as u32 {
                 ABN_POSCHANGED => self.place_appbar(),
                 ABN_FULLSCREENAPP if self.enabled => unsafe {
@@ -263,7 +289,12 @@ impl App {
         self.enabled = false;
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_RESCAN);
+            let _ = KillTimer(self.hwnd, TIMER_WINDOW_DRAG);
         }
+        self.cancel_drag();
+        self.window_drag = None;
+        self.drop_target = false;
+        // Termine l'animation (et replace les fenêtres détachées) avant de tout restaurer.
         self.finish_switch();
         self.slide_start = None;
         restore_hidden();
@@ -342,9 +373,83 @@ impl App {
                 }
                 self.forget(w);
             }
+            EVENT_SYSTEM_MOVESIZESTART => {
+                if !self.model.can_detach(w) {
+                    return;
+                }
+                let maximized = unsafe { IsZoomed(h) }.as_bool();
+                self.window_drag = Some(WindowDrag { window: w, rect: anim::window_rect(h), maximized });
+                // Pendant le déplacement, Windows ne prévient pas : on surveille la souris.
+                unsafe {
+                    SetTimer(self.hwnd, TIMER_WINDOW_DRAG, 30, None);
+                }
+                return;
+            }
+            EVENT_SYSTEM_MOVESIZEEND => {
+                if self.window_drag.is_none_or(|d| d.window != w) {
+                    return;
+                }
+                let over = self.window_over_bar();
+                let Some(drag) = self.window_drag.take() else { return };
+                unsafe {
+                    let _ = KillTimer(self.hwnd, TIMER_WINDOW_DRAG);
+                }
+                self.set_drop_target(false);
+                if !over {
+                    return;
+                }
+                self.detach(w, Some(drag));
+            }
             _ => return,
         }
         self.refresh();
+    }
+
+    /// Sort une fenêtre de la scène active : elle rejoint la barre comme scène à part.
+    /// `moved` : si on l'a traînée jusqu'à la barre, sa position d'avant le déplacement,
+    /// pour qu'elle revienne là et non à l'endroit où on l'a lâchée.
+    fn detach(&mut self, w: Wid, moved: Option<WindowDrag>) {
+        let t = self.model.detach(w);
+        if t.is_empty() {
+            return;
+        }
+        self.apply(t, true);
+        if let Some(drag) = moved {
+            self.last_rects.insert(w, drag.rect);
+            self.pending_placements.push(drag);
+            if self.switch.is_none() {
+                self.apply_placements();
+            }
+        }
+        self.refresh();
+    }
+
+    /// À appeler une fois les fenêtres réduites : changer leur position ne se voit plus.
+    fn apply_placements(&mut self) {
+        for drag in std::mem::take(&mut self.pending_placements) {
+            anim::set_restore_position(hwnd_of(drag.window), drag.rect, drag.maximized);
+        }
+    }
+
+    /// La fenêtre en cours de déplacement est-elle lâchable sur la barre ?
+    fn window_over_bar(&self) -> bool {
+        let Some(drag) = self.window_drag else { return false };
+        // Un redimensionnement passe par les mêmes événements : on ne retient que les
+        // déplacements (taille inchangée). Une fenêtre agrandie reprend sa taille normale
+        // dès qu'on la tire, ce n'est pas un redimensionnement.
+        let resized = size(anim::window_rect(hwnd_of(drag.window))) != size(drag.rect);
+        if resized && !drag.maximized {
+            return false;
+        }
+        let mut pt = POINT::default();
+        unsafe { GetCursorPos(&mut pt) }.is_ok() && self.appbar.is_some_and(|bar| contains(bar, pt))
+    }
+
+    fn set_drop_target(&mut self, over: bool) {
+        if self.drop_target != over {
+            self.drop_target = over;
+            self.render();
+        }
     }
 
     fn forget(&mut self, w: Wid) {
@@ -580,6 +685,7 @@ impl App {
         if !self.dragging() {
             self.hide_overlay();
         }
+        self.apply_placements();
         for w in switch.quiet {
             anim::set_transitions(hwnd_of(w), true);
         }
@@ -988,6 +1094,10 @@ impl App {
         // (Windows laisse passer les clics sur les pixels totalement transparents).
         canvas.clear((0, 0, 0), 1);
         let white = (255, 255, 255);
+        if self.drop_target {
+            // Une fenêtre est traînée au-dessus de la barre : la lâcher la sortira de sa scène.
+            canvas.round_rect(RECT { left: s(6), top: s(6), right: w - s(6), bottom: h - s(6) }, s(18), white, 56);
+        }
         for &(card, rect, dest, _) in &cards {
             if self.hover == Some(card.stage) {
                 canvas.round_rect(inflate(rect, s(8)), s(16), white, 46);
@@ -1024,9 +1134,13 @@ impl App {
                 let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
                 draw_text(dc, &title, text_rect, flags, TEXT, s(1));
             }
-            if cards.is_empty() {
+            let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
+            if self.drop_target {
+                let text_rect = RECT { left: 0, top: h - s(70), right: w, bottom: h - s(30) };
+                draw_text(dc, "Lâcher pour séparer", text_rect, centered, TEXT, s(1));
+            } else if cards.is_empty() {
                 let text_rect = RECT { left: 0, top: s(20), right: w, bottom: s(60) };
-                draw_text(dc, "Aucune autre scène", text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, TEXT_DIM, s(1));
+                draw_text(dc, "Aucune autre scène", text_rect, centered, TEXT_DIM, s(1));
             }
         });
         canvas.present(self.hwnd, POINT { x: bar.left, y: bar.top });
@@ -1088,6 +1202,8 @@ unsafe extern "system" fn win_event(
         EVENT_SYSTEM_FOREGROUND
             | EVENT_SYSTEM_MINIMIZESTART
             | EVENT_SYSTEM_MINIMIZEEND
+            | EVENT_SYSTEM_MOVESIZESTART
+            | EVENT_SYSTEM_MOVESIZEEND
             | EVENT_OBJECT_HIDE
             | EVENT_OBJECT_DESTROY
     );
@@ -1178,10 +1294,19 @@ unsafe fn tray_menu(hwnd: HWND) {
 }
 
 unsafe fn card_menu(hwnd: HWND, stage: u64) {
-    let items = [(MENU_SHOW, w!("Afficher cette scène")), (MENU_MERGE, w!("Ajouter à la scène active\tMaj+clic"))];
+    let mut items = vec![(MENU_SHOW, w!("Afficher cette scène")), (MENU_MERGE, w!("Ajouter à la scène active\tMaj+clic"))];
+    let windows = with_app(|app| app.model.stage(stage).map_or(0, |s| s.windows.len())).unwrap_or(0);
+    if windows > 1 {
+        items.push((MENU_SPLIT, w!("Séparer les fenêtres")));
+    }
     match popup(hwnd, &items, &[]) {
         MENU_SHOW => with_app(|app| app.show_stage(stage, false)),
         MENU_MERGE => with_app(|app| app.show_stage(stage, true)),
+        MENU_SPLIT => with_app(|app| {
+            if app.model.split(stage) {
+                app.refresh();
+            }
+        }),
         _ => None,
     };
 }
@@ -1226,6 +1351,7 @@ pub fn run() -> Result<()> {
             SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, None, Some(win_event), 0, 0, flags),
         ];
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S' as u32);
+        let _ = RegisterHotKey(hwnd, HOTKEY_DETACH, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D' as u32);
         with_app(|app| {
             app.add_tray();
             app.enable();
