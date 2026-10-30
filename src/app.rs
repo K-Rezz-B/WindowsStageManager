@@ -40,7 +40,6 @@ const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_APPBAR: u32 = WM_APP + 3;
 const WM_MEDIA: u32 = WM_APP + 4;
-const WM_WALLPAPER: u32 = WM_APP + 5;
 /// Envoyé avec WM_SETTINGCHANGE quand le fond d'écran change.
 const SPI_SETDESKWALLPAPER: usize = 0x0014;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -158,13 +157,9 @@ struct App {
     font_bold: HFONT,
     font_icons: HFONT,
     media: Media,
-    /// Morceau en cours, affiché dans le lecteur en bas de la barre.
+    /// Morceau en cours, affiché dans le lecteur à gauche du Dock.
     now_playing: Option<NowPlaying>,
-    hover_play: bool,
-    /// Fond d'écran flouté derrière la barre, vu à travers le verre du lecteur.
-    backdrop: Option<Rc<Image>>,
-    /// Dépôt du fil qui charge le fond d'écran.
-    backdrop_loaded: Arc<Mutex<Option<Image>>>,
+    font_time: HFONT,
     appbar: Option<RECT>,
     monitor: RECT,
     taskbar_created: u32,
@@ -219,9 +214,7 @@ impl App {
             font_icons: HFONT::default(),
             media: Media::start(hwnd, WM_MEDIA),
             now_playing: None,
-            hover_play: false,
-            backdrop: None,
-            backdrop_loaded: Arc::new(Mutex::new(None)),
+            font_time: HFONT::default(),
             appbar: None,
             monitor: RECT::default(),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
@@ -252,33 +245,17 @@ impl App {
         match msg {
             WM_WINEVENT => self.on_event(wp.0 as u32, HWND(lp.0 as _)),
             WM_MEDIA => {
-                let had_player = self.now_playing.is_some();
+                // Le lecteur est collé à gauche du Dock.
                 self.now_playing = self.media.now_playing();
-                if had_player != self.now_playing.is_some() {
-                    // Le lecteur apparaît ou disparaît : la place des cartes change.
-                    self.layout_key.clear();
-                    self.refresh();
-                }
-                self.render();
+                self.render_dock();
             }
-            WM_WALLPAPER => {
-                let loaded = self.backdrop_loaded.lock().ok().and_then(|mut l| l.take());
-                if let Some(image) = loaded {
-                    self.backdrop = Some(Rc::new(image));
-                    self.render();
-                }
-            }
-            WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => {
-                self.load_backdrop();
-                self.reload_dock_backdrop();
-            }
+            WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => self.reload_dock_backdrop(),
             WM_TIMER if wp.0 == TIMER_RESCAN => self.rescan(),
             WM_TIMER if wp.0 == TIMER_WINDOW_DRAG => self.set_drop_target(self.window_over_bar()),
             WM_MOUSEMOVE if self.drag.is_some() => self.drag_to(point(lp)),
             WM_MOUSEMOVE => self.on_mouse_move(point(lp)),
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                self.hover_play = false;
                 self.set_hover(None);
             }
             WM_LBUTTONDOWN => self.press(point(lp)),
@@ -886,19 +863,20 @@ impl App {
             self.appbar = Some(r);
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
 
-            for font in [self.font, self.font_bold, self.font_icons] {
+            for font in [self.font, self.font_bold, self.font_icons, self.font_time] {
                 if !font.is_invalid() {
                     let _ = DeleteObject(font);
                 }
             }
             let dpi = self.dpi();
-            self.font = make_font("Segoe UI", 12, 400, dpi);
-            self.font_bold = make_font("Segoe UI", 12, 600, dpi);
+            // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
+            self.font = make_font("Inter", 12, 400, dpi);
+            self.font_bold = make_font("Inter SemiBold", 12, 600, dpi);
             // Icônes de Windows 11 (lecture, pause).
             self.font_icons = make_font("Segoe Fluent Icons", 14, 400, dpi);
+            // L'heure, à droite du Dock.
+            self.font_time = make_font("Inter SemiBold", 16, 600, dpi);
         }
-        // La barre a bougé ou changé de taille : le fond derrière elle aussi.
-        self.load_backdrop();
         self.layout_key.clear();
         self.refresh();
     }
@@ -948,8 +926,7 @@ impl App {
         let label_h = s(26);
         let card_h = stack + thumb_h + label_h;
 
-        // Les cartes s'arrêtent au-dessus du lecteur de musique.
-        let limit = self.player_layout().map_or(rc.bottom - margin, |p| p.panel.top - s(12));
+        let limit = rc.bottom - margin;
         let mut layout: LayoutKey = Vec::new();
         let mut y = s(20);
         for stage in self.model.sidebar() {
@@ -1053,40 +1030,7 @@ impl App {
             };
             self.tracking_mouse = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
         }
-        let over_play = self.player_layout().is_some_and(|p| contains(p.button, pt));
-        if over_play != self.hover_play {
-            self.hover_play = over_play;
-            self.render();
-        }
         self.set_hover(self.hit(pt));
-    }
-
-    fn load_backdrop(&self) {
-        if let Some(bar) = self.appbar {
-            let blur = 10 * self.dpi() / 96;
-            wallpaper::load_async(bar, self.monitor, blur, self.hwnd, WM_WALLPAPER, Arc::clone(&self.backdrop_loaded));
-        }
-    }
-
-    /// Lecteur de musique en bas de la barre, s'il y a un morceau en cours.
-    fn player_layout(&self) -> Option<PlayerLayout> {
-        self.now_playing.as_ref()?;
-        let bar = self.appbar?;
-        let (w, h) = (bar.right - bar.left, bar.bottom - bar.top);
-        let dpi = self.dpi();
-        let s = move |v: i32| v * dpi / 96;
-        let (pad, art) = (s(10), s(56));
-        let bottom = h - s(14);
-        let top = bottom - (2 * pad + art + s(8) + s(32));
-        let panel = RECT { left: s(10), top, right: w - s(10), bottom };
-        let art_rect = RECT { left: panel.left + pad, top: top + pad, right: panel.left + pad + art, bottom: top + pad + art };
-        let text_left = art_rect.right + s(10);
-        let title = RECT { left: text_left, top: art_rect.top + s(6), right: panel.right - pad, bottom: art_rect.top + s(26) };
-        let artist = RECT { top: title.bottom, bottom: title.bottom + s(20), ..title };
-        let size = s(32);
-        let cx = (panel.left + panel.right) / 2;
-        let button = RECT { left: cx - size / 2, top: art_rect.bottom + s(8), right: cx + size / 2, bottom: art_rect.bottom + s(8) + size };
-        Some(PlayerLayout { panel, art: art_rect, title, artist, button })
     }
 
     fn set_hover(&mut self, hover: Option<u64>) {
@@ -1103,15 +1047,6 @@ impl App {
     }
 
     fn press(&mut self, pt: POINT) {
-        if self.player_layout().is_some_and(|p| contains(p.button, pt)) {
-            self.media.toggle_play_pause();
-            // Affiché tout de suite, sans attendre la confirmation du lecteur.
-            if let Some(np) = self.now_playing.as_mut() {
-                np.playing = !np.playing;
-            }
-            self.render();
-            return;
-        }
         let Some(bar) = self.appbar else { return };
         let Some(card) = self.cards.iter().find(|c| !c.hidden && contains(c.rect, pt)) else { return };
         let mon = self.monitor;
@@ -1272,37 +1207,6 @@ impl App {
             let image = self.snapshots.get(&card.window);
             canvas.draw_quad(image.map_or(&placeholder, |i| i.as_ref()), tilt(dest), alpha, 0);
         }
-        // Lecteur de musique : plaque de verre liquide, pochette et bulle lecture/pause.
-        let player = self.player_layout().zip(self.now_playing.as_ref());
-        if let Some((p, np)) = &player {
-            let flat = |r: RECT| {
-                let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-                [(l, t), (rr, t), (rr, b), (l, b)]
-            };
-            let sf = |v: i32| s(v) as f32;
-            // Ombre douce sous la plaque.
-            canvas.round_rect(offset(inflate(p.panel, s(2)), 0, s(5)), s(22), (0, 0, 0), 45);
-            canvas.round_rect(offset(p.panel, 0, s(2)), s(20), (0, 0, 0), 55);
-            let panel_glass = Glass { frost: 0.14, darken: 0.06, refraction: sf(14), bevel: sf(18), rim: 0.85 };
-            match &self.backdrop {
-                Some(backdrop) => canvas.glass(p.panel, sf(20), backdrop, (0, 0), &panel_glass),
-                // Fond d'écran pas encore chargé : simple panneau sombre translucide.
-                None => canvas.round_rect(p.panel, s(20), (18, 18, 22), 150),
-            }
-            canvas.round_rect(offset(p.art, 0, s(2)), s(8), (0, 0, 0), 70);
-            match &np.art {
-                Some(art) => canvas.draw_quad(art, flat(p.art), 255, 0),
-                None => canvas.round_rect(p.art, s(6), (70, 70, 80), 255),
-            }
-            // Bulle de verre plus claire pour le bouton, encore plus claire au survol.
-            let radius = (p.button.right - p.button.left) as f32 / 2.0;
-            let frost = if self.hover_play { 0.5 } else { 0.34 };
-            let bubble = Glass { frost, darken: 0.05, refraction: sf(6), bevel: sf(9), rim: 0.9 };
-            match &self.backdrop {
-                Some(backdrop) => canvas.glass(p.button, radius, backdrop, (0, 0), &bubble),
-                None => canvas.round_rect(p.button, radius as i32, white, if self.hover_play { 110 } else { 70 }),
-            }
-        }
         canvas.gdi(|dc| unsafe {
             SelectObject(dc, self.font);
             SetBkMode(dc, TRANSPARENT);
@@ -1334,22 +1238,8 @@ impl App {
                 draw_text(dc, &title, text_rect, flags, TEXT, s(1));
             }
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-            if let Some((p, np)) = &player {
-                let line = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-                SelectObject(dc, self.font_bold);
-                draw_text(dc, &np.title, p.title, line, TEXT, s(1));
-                SelectObject(dc, self.font);
-                draw_text(dc, &np.artist, p.artist, line, TEXT_DIM, s(1));
-                // Icônes Segoe Fluent : E769 pause, E768 lecture.
-                SelectObject(dc, self.font_icons);
-                let glyph = String::from_utf16_lossy(&[if np.playing { 0xE769 } else { 0xE768 }]);
-                draw_text(dc, &glyph, p.button, centered, TEXT, s(1));
-                SelectObject(dc, self.font);
-            }
             if self.drop_target {
-                // Au-dessus du lecteur s'il est affiché.
-                let bottom = player.as_ref().map_or(h - s(30), |(p, _)| p.panel.top - s(10));
-                let text_rect = RECT { left: 0, top: bottom - s(40), right: w, bottom };
+                let text_rect = RECT { left: 0, top: h - s(70), right: w, bottom: h - s(30) };
                 draw_text(dc, "Lâcher pour séparer", text_rect, centered, TEXT, s(1));
             } else if cards.is_empty() {
                 let text_rect = RECT { left: 0, top: s(20), right: w, bottom: s(60) };
@@ -1378,6 +1268,21 @@ fn point(lp: LPARAM) -> POINT {
     POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 }
 }
 
+/// Charge Inter (intégrée à l'exécutable) pour ce seul processus : rien n'est installé dans
+/// Windows. Elle apparaît sous deux noms : « Inter » et « Inter SemiBold ».
+fn load_fonts() {
+    const FONTS: [&[u8]; 2] = [
+        include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+        include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    ];
+    for font in FONTS {
+        let mut count = 0u32;
+        unsafe {
+            AddFontMemResourceEx(font.as_ptr().cast(), font.len() as u32, None, &mut count);
+        }
+    }
+}
+
 unsafe fn make_font(face: &str, points: i32, weight: i32, dpi: i32) -> HFONT {
     let mut lf = LOGFONTW {
         lfHeight: -points * dpi / 96,
@@ -1404,9 +1309,11 @@ struct PlayerLayout {
 /// Texte avec une ombre portée, pour rester lisible sur n'importe quel fond d'écran.
 unsafe fn draw_text(dc: HDC, text: &str, rect: RECT, flags: DRAW_TEXT_FORMAT, color: COLORREF, shadow: i32) {
     let mut text: Vec<u16> = text.encode_utf16().collect();
-    let mut shadow_rect = offset(rect, shadow, shadow);
-    SetTextColor(dc, rgb(0, 0, 0));
-    DrawTextW(dc, &mut text, &mut shadow_rect, flags);
+    if shadow > 0 {
+        let mut shadow_rect = offset(rect, shadow, shadow);
+        SetTextColor(dc, rgb(0, 0, 0));
+        DrawTextW(dc, &mut text, &mut shadow_rect, flags);
+    }
     let mut rect = rect;
     SetTextColor(dc, color);
     DrawTextW(dc, &mut text, &mut rect, flags);
@@ -1481,7 +1388,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Some(None) => DefWindowProcW(hwnd, msg, wp, lp),
         None => {
             // Occupé : on remet l'événement à plus tard plutôt que de le perdre.
-            if [WM_WINEVENT, WM_APPBAR, WM_MEDIA, WM_WALLPAPER, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER].contains(&msg) {
+            if [WM_WINEVENT, WM_APPBAR, WM_MEDIA, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER].contains(&msg) {
                 let _ = PostMessageW(hwnd, msg, wp, lp);
                 return LRESULT(0);
             }
@@ -1555,6 +1462,7 @@ unsafe fn card_menu(hwnd: HWND, stage: u64) {
 pub fn run() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        load_fonts();
         // COM : le Dock lance des applis et ouvre la corbeille via le shell.
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();

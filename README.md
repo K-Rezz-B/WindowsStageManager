@@ -21,10 +21,13 @@ cargo run --release
   barre comme scène à part, et reviendra à sa place d'origine quand on la rouvrira.
 - **Clic droit sur une carte → « Séparer les fenêtres »** : éclate une scène regroupée en une
   scène par fenêtre.
-- **Lecteur de musique** en bas de la barre : pochette, titre, artiste et bouton lecture/pause
-  du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…), sur une
-  plaque de « verre liquide ». Il n'apparaît que lorsqu'un média est ouvert. Le verre est
-  calculé à partir du fond d'écran (seule chose derrière la barre), lu et flouté une seule fois.
+- **Lecteur de musique** collé à gauche du Dock : pochette, titre, artiste et bouton
+  lecture/pause du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify,
+  Deezer…), sur une plaque de « verre liquide ». Il n'apparaît que lorsqu'un média est ouvert.
+- **Horloge** collée à droite du Dock : l'heure et la date ; un clic ouvre le calendrier et
+  les notifications de Windows.
+- Le verre du Dock et de ses panneaux est calculé à partir du fond d'écran (seule chose
+  derrière eux), lu et flouté une seule fois.
 - **Dock** en bas de l'écran, comme sur macOS : applis épinglées (reprises au départ de la
   barre des tâches), applis ouvertes à la suite, puis la corbeille. Les icônes grossissent en
   vague sous la souris, le nom de l'appli s'affiche au-dessus, un point marque les applis
@@ -46,6 +49,12 @@ L'option du menu enregistre l'exécutable dans la clé `Run` de l'utilisateur
 l'exécutable change de place, la version release met la clé à jour à son lancement.
 Attention : `cargo clean` supprime `target\release\stage-manager.exe` ; il faudra recompiler
 pour que le lancement automatique fonctionne de nouveau.
+
+### Police
+
+L'interface utilise [Inter](https://github.com/rsms/inter) (Regular et SemiBold), la police
+libre la plus proche de SF Pro, intégrée à l'exécutable et chargée pour ce seul processus
+(rien n'est installé dans Windows). Licence SIL Open Font : `assets/fonts/LICENSE-Inter.txt`.
 
 ### Icône
 

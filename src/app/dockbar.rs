@@ -12,6 +12,14 @@ pub(super) const WM_DOCKBAR: u32 = WM_APP + 6;
 pub(super) const WM_DOCK_LOADED: u32 = WM_APP + 7;
 pub(super) const WM_DOCK_WALLPAPER: u32 = WM_APP + 8;
 
+const TIMER_CLOCK: usize = 3;
+
+/// Largeurs du lecteur (à gauche du Dock) et de l'horloge (à droite), et leur écart avec le
+/// Dock, en pixels à 100 %.
+const PLAYER_WIDTH: i32 = 250;
+const CLOCK_WIDTH: i32 = 110;
+const PANEL_GAP: i32 = 10;
+
 const MENU_DOCK_OPEN: usize = 20;
 const MENU_DOCK_PIN: usize = 21;
 const MENU_DOCK_QUIT: usize = 22;
@@ -35,6 +43,15 @@ pub(super) struct DockUi {
     backdrop_loaded: Arc<Mutex<Option<Image>>>,
     tracking: bool,
     trash_full: bool,
+    hover_play: bool,
+    /// Heure et date affichées, pour ne redessiner qu'au changement de minute.
+    clock: (String, String),
+}
+
+/// Panneaux collés au Dock : le lecteur à gauche (s'il y a de la musique), l'horloge à droite.
+struct Panels {
+    player: Option<PlayerLayout>,
+    clock: RECT,
 }
 
 impl DockUi {
@@ -52,6 +69,8 @@ impl DockUi {
             backdrop_loaded: Arc::new(Mutex::new(None)),
             tracking: false,
             trash_full: false,
+            hover_play: false,
+            clock: clock_text(),
         }
     }
 
@@ -74,6 +93,13 @@ impl App {
                 _ => {}
             },
             WM_DOCK_LOADED => self.on_dock_loaded(),
+            WM_TIMER if wp.0 == TIMER_CLOCK => {
+                let clock = clock_text();
+                if clock != self.dock.clock {
+                    self.dock.clock = clock;
+                    self.render_dock();
+                }
+            }
             WM_DOCK_WALLPAPER => {
                 let loaded = self.dock.backdrop_loaded.lock().ok().and_then(|mut l| l.take());
                 if let Some(image) = loaded {
@@ -106,12 +132,15 @@ impl App {
         self.place_dock();
         unsafe {
             let _ = ShowWindow(self.dock.hwnd, SW_SHOWNOACTIVATE);
+            // L'horloge vérifie chaque seconde si la minute a changé.
+            SetTimer(self.hwnd, TIMER_CLOCK, 1000, None);
         }
     }
 
     pub(super) fn disable_dock(&mut self) {
         unsafe {
             let _ = ShowWindow(self.dock.hwnd, SW_HIDE);
+            let _ = KillTimer(self.hwnd, TIMER_CLOCK);
         }
         if self.dock.reserved.take().is_some() {
             let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.dock.hwnd, ..Default::default() };
@@ -231,10 +260,40 @@ impl App {
 
     fn dock_window_rect(&self, m: &Metrics) -> RECT {
         let mon = self.monitor;
-        let w = self.dock.model.window_width(m);
+        // Place pour les panneaux des deux côtés, à égalité pour que le Dock reste centré.
+        let side = (PLAYER_WIDTH.max(CLOCK_WIDTH) + PANEL_GAP) * self.dock.dpi / 96;
+        let w = self.dock.model.window_width(m) + 2 * side;
         let left = (mon.left + mon.right - w) / 2;
         let bottom = mon.bottom - 3;
         RECT { left, top: bottom - m.height, right: left + w, bottom }
+    }
+
+    /// Emplacement du lecteur et de l'horloge, collés aux bords du Dock (qui s'élargit au survol).
+    fn panels(&self, body: RECT) -> Panels {
+        let dpi = self.dock.dpi;
+        let s = move |v: i32| v * dpi / 96;
+        let (gap, height) = (s(PANEL_GAP), body.bottom - body.top);
+        let clock = RECT { left: body.right + gap, top: body.top, right: body.right + gap + s(CLOCK_WIDTH), bottom: body.bottom };
+        let player = self.now_playing.as_ref().map(|_| {
+            let panel = RECT { left: body.left - gap - s(PLAYER_WIDTH), top: body.top, right: body.left - gap, bottom: body.bottom };
+            let pad = s(8);
+            let art_size = height - 2 * pad;
+            let art = RECT { left: panel.left + pad, top: panel.top + pad, right: panel.left + pad + art_size, bottom: panel.bottom - pad };
+            let size = s(30);
+            let cy = (panel.top + panel.bottom) / 2;
+            let button = RECT { left: panel.right - pad - size, top: cy - size / 2, right: panel.right - pad, bottom: cy + size / 2 };
+            let title = RECT { left: art.right + s(10), top: cy - s(19), right: button.left - s(8), bottom: cy };
+            let artist = RECT { top: cy, bottom: cy + s(18), ..title };
+            PlayerLayout { panel, art, title, artist, button }
+        });
+        Panels { player, clock }
+    }
+
+    /// Disposition actuelle du Dock et de ses panneaux, en coordonnées de sa fenêtre.
+    fn dock_panels(&self) -> Panels {
+        let m = Metrics::new(self.dock.dpi);
+        let (w, h) = (self.dock.window.right - self.dock.window.left, self.dock.window.bottom - self.dock.window.top);
+        self.panels(self.dock.model.layout(&m, w, h, Instant::now()).body)
     }
 
     pub(super) fn render_dock(&mut self) {
@@ -259,14 +318,36 @@ impl App {
             canvas.round_rect(RECT { left: body.left - s(6), top: body.top - lift, right: body.right + s(6), bottom: h }, 0, (0, 0, 0), 1);
         }
         let radius = m.radius;
-        canvas.round_rect(offset(inflate(body, s(1)), 0, s(3)), radius as i32 + s(1), (0, 0, 0), 45);
         let look = Glass { frost: 0.18, darken: 0.04, refraction: s(10) as f32, bevel: s(14) as f32, rim: 0.8 };
-        match &self.dock.backdrop {
-            Some(backdrop) => {
-                let origin = (window.left - self.dock.backdrop_rect.left, window.top - self.dock.backdrop_rect.top);
-                canvas.glass(body, radius, backdrop, origin, &look);
+        let origin = (window.left - self.dock.backdrop_rect.left, window.top - self.dock.backdrop_rect.top);
+        // Plaque de verre avec son ombre : le Dock, le lecteur et l'horloge.
+        let plate = |canvas: &mut Canvas, r: RECT, radius: f32, look: &Glass| {
+            canvas.round_rect(offset(inflate(r, s(1)), 0, s(3)), radius as i32 + s(1), (0, 0, 0), 45);
+            match &self.dock.backdrop {
+                Some(backdrop) => canvas.glass(r, radius, backdrop, origin, look),
+                None => canvas.round_rect(r, radius as i32, (30, 30, 36), 170),
             }
-            None => canvas.round_rect(body, radius as i32, (30, 30, 36), 170),
+        };
+        plate(&mut canvas, body, radius, &look);
+        let panels = self.panels(body);
+        plate(&mut canvas, panels.clock, radius, &look);
+        let player = panels.player.as_ref().zip(self.now_playing.as_ref());
+        if let Some((p, np)) = player {
+            plate(&mut canvas, p.panel, radius, &look);
+            canvas.round_rect(offset(p.art, 0, s(2)), s(8), (0, 0, 0), 70);
+            match &np.art {
+                Some(art) => canvas.draw_quad(art, [
+                    (p.art.left as f32, p.art.top as f32),
+                    (p.art.right as f32, p.art.top as f32),
+                    (p.art.right as f32, p.art.bottom as f32),
+                    (p.art.left as f32, p.art.bottom as f32),
+                ], 255, 0),
+                None => canvas.round_rect(p.art, s(6), (70, 70, 80), 255),
+            }
+            // Bulle de verre plus claire pour le bouton, encore plus claire au survol.
+            let frost = if self.dock.hover_play { 0.5 } else { 0.34 };
+            let bubble = Glass { frost, darken: 0.05, refraction: s(6) as f32, bevel: s(9) as f32, rim: 0.9 };
+            plate(&mut canvas, p.button, (p.button.right - p.button.left) as f32 / 2.0, &bubble);
         }
         if let Some(x) = layout.separator {
             canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
@@ -299,17 +380,37 @@ impl App {
         if let Some(r) = label_box {
             canvas.round_rect(r, s(8), (28, 28, 32), 225);
         }
-        if let (Some((item, _)), Some(r)) = (label, label_box) {
-            let font = self.font;
-            canvas.gdi(|dc| unsafe {
-                SelectObject(dc, font);
-                SetBkMode(dc, TRANSPARENT);
+        let (time, date) = &self.dock.clock;
+        canvas.gdi(|dc| unsafe {
+            SetBkMode(dc, TRANSPARENT);
+            let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+            if let (Some((item, _)), Some(r)) = (label, label_box) {
+                SelectObject(dc, self.font);
                 SetTextColor(dc, TEXT);
                 let mut text: Vec<u16> = item.name.encode_utf16().collect();
                 let mut rect = r;
-                DrawTextW(dc, &mut text, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            });
-        }
+                DrawTextW(dc, &mut text, &mut rect, centered);
+            }
+            // Horloge : l'heure en gras, la date en dessous.
+            let c = panels.clock;
+            let mid = (c.top + c.bottom) / 2;
+            SelectObject(dc, self.font_time);
+            draw_text(dc, time, RECT { top: c.top + s(6), bottom: mid + s(4), ..c }, centered, TEXT, 0);
+            SelectObject(dc, self.font);
+            draw_text(dc, date, RECT { top: mid + s(2), bottom: c.bottom - s(6), ..c }, centered, TEXT_DIM, 0);
+            // Lecteur : titre, artiste et icône lecture/pause.
+            if let Some((p, np)) = player {
+                let line = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+                SelectObject(dc, self.font_bold);
+                draw_text(dc, &np.title, p.title, line, TEXT, 0);
+                SelectObject(dc, self.font);
+                draw_text(dc, &np.artist, p.artist, line, TEXT_DIM, 0);
+                // Icônes Segoe Fluent : E769 pause, E768 lecture.
+                SelectObject(dc, self.font_icons);
+                let glyph = String::from_utf16_lossy(&[if np.playing { 0xE769 } else { 0xE768 }]);
+                draw_text(dc, &glyph, p.button, centered, TEXT, 0);
+            }
+        });
         canvas.present(self.dock.hwnd, POINT { x: window.left, y: window.top });
     }
 
@@ -353,9 +454,10 @@ impl App {
                     self.dock.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
                 }
                 let hover = self.dock_hit(pt.x as f32, pt.y);
-                // Le Dock ne grossit que si la souris est sur lui, pas au-dessus dans le vide.
-                let on_dock = hover.is_some() || self.dock.model.cursor.is_some();
-                self.dock.model.set_hover(on_dock.then_some(pt.x as f32), hover);
+                // Le Dock ne grossit que sous la souris, pas quand elle passe sur le lecteur ou
+                // l'horloge.
+                self.dock.model.set_hover(hover.map(|_| pt.x as f32), hover);
+                self.dock.hover_play = self.dock_panels().player.is_some_and(|p| contains(p.button, pt));
                 self.render_dock();
             }
             WM_MOUSELEAVE => {
@@ -364,7 +466,18 @@ impl App {
                 self.render_dock();
             }
             WM_LBUTTONUP => {
-                if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
+                let panels = self.dock_panels();
+                if panels.player.as_ref().is_some_and(|p| contains(p.button, pt)) {
+                    self.media.toggle_play_pause();
+                    // Affiché tout de suite, sans attendre la confirmation du lecteur.
+                    if let Some(np) = self.now_playing.as_mut() {
+                        np.playing = !np.playing;
+                    }
+                    self.render_dock();
+                } else if contains(panels.clock, pt) {
+                    // Comme l'horloge de la barre des tâches : calendrier et notifications.
+                    shell::open("ms-actioncenter:");
+                } else if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
                     self.dock_click(index);
                 }
             }
@@ -475,6 +588,19 @@ pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
         }
         MENU_TRASH_EMPTY => shell::empty_recycle_bin(hwnd),
         _ => {}
+    }
+}
+
+/// Heure (« 22:15 ») et date courte (« jeu. 30 oct. ») au format de Windows.
+fn clock_text() -> (String, String) {
+    use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx};
+    let read = |buf: &[u16], n: i32| String::from_utf16_lossy(&buf[..(n - 1).max(0) as usize]);
+    unsafe {
+        let mut time = [0u16; 32];
+        let mut date = [0u16; 64];
+        let n = GetTimeFormatEx(PCWSTR::null(), Default::default(), None, w!("HH:mm"), Some(&mut time));
+        let d = GetDateFormatEx(PCWSTR::null(), Default::default(), None, w!("ddd d MMM"), Some(&mut date), PCWSTR::null());
+        (read(&time, n), read(&date, d))
     }
 }
 
