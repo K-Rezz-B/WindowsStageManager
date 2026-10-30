@@ -1,0 +1,3 @@
+// Ressources de l'exécutable : l'icône (identifiant 1) apparaît dans l'Explorateur,
+// et l'application la charge pour la zone de notification.
+1 ICON "icon.ico"
