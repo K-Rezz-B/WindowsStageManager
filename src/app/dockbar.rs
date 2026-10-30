@@ -88,7 +88,7 @@ impl App {
             WM_DOCKBAR => match wp.0 as u32 {
                 ABN_POSCHANGED => self.place_dock(),
                 ABN_FULLSCREENAPP if self.enabled => unsafe {
-                    let cmd = if lp.0 != 0 { SW_HIDE } else { SW_SHOWNOACTIVATE };
+                    let cmd = if lp.0 != 0 && win::fullscreen_app_in_front() { SW_HIDE } else { SW_SHOWNOACTIVATE };
                     let _ = ShowWindow(self.dock.hwnd, cmd);
                 },
                 _ => {}

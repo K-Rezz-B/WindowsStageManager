@@ -268,7 +268,7 @@ impl App {
             WM_APPBAR => match wp.0 as u32 {
                 ABN_POSCHANGED => self.place_appbar(),
                 ABN_FULLSCREENAPP if self.enabled => unsafe {
-                    let cmd = if lp.0 != 0 { SW_HIDE } else { SW_SHOWNOACTIVATE };
+                    let cmd = if lp.0 != 0 && win::fullscreen_app_in_front() { SW_HIDE } else { SW_SHOWNOACTIVATE };
                     let _ = ShowWindow(self.hwnd, cmd);
                 },
                 _ => {}
@@ -402,6 +402,7 @@ impl App {
                 }
                 // Réduite par l'utilisateur : elle quitte sa scène, comme sur macOS.
                 self.forget(w);
+                self.show_next_stage();
             }
             EVENT_SYSTEM_MINIMIZEEND => {
                 if guarded || self.model.in_active_stage(w) {
@@ -416,6 +417,7 @@ impl App {
                     return;
                 }
                 self.forget(w);
+                self.show_next_stage();
             }
             EVENT_SYSTEM_MOVESIZESTART => {
                 if !self.model.can_detach(w) {
@@ -495,6 +497,15 @@ impl App {
         if self.drop_target != over {
             self.drop_target = over;
             self.render();
+        }
+    }
+
+    /// La scène active vient de se vider (dernière fenêtre fermée ou réduite) : la scène la plus
+    /// récente de la barre prend sa place, plutôt que de laisser le bureau seul à l'écran.
+    fn show_next_stage(&mut self) {
+        if let Some(next) = self.model.next_stage() {
+            let t = self.model.activate(next, None);
+            self.apply(t, true);
         }
     }
 

@@ -6,7 +6,10 @@ use windows::{
     core::*,
     Win32::{
         Foundation::*,
-        Graphics::Dwm::*,
+        Graphics::{
+            Dwm::*,
+            Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+        },
         Security::*,
         System::{LibraryLoader::GetModuleHandleW, Threading::*},
         UI::{
@@ -76,6 +79,27 @@ pub fn is_app_window(h: HWND) -> bool {
         }
     }
     !is_cloaked(h) && !title(h).trim().is_empty() && !IGNORED_CLASSES.contains(&class_name(h).as_str())
+}
+
+/// Une vraie appli plein écran (jeu, vidéo…) est-elle au premier plan ? Windows prévient aussi
+/// quand c'est le bureau qui prend le premier plan (il couvre tout l'écran) : on l'écarte.
+pub fn fullscreen_app_in_front() -> bool {
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_invalid() || pid(h) == GetCurrentProcessId() {
+            return false;
+        }
+        if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"].contains(&class_name(h).as_str()) {
+            return false;
+        }
+        let mut rect = RECT::default();
+        let _ = GetWindowRect(h, &mut rect);
+        let monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(monitor, &mut info);
+        let m = info.rcMonitor;
+        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+    }
 }
 
 pub fn is_alive(h: HWND) -> bool {

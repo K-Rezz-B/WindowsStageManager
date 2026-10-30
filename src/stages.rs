@@ -80,6 +80,14 @@ impl Model {
         self.active
     }
 
+    /// Scène à afficher quand la scène active vient de se vider : la plus récente de la barre.
+    pub fn next_stage(&self) -> Option<u64> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.sidebar().first().map(|s| s.id)
+    }
+
     pub fn stage(&self, id: u64) -> Option<&Stage> {
         self.stages.iter().find(|s| s.id == id)
     }
@@ -334,6 +342,19 @@ mod tests {
         assert!(m.remove(2));
         assert_eq!(m.active(), None);
         assert!(!m.remove(2));
+    }
+
+    #[test]
+    fn la_scene_suivante_remplace_une_scene_videe() {
+        let (mut m, _) = model();
+        assert_eq!(m.next_stage(), None, "la scène active n'est pas vide");
+        // On ferme la seule fenêtre de la scène active (code) : edge, la plus récente, prend la place.
+        m.remove(2);
+        let edge = m.stage_of(1).unwrap();
+        assert_eq!(m.next_stage(), Some(edge));
+        let t = m.activate(edge, None);
+        assert_eq!(t, Transition { minimize: vec![], restore: vec![3], focus: Some(1) });
+        assert_eq!(m.next_stage(), None);
     }
 
     #[test]
