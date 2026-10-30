@@ -1,0 +1,493 @@
+//! Le Dock à l'écran : sa fenêtre, sa place réservée en bas de l'écran, son dessin, ses clics.
+
+use std::collections::HashSet;
+
+use super::*;
+use crate::{
+    dock::{self, Dock, Kind, Metrics},
+    shell,
+};
+
+pub(super) const WM_DOCKBAR: u32 = WM_APP + 6;
+pub(super) const WM_DOCK_LOADED: u32 = WM_APP + 7;
+pub(super) const WM_DOCK_WALLPAPER: u32 = WM_APP + 8;
+
+const MENU_DOCK_OPEN: usize = 20;
+const MENU_DOCK_PIN: usize = 21;
+const MENU_DOCK_QUIT: usize = 22;
+const MENU_TRASH_EMPTY: usize = 23;
+
+pub(super) static DOCK: AtomicIsize = AtomicIsize::new(0);
+
+pub(super) struct DockUi {
+    pub hwnd: HWND,
+    pub model: Dock,
+    /// Bande réservée en bas de l'écran (les fenêtres agrandies s'arrêtent au-dessus).
+    reserved: Option<RECT>,
+    /// Position de la fenêtre du Dock à l'écran.
+    window: RECT,
+    dpi: i32,
+    loader: shell::IconLoader,
+    requested: HashSet<String>,
+    /// Fond d'écran flouté derrière le Dock (toute la largeur de l'écran).
+    backdrop: Option<Rc<Image>>,
+    backdrop_rect: RECT,
+    backdrop_loaded: Arc<Mutex<Option<Image>>>,
+    tracking: bool,
+    trash_full: bool,
+}
+
+impl DockUi {
+    pub fn new(hwnd: HWND) -> Self {
+        Self {
+            hwnd,
+            model: Dock::new(&dock::load_pins()),
+            reserved: None,
+            window: RECT::default(),
+            dpi: 96,
+            loader: shell::IconLoader::start(hwnd, WM_DOCK_LOADED),
+            requested: HashSet::new(),
+            backdrop: None,
+            backdrop_rect: RECT::default(),
+            backdrop_loaded: Arc::new(Mutex::new(None)),
+            tracking: false,
+            trash_full: false,
+        }
+    }
+
+    fn request(&mut self, path: &str) {
+        if self.requested.insert(path.to_owned()) {
+            self.loader.request(path);
+        }
+    }
+}
+
+impl App {
+    pub(super) fn handle_dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
+        match msg {
+            WM_DOCKBAR => match wp.0 as u32 {
+                ABN_POSCHANGED => self.place_dock(),
+                ABN_FULLSCREENAPP if self.enabled => unsafe {
+                    let cmd = if lp.0 != 0 { SW_HIDE } else { SW_SHOWNOACTIVATE };
+                    let _ = ShowWindow(self.dock.hwnd, cmd);
+                },
+                _ => {}
+            },
+            WM_DOCK_LOADED => self.on_dock_loaded(),
+            WM_DOCK_WALLPAPER => {
+                let loaded = self.dock.backdrop_loaded.lock().ok().and_then(|mut l| l.take());
+                if let Some(image) = loaded {
+                    self.dock.backdrop = Some(Rc::new(image));
+                    self.render_dock();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    // --- Mise en place ----------------------------------------------------------------
+
+    pub(super) fn enable_dock(&mut self) {
+        taskbar::autohide();
+        let mut abd = APPBARDATA {
+            cbSize: size_of::<APPBARDATA>() as u32,
+            hWnd: self.dock.hwnd,
+            uCallbackMessage: WM_DOCKBAR,
+            ..Default::default()
+        };
+        unsafe { SHAppBarMessage(ABM_NEW, &mut abd) };
+        self.dock.reserved = Some(RECT::default());
+        let paths: Vec<String> = self.dock.model.items.iter().map(|i| i.path.clone()).collect();
+        for path in paths {
+            self.dock.request(&path);
+        }
+        self.update_running();
+        self.place_dock();
+        unsafe {
+            let _ = ShowWindow(self.dock.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    pub(super) fn disable_dock(&mut self) {
+        unsafe {
+            let _ = ShowWindow(self.dock.hwnd, SW_HIDE);
+        }
+        if self.dock.reserved.take().is_some() {
+            let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.dock.hwnd, ..Default::default() };
+            unsafe { SHAppBarMessage(ABM_REMOVE, &mut abd) };
+        }
+        taskbar::restore();
+    }
+
+    /// L'explorateur a redémarré : il a oublié la place réservée au Dock.
+    pub(super) fn reregister_dock(&mut self) {
+        if self.dock.reserved.take().is_some() {
+            self.disable_dock();
+            self.enable_dock();
+        }
+    }
+
+    /// Réserve la bande du bas de l'écran principal, puis place la fenêtre du Dock.
+    fn place_dock(&mut self) {
+        let Some(current) = self.dock.reserved else { return };
+        let monitor = self.monitor;
+        unsafe {
+            let handle = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
+            let (mut dpi, mut dpi_y) = (96u32, 96u32);
+            let _ = GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
+            self.dock.dpi = dpi as i32;
+        }
+        let m = Metrics::new(self.dock.dpi);
+        let mut abd = APPBARDATA {
+            cbSize: size_of::<APPBARDATA>() as u32,
+            hWnd: self.dock.hwnd,
+            uEdge: ABE_BOTTOM,
+            rc: monitor,
+            ..Default::default()
+        };
+        abd.rc.top = abd.rc.bottom - m.reserve;
+        unsafe {
+            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+            abd.rc.top = abd.rc.bottom - m.reserve;
+            if abd.rc != current {
+                SHAppBarMessage(ABM_SETPOS, &mut abd);
+                self.dock.reserved = Some(abd.rc);
+            }
+        }
+        // Fond d'écran derrière toute la largeur du Dock (et de ses icônes grossies).
+        let strip = RECT { left: monitor.left, top: monitor.bottom - 3 - m.height, right: monitor.right, bottom: monitor.bottom - 3 };
+        if strip != self.dock.backdrop_rect {
+            self.dock.backdrop_rect = strip;
+            let blur = 10 * self.dock.dpi / 96;
+            wallpaper::load_async(strip, monitor, blur, self.dock.hwnd, WM_DOCK_WALLPAPER, Arc::clone(&self.dock.backdrop_loaded));
+        }
+        self.render_dock();
+    }
+
+    /// Le fond d'écran a changé.
+    pub(super) fn reload_dock_backdrop(&mut self) {
+        self.dock.backdrop_rect = RECT::default();
+        self.place_dock();
+    }
+
+    // --- Contenu ----------------------------------------------------------------------
+
+    /// Repère les applis ouvertes et met le Dock à jour.
+    pub(super) fn update_running(&mut self) {
+        if self.dock.reserved.is_none() {
+            return;
+        }
+        let mut running: Vec<String> = Vec::new();
+        for h in win::top_level_windows() {
+            if let Some(app) = self.app_key(h) {
+                if !running.contains(&app) {
+                    running.push(app);
+                }
+            }
+        }
+        let added = self.dock.model.set_running(&running, Instant::now());
+        for path in added {
+            self.dock.request(&path);
+        }
+        // La corbeille change d'icône quand elle se remplit ou se vide.
+        let full = shell::recycle_bin_items() > 0;
+        if full != self.dock.trash_full {
+            self.dock.trash_full = full;
+            self.dock.requested.remove(shell::RECYCLE_BIN);
+            self.dock.request(shell::RECYCLE_BIN);
+        }
+        self.render_dock();
+    }
+
+    fn on_dock_loaded(&mut self) {
+        let mut targets_changed = false;
+        for loaded in self.dock.loader.take() {
+            let icon = loaded.icon.map(Rc::new);
+            for item in self.dock.model.items.iter_mut().filter(|i| i.path == loaded.path) {
+                if !loaded.name.is_empty() {
+                    item.name = loaded.name.clone();
+                }
+                if !loaded.target.is_empty() && item.target != loaded.target {
+                    item.target = loaded.target.clone();
+                    targets_changed = true;
+                }
+                if icon.is_some() {
+                    item.icon = icon.clone();
+                }
+            }
+        }
+        // Noms et cibles connus : des applis ouvertes peuvent rejoindre leur icône épinglée.
+        self.dock.model.merge_duplicates();
+        if targets_changed {
+            // On sait maintenant quel exécutable lance chaque raccourci : on revérifie qui tourne.
+            self.update_running();
+        } else {
+            self.render_dock();
+        }
+    }
+
+    // --- Dessin -----------------------------------------------------------------------
+
+    fn dock_window_rect(&self, m: &Metrics) -> RECT {
+        let mon = self.monitor;
+        let w = self.dock.model.window_width(m);
+        let left = (mon.left + mon.right - w) / 2;
+        let bottom = mon.bottom - 3;
+        RECT { left, top: bottom - m.height, right: left + w, bottom }
+    }
+
+    pub(super) fn render_dock(&mut self) {
+        if !self.enabled || self.dock.reserved.is_none() {
+            return;
+        }
+        let m = Metrics::new(self.dock.dpi);
+        let dpi = self.dock.dpi;
+        let s = move |v: i32| v * dpi / 96;
+        let window = self.dock_window_rect(&m);
+        self.dock.window = window;
+        let (w, h) = (window.right - window.left, window.bottom - window.top);
+        let layout = self.dock.model.layout(&m, w, h, Instant::now());
+        let body = layout.body;
+        let white = (255, 255, 255);
+
+        let mut canvas = Canvas::new(w, h);
+        if self.dock.model.cursor.is_some() {
+            // Zone invisible mais « pleine » au-dessus du Dock : la souris ne quitte pas la
+            // fenêtre en passant entre deux icônes grossies.
+            let lift = (m.max - m.icon) as i32 + s(12);
+            canvas.round_rect(RECT { left: body.left - s(6), top: body.top - lift, right: body.right + s(6), bottom: h }, 0, (0, 0, 0), 1);
+        }
+        let radius = m.radius;
+        canvas.round_rect(offset(inflate(body, s(1)), 0, s(3)), radius as i32 + s(1), (0, 0, 0), 45);
+        let look = Glass { frost: 0.18, darken: 0.04, refraction: s(10) as f32, bevel: s(14) as f32, rim: 0.8 };
+        match &self.dock.backdrop {
+            Some(backdrop) => {
+                let origin = (window.left - self.dock.backdrop_rect.left, window.top - self.dock.backdrop_rect.top);
+                canvas.glass(body, radius, backdrop, origin, &look);
+            }
+            None => canvas.round_rect(body, radius as i32, (30, 30, 36), 170),
+        }
+        if let Some(x) = layout.separator {
+            canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
+        }
+        let flat = |r: RECT| {
+            let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+            [(l, t), (rr, t), (rr, b), (l, b)]
+        };
+        for (item, rect) in self.dock.model.items.iter().zip(&layout.icons) {
+            match &item.icon {
+                Some(icon) => canvas.draw_quad(icon, flat(*rect), 255, 0),
+                None => canvas.round_rect(inflate(*rect, -s(3)), s(12), (90, 90, 100), 200),
+            }
+            if item.running {
+                // Point sous l'icône : l'appli est ouverte.
+                let cx = (rect.left + rect.right) / 2;
+                let dot = RECT { left: cx - s(2), top: body.bottom - s(6), right: cx + s(2), bottom: body.bottom - s(2) };
+                canvas.round_rect(dot, s(2), white, 220);
+            }
+        }
+        // Étiquette au-dessus de l'icône survolée.
+        let label = self.dock.model.hover.and_then(|i| Some((self.dock.model.items.get(i)?, layout.icons.get(i)?)));
+        let label_box = label.map(|(item, rect)| {
+            let width = text_width(self.font, &item.name) + s(22);
+            let cx = (rect.left + rect.right) / 2;
+            let bottom = rect.top - s(10);
+            let r = RECT { left: cx - width / 2, top: bottom - s(26), right: cx + width / 2, bottom };
+            offset(r, (s(4) - r.left).max(0) - (r.right - (w - s(4))).max(0), 0)
+        });
+        if let Some(r) = label_box {
+            canvas.round_rect(r, s(8), (28, 28, 32), 225);
+        }
+        if let (Some((item, _)), Some(r)) = (label, label_box) {
+            let font = self.font;
+            canvas.gdi(|dc| unsafe {
+                SelectObject(dc, font);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, TEXT);
+                let mut text: Vec<u16> = item.name.encode_utf16().collect();
+                let mut rect = r;
+                DrawTextW(dc, &mut text, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            });
+        }
+        canvas.present(self.dock.hwnd, POINT { x: window.left, y: window.top });
+    }
+
+    pub(super) fn dock_animating(&self) -> bool {
+        self.dock.model.animating()
+    }
+
+    pub(super) fn dock_tick(&mut self, now: Instant) {
+        if self.dock.model.animating() {
+            self.dock.model.tick(now);
+            self.render_dock();
+        }
+    }
+
+    // --- Souris -----------------------------------------------------------------------
+
+    /// Icône sous l'abscisse `x` (coordonnées de la fenêtre du Dock).
+    fn dock_hit(&self, x: f32, y: i32) -> Option<usize> {
+        let m = Metrics::new(self.dock.dpi);
+        let (w, h) = (self.dock.window.right - self.dock.window.left, self.dock.window.bottom - self.dock.window.top);
+        let layout = self.dock.model.layout(&m, w, h, Instant::now());
+        let top = layout.icons.iter().map(|r| r.top).min().unwrap_or(layout.body.top);
+        if y < top - (m.gap as i32) || x < layout.body.left as f32 || x > layout.body.right as f32 {
+            return None;
+        }
+        let half_gap = m.gap / 2.0;
+        layout.icons.iter().position(|r| x >= r.left as f32 - half_gap && x < r.right as f32 + half_gap)
+    }
+
+    pub(super) fn dock_mouse(&mut self, msg: u32, lp: LPARAM) {
+        let pt = point(lp);
+        match msg {
+            WM_MOUSEMOVE => {
+                if !self.dock.tracking {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: self.dock.hwnd,
+                        dwHoverTime: 0,
+                    };
+                    self.dock.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+                }
+                let hover = self.dock_hit(pt.x as f32, pt.y);
+                // Le Dock ne grossit que si la souris est sur lui, pas au-dessus dans le vide.
+                let on_dock = hover.is_some() || self.dock.model.cursor.is_some();
+                self.dock.model.set_hover(on_dock.then_some(pt.x as f32), hover);
+                self.render_dock();
+            }
+            WM_MOUSELEAVE => {
+                self.dock.tracking = false;
+                self.dock.model.set_hover(None, None);
+                self.render_dock();
+            }
+            WM_LBUTTONUP => {
+                if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
+                    self.dock_click(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn dock_click(&mut self, index: usize) {
+        let Some(item) = self.dock.model.items.get(index) else { return };
+        match item.kind {
+            Kind::Trash => shell::open_recycle_bin(),
+            Kind::App if item.running => self.show_app(index),
+            Kind::App => {
+                shell::open(&item.path);
+                // L'icône rebondit jusqu'à l'ouverture d'une fenêtre de l'appli.
+                if let Some(item) = self.dock.model.items.get_mut(index) {
+                    item.launched = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Fenêtres ouvertes de l'appli d'un élément du Dock.
+    fn app_windows(&mut self, index: usize) -> Vec<HWND> {
+        let mut windows = Vec::new();
+        for h in win::top_level_windows() {
+            let Some(app) = self.app_key(h) else { continue };
+            if self.dock.model.items.get(index).is_some_and(|i| i.matches(&app)) {
+                windows.push(h);
+            }
+        }
+        windows
+    }
+
+    /// Affiche une appli ouverte : sa scène si elle en a une, sinon sa fenêtre.
+    fn show_app(&mut self, index: usize) {
+        let windows = self.app_windows(index);
+        if let Some(&h) = windows.iter().find(|h| self.model.is_tracked(wid_of(**h))) {
+            let w = wid_of(h);
+            match self.model.stage_of(w) {
+                Some(id) if !self.model.in_active_stage(w) => {
+                    let t = self.model.activate(id, Some(w));
+                    self.apply(t, true);
+                    self.refresh();
+                }
+                _ => win::force_foreground(h),
+            }
+        } else if let Some(&h) = windows.first() {
+            if win::is_minimized(h) {
+                win::show(h, SW_RESTORE);
+            }
+            win::force_foreground(h);
+        }
+    }
+
+    fn quit_app(&mut self, index: usize) {
+        for h in self.app_windows(index) {
+            unsafe {
+                let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    fn toggle_pin(&mut self, index: usize) {
+        self.dock.model.toggle_pin(index);
+        dock::save_pins(&self.dock.model.pins());
+        self.render_dock();
+    }
+}
+
+/// Menu du clic droit sur une icône du Dock (ouvert hors de `with_app` : il a sa propre boucle).
+pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
+    let Some(Some((index, kind, running, pinned))) = with_app(|app| {
+        let index = app.dock_hit(pt.x as f32, pt.y)?;
+        let item = app.dock.model.items.get(index)?;
+        Some((index, item.kind, item.running, item.pinned))
+    }) else {
+        return;
+    };
+    let mut items = Vec::new();
+    let mut checked = Vec::new();
+    match kind {
+        Kind::Trash => {
+            items.push((MENU_DOCK_OPEN, w!("Ouvrir")));
+            items.push((MENU_TRASH_EMPTY, w!("Vider la corbeille")));
+        }
+        Kind::App => {
+            items.push((MENU_DOCK_OPEN, if running { w!("Afficher") } else { w!("Ouvrir") }));
+            items.push((MENU_DOCK_PIN, w!("Garder dans le Dock")));
+            if pinned {
+                checked.push(MENU_DOCK_PIN);
+            }
+            if running {
+                items.push((0, PCWSTR::null()));
+                items.push((MENU_DOCK_QUIT, w!("Quitter")));
+            }
+        }
+    }
+    match popup(hwnd, &items, &checked) {
+        MENU_DOCK_OPEN => {
+            with_app(|app| app.dock_click(index));
+        }
+        MENU_DOCK_PIN => {
+            with_app(|app| app.toggle_pin(index));
+        }
+        MENU_DOCK_QUIT => {
+            with_app(|app| app.quit_app(index));
+        }
+        MENU_TRASH_EMPTY => shell::empty_recycle_bin(hwnd),
+        _ => {}
+    }
+}
+
+/// Largeur d'un texte dans une police donnée, en pixels.
+fn text_width(font: HFONT, text: &str) -> i32 {
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let old = SelectObject(dc, font);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+        SelectObject(dc, old);
+        let _ = DeleteDC(dc);
+        size.cx
+    }
+}

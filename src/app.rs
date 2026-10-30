@@ -27,10 +27,14 @@ use crate::{
     autostart,
     canvas::{Canvas, Glass, Image},
     media::{Media, NowPlaying},
-    snapshot, wallpaper,
+    snapshot, taskbar, wallpaper,
     stages::{Model, Transition, Wid},
     win::{self, hwnd_of, wid_of},
 };
+
+mod dockbar;
+
+use dockbar::{DockUi, DOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
@@ -87,6 +91,8 @@ pub fn restore_hidden() {
             win::show(h, SW_SHOWNOACTIVATE);
         }
     }
+    // Et la barre des tâches, si on l'avait passée en masquage automatique pour le Dock.
+    taskbar::restore();
 }
 
 #[derive(Clone)]
@@ -169,6 +175,8 @@ struct App {
     drag: Option<Drag>,
     /// Point de départ imposé au prochain changement de scène (la carte qu'on vient de lâcher).
     drag_source: Option<RECT>,
+    /// Le Dock, en bas de l'écran.
+    dock: DockUi,
     /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
     /// la sort de sa scène.
     window_drag: Option<WindowDrag>,
@@ -187,7 +195,7 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, overlay: HWND) -> Self {
+    fn new(hwnd: HWND, overlay: HWND, dock: HWND) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
@@ -223,6 +231,7 @@ impl App {
             arriving: None,
             drag: None,
             drag_source: None,
+            dock: DockUi::new(dock),
             window_drag: None,
             drop_target: false,
             pending_placements: Vec::new(),
@@ -237,6 +246,9 @@ impl App {
     }
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if self.handle_dock_message(msg, wp, lp) {
+            return Some(LRESULT(0));
+        }
         match msg {
             WM_WINEVENT => self.on_event(wp.0 as u32, HWND(lp.0 as _)),
             WM_MEDIA => {
@@ -256,7 +268,10 @@ impl App {
                     self.render();
                 }
             }
-            WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => self.load_backdrop(),
+            WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => {
+                self.load_backdrop();
+                self.reload_dock_backdrop();
+            }
             WM_TIMER if wp.0 == TIMER_RESCAN => self.rescan(),
             WM_TIMER if wp.0 == TIMER_WINDOW_DRAG => self.set_drop_target(self.window_over_bar()),
             WM_MOUSEMOVE if self.drag.is_some() => self.drag_to(point(lp)),
@@ -292,6 +307,7 @@ impl App {
                 if self.appbar.take().is_some() {
                     self.register_appbar();
                 }
+                self.reregister_dock();
             }
             _ => return None,
         }
@@ -314,6 +330,7 @@ impl App {
         }
         self.enabled = true;
         self.register_appbar();
+        self.enable_dock();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
@@ -359,6 +376,7 @@ impl App {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.remove_appbar();
+        self.disable_dock();
     }
 
     // --- Scènes ---------------------------------------------------------------------
@@ -454,6 +472,8 @@ impl App {
             _ => return,
         }
         self.refresh();
+        // Une appli a pu s'ouvrir ou se fermer : le Dock suit.
+        self.update_running();
     }
 
     /// Sort une fenêtre de la scène active : elle rejoint la barre comme scène à part.
@@ -536,6 +556,7 @@ impl App {
         self.refresh();
         // Les titres des fenêtres ont pu changer.
         self.invalidate();
+        self.update_running();
     }
 
     fn show_stage(&mut self, stage: u64, merge: bool) {
@@ -703,7 +724,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.switch.is_some() || self.slide_start.is_some()
+        self.switch.is_some() || self.slide_start.is_some() || self.dock_animating()
     }
 
     /// Une image d'animation, appelée à chaque rafraîchissement de l'écran.
@@ -741,6 +762,7 @@ impl App {
         if redraw {
             self.render();
         }
+        self.dock_tick(now);
     }
 
     /// Fin du trajet : les vraies fenêtres reprennent la place de leurs miniatures.
@@ -1263,7 +1285,7 @@ impl App {
             canvas.round_rect(offset(p.panel, 0, s(2)), s(20), (0, 0, 0), 55);
             let panel_glass = Glass { frost: 0.14, darken: 0.06, refraction: sf(14), bevel: sf(18), rim: 0.85 };
             match &self.backdrop {
-                Some(backdrop) => canvas.glass(p.panel, sf(20), backdrop, &panel_glass),
+                Some(backdrop) => canvas.glass(p.panel, sf(20), backdrop, (0, 0), &panel_glass),
                 // Fond d'écran pas encore chargé : simple panneau sombre translucide.
                 None => canvas.round_rect(p.panel, s(20), (18, 18, 22), 150),
             }
@@ -1277,7 +1299,7 @@ impl App {
             let frost = if self.hover_play { 0.5 } else { 0.34 };
             let bubble = Glass { frost, darken: 0.05, refraction: sf(6), bevel: sf(9), rim: 0.9 };
             match &self.backdrop {
-                Some(backdrop) => canvas.glass(p.button, radius, backdrop, &bubble),
+                Some(backdrop) => canvas.glass(p.button, radius, backdrop, (0, 0), &bubble),
                 None => canvas.round_rect(p.button, radius as i32, white, if self.hover_play { 110 } else { 70 }),
             }
         }
@@ -1426,9 +1448,18 @@ unsafe extern "system" fn win_event(
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let is_dock = hwnd.0 as isize == DOCK.load(Ordering::Relaxed);
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => return LRESULT(1),
+        WM_RBUTTONUP if is_dock => {
+            dockbar::dock_menu(hwnd, point(lp));
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP if is_dock => {
+            with_app(|app| app.dock_mouse(msg, lp));
+            return LRESULT(0);
+        }
         // Les menus ont leur propre boucle de messages : on les ouvre hors de `with_app`.
         WM_TRAY => {
             let mouse = (lp.0 & 0xFFFF) as u32;
@@ -1450,7 +1481,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Some(None) => DefWindowProcW(hwnd, msg, wp, lp),
         None => {
             // Occupé : on remet l'événement à plus tard plutôt que de le perdre.
-            if msg == WM_WINEVENT || msg == WM_APPBAR || msg == WM_MEDIA {
+            if [WM_WINEVENT, WM_APPBAR, WM_MEDIA, WM_WALLPAPER, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER].contains(&msg) {
                 let _ = PostMessageW(hwnd, msg, wp, lp);
                 return LRESULT(0);
             }
@@ -1524,6 +1555,8 @@ unsafe fn card_menu(hwnd: HWND, stage: u64) {
 pub fn run() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // COM : le Dock lance des applis et ouvre la corbeille via le shell.
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = w!("StageManagerSidebar");
         let wc = WNDCLASSW {
@@ -1553,7 +1586,27 @@ pub fn run() -> Result<()> {
         )?;
         SIDEBAR.store(hwnd.0 as isize, Ordering::Relaxed);
         let overlay = anim::create_overlay(instance)?;
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay)));
+        let dock_class = w!("StageManagerDock");
+        let dock_wc = WNDCLASSW { lpszClassName: dock_class, ..wc };
+        if RegisterClassW(&dock_wc) == 0 {
+            return Err(Error::from_win32());
+        }
+        let dock = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            dock_class,
+            w!("Dock"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+        DOCK.store(dock.0 as isize, Ordering::Relaxed);
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [

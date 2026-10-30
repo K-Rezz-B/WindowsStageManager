@@ -25,6 +25,14 @@ cargo run --release
   du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…), sur une
   plaque de « verre liquide ». Il n'apparaît que lorsqu'un média est ouvert. Le verre est
   calculé à partir du fond d'écran (seule chose derrière la barre), lu et flouté une seule fois.
+- **Dock** en bas de l'écran, comme sur macOS : applis épinglées (reprises au départ de la
+  barre des tâches), applis ouvertes à la suite, puis la corbeille. Les icônes grossissent en
+  vague sous la souris, le nom de l'appli s'affiche au-dessus, un point marque les applis
+  ouvertes. Clic : lance l'appli (l'icône rebondit) ou affiche sa scène. Clic droit : garder
+  dans le Dock, quitter ; vider la corbeille. Les applis épinglées sont enregistrées dans
+  `%APPDATA%\StageManager\dock.txt`. La barre des tâches de Windows passe en masquage
+  automatique (remise comme avant en quittant) : poussez la souris tout en bas de l'écran
+  pour retrouver l'horloge et les icônes de notification.
 - **Ctrl + Alt + S** : active ou désactive le Stage Manager (toutes les fenêtres sont restaurées).
   Désactiver puis réactiver recrée les scènes, une par application.
 - **Icône dans la zone de notification** (clic droit) : activer/désactiver, lancer au
@@ -83,6 +91,10 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/app.rs` | Barre latérale (AppBar), miniatures DWM, icône de notification, événements |
 | `src/anim.rs` | Animations : fenêtre transparente, trajectoires, courbes d'accélération |
 | `src/canvas.rs` | Dessin avec transparence par pixel pour la barre, projection en perspective |
+| `src/dock.rs` | Modèle du Dock : éléments, épinglage, grossissement, rebond (testé) |
+| `src/app/dockbar.rs` | Fenêtre du Dock : place réservée, dessin, clics, menu |
+| `src/shell.rs` | Raccourcis épinglés, grandes icônes, noms d'applis, lancement, corbeille |
+| `src/taskbar.rs` | Masquage automatique de la barre des tâches, et sa remise en état |
 | `src/wallpaper.rs` | Fond d'écran derrière la barre, flouté, pour l'effet verre (fil à part) |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |

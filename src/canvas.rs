@@ -34,6 +34,23 @@ impl Image {
         }
     }
 
+    /// Image deux fois plus petite (moyenne de chaque carré de 2×2 pixels).
+    pub fn half(&self) -> Image {
+        let (w, h) = ((self.w / 2).max(1), (self.h / 2).max(1));
+        let mut px = vec![0u32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let at = |dx: i32, dy: i32| self.px[(((2 * y + dy).min(self.h - 1)) * self.w + (2 * x + dx).min(self.w - 1)) as usize];
+                let quad = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                px[(y * w + x) as usize] = (0..4).fold(0, |acc, c| {
+                    let sum: u32 = quad.iter().map(|p| (p >> (c * 8)) & 0xFF).sum();
+                    acc | ((sum + 2) / 4) << (c * 8)
+                });
+            }
+        }
+        Image { w, h, px }
+    }
+
     /// Flou (trois passes de flou « boîte », proche d'un flou gaussien).
     pub fn blur(&mut self, radius: i32) {
         if radius <= 0 || self.w <= 0 || self.h <= 0 {
@@ -237,11 +254,10 @@ pub struct Glass {
 
 impl Canvas {
     /// Pose une plaque de verre en `r` (coins arrondis) : `backdrop`, ce qu'il y a derrière la
-    /// barre, déjà flouté et de la taille du canevas, y est vu à travers une lentille.
-    pub fn glass(&mut self, r: RECT, radius: f32, backdrop: &Image, look: &Glass) {
-        if backdrop.w != self.w || backdrop.h != self.h {
-            return;
-        }
+    /// fenêtre, déjà flouté, y est vu à travers une lentille. `origin` : position du canevas
+    /// dans `backdrop`.
+    pub fn glass(&mut self, r: RECT, radius: f32, backdrop: &Image, origin: (i32, i32), look: &Glass) {
+        let (ox, oy) = (origin.0 as f32, origin.1 as f32);
         let (cx, cy) = ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0);
         let (hx, hy) = ((r.right - r.left) as f32 / 2.0, (r.bottom - r.top) as f32 / 2.0);
         let rad = radius.min(hx).min(hy);
@@ -269,7 +285,7 @@ impl Canvas {
                 // travers l'épaisseur arrondie d'un verre.
                 let t = (1.0 - depth / look.bevel).clamp(0.0, 1.0);
                 let bend = t * t * look.refraction;
-                let src = backdrop.sample(x as f32 - nx * bend, y as f32 - ny * bend);
+                let src = backdrop.sample(x as f32 + ox - nx * bend, y as f32 + oy - ny * bend);
                 let ch = |shift: u32| ((src >> shift) & 0xFF) as f32;
                 let (mut rr, mut gg, mut bb) = (ch(16), ch(8), ch(0));
                 // Couleurs un peu plus vives, fond assombri puis givré.
@@ -461,7 +477,7 @@ mod tests {
         let backdrop = Image { w: 40, h: 40, px: vec![premul((0, 100, 0), 255); 1600] };
         let mut c = Canvas::new(40, 40);
         let look = Glass { frost: 0.1, darken: 0.2, refraction: 4.0, bevel: 6.0, rim: 0.6 };
-        c.glass(RECT { left: 5, top: 5, right: 35, bottom: 35 }, 8.0, &backdrop, &look);
+        c.glass(RECT { left: 5, top: 5, right: 35, bottom: 35 }, 8.0, &backdrop, (0, 0), &look);
         assert_eq!(c.px[(20 * 40 + 20) as usize] >> 24, 255, "le centre est couvert");
         assert_eq!(c.px[(5 * 40 + 5) as usize] >> 24, 0, "le coin arrondi reste vide");
         assert!(channel(c.px[(20 * 40 + 20) as usize], 8) > 0, "on voit le fond à travers");
