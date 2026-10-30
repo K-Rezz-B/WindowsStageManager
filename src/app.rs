@@ -33,8 +33,10 @@ use crate::{
 };
 
 mod dockbar;
+mod launcherui;
 
 use dockbar::{DockUi, DOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
+use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
@@ -171,6 +173,8 @@ struct App {
     drag_source: Option<RECT>,
     /// Le Dock, en bas de l'écran.
     dock: DockUi,
+    /// Le lanceur façon Spotlight (Alt + Espace).
+    launcher: LauncherUi,
     /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
     /// la sort de sa scène.
     window_drag: Option<WindowDrag>,
@@ -189,7 +193,7 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, overlay: HWND, dock: HWND) -> Self {
+    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
@@ -223,6 +227,7 @@ impl App {
             drag: None,
             drag_source: None,
             dock: DockUi::new(dock),
+            launcher: LauncherUi::new(launcher),
             window_drag: None,
             drop_target: false,
             pending_placements: Vec::new(),
@@ -237,7 +242,7 @@ impl App {
     }
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        if self.handle_dock_message(msg, wp, lp) {
+        if self.handle_dock_message(msg, wp, lp) || self.handle_launcher_message(msg, wp) {
             return Some(LRESULT(0));
         }
         match msg {
@@ -306,6 +311,7 @@ impl App {
         self.enabled = true;
         self.register_appbar();
         self.enable_dock();
+        self.preload_launcher();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
@@ -1310,7 +1316,11 @@ struct PlayerLayout {
     art: RECT,
     title: RECT,
     artist: RECT,
+    previous: RECT,
     button: RECT,
+    next: RECT,
+    /// Barre de progression du morceau, sous le titre.
+    progress: RECT,
 }
 
 /// Texte avec une ombre portée, pour rester lisible sur n'importe quel fond d'écran.
@@ -1363,15 +1373,22 @@ unsafe extern "system" fn win_event(
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let is_dock = hwnd.0 as isize == DOCK.load(Ordering::Relaxed);
+    let is_launcher = hwnd.0 as isize == LAUNCHER.load(Ordering::Relaxed);
     match msg {
+        // Le lanceur, lui, prend le premier plan : il lui faut le clavier.
+        WM_CHAR | WM_KEYDOWN | WM_ACTIVATE | WM_MOUSEMOVE | WM_LBUTTONUP if is_launcher => {
+            with_app(|app| app.launcher_input(msg, wp, lp));
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        WM_MOUSEACTIVATE if is_launcher => return LRESULT(MA_ACTIVATE as isize),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => return LRESULT(1),
         WM_RBUTTONUP if is_dock => {
             dockbar::dock_menu(hwnd, point(lp));
             return LRESULT(0);
         }
-        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP if is_dock => {
-            with_app(|app| app.dock_mouse(msg, lp));
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEWHEEL if is_dock => {
+            with_app(|app| app.dock_mouse(msg, wp, lp));
             return LRESULT(0);
         }
         // Les menus ont leur propre boucle de messages : on les ouvre hors de `with_app`.
@@ -1395,7 +1412,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Some(None) => DefWindowProcW(hwnd, msg, wp, lp),
         None => {
             // Occupé : on remet l'événement à plus tard plutôt que de le perdre.
-            if [WM_WINEVENT, WM_APPBAR, WM_MEDIA, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER].contains(&msg) {
+            if [WM_WINEVENT, WM_APPBAR, WM_MEDIA, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
+                .contains(&msg)
+            {
                 let _ = PostMessageW(hwnd, msg, wp, lp);
                 return LRESULT(0);
             }
@@ -1521,7 +1540,27 @@ pub fn run() -> Result<()> {
             None,
         )?;
         DOCK.store(dock.0 as isize, Ordering::Relaxed);
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock)));
+        let launcher_class = w!("StageManagerLauncher");
+        let launcher_wc = WNDCLASSW { lpszClassName: launcher_class, ..wc };
+        if RegisterClassW(&launcher_wc) == 0 {
+            return Err(Error::from_win32());
+        }
+        let launcher = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            launcher_class,
+            w!("Rechercher"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+        LAUNCHER.store(launcher.0 as isize, Ordering::Relaxed);
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [
@@ -1530,6 +1569,7 @@ pub fn run() -> Result<()> {
         ];
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S' as u32);
         let _ = RegisterHotKey(hwnd, HOTKEY_DETACH, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D' as u32);
+        let _ = RegisterHotKey(hwnd, HOTKEY_LAUNCHER, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
         with_app(|app| {
             app.add_tray();
             app.enable();

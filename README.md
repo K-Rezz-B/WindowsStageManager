@@ -24,8 +24,14 @@ cargo run --release
 - **Lecteur de musique** collé à gauche du Dock : pochette, titre, artiste et bouton
   lecture/pause du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify,
   Deezer…), sur une plaque de « verre liquide ». Il n'apparaît que lorsqu'un média est ouvert.
+  Boutons précédent / lecture-pause / suivant, et barre de progression quand le lecteur
+  donne la durée du morceau.
 - **Horloge** collée à droite du Dock : l'heure et la date ; un clic ouvre le calendrier et
-  les notifications de Windows.
+  les notifications de Windows. À sa gauche, le **volume** : la molette le règle, un clic
+  coupe ou rétablit le son, le pourcentage s'affiche au survol.
+- **Lanceur façon Spotlight** : **Alt + Espace** ouvre une barre de recherche en verre ; tapez
+  quelques lettres (accents et majuscules ignorés), ↑ ↓ pour choisir, Entrée pour lancer,
+  Échap pour fermer. Il trouve toutes les applis installées, y compris celles du Store.
 - Le verre du Dock et de ses panneaux est calculé à partir du fond d'écran (seule chose
   derrière eux), lu et flouté une seule fois.
 - **Dock** en bas de l'écran, comme sur macOS : applis épinglées (reprises au départ de la
@@ -105,6 +111,9 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/shell.rs` | Raccourcis épinglés, grandes icônes, noms d'applis, lancement, corbeille |
 | `src/taskbar.rs` | Masquage automatique de la barre des tâches, et sa remise en état |
 | `src/wallpaper.rs` | Fond d'écran derrière la barre, flouté, pour l'effet verre (fil à part) |
+| `src/launcher.rs` | Lanceur : recherche des applis (testée) |
+| `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats, verre |
+| `src/volume.rs` | Volume de la sortie audio par défaut |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |
 | `src/autostart.rs` | Lancement automatique à l'ouverture de session |

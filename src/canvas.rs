@@ -156,6 +156,30 @@ impl Canvas {
         }
     }
 
+    /// Arc de cercle ouvert vers la droite (les ondes d'un haut-parleur), bords lissés.
+    /// `half_angle` : demi-ouverture en radians ; `width` : épaisseur du trait.
+    pub fn arc(&mut self, center: (f32, f32), radius: f32, half_angle: f32, width: f32, rgb: (u8, u8, u8), alpha: u8) {
+        let reach = radius + width;
+        let x0 = ((center.0 - reach).floor() as i32).max(0);
+        let x1 = ((center.0 + reach).ceil() as i32).min(self.w);
+        let y0 = ((center.1 - reach).floor() as i32).max(0);
+        let y1 = ((center.1 + reach).ceil() as i32).min(self.h);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (dx, dy) = (x as f32 + 0.5 - center.0, y as f32 + 0.5 - center.1);
+                let d = dx.hypot(dy);
+                let ring = (width / 2.0 - (d - radius).abs() + 0.5).clamp(0.0, 1.0);
+                // Extrémités arrondies en douceur : on mesure le dépassement de l'angle en pixels.
+                let ends = ((half_angle - dy.atan2(dx).abs()) * d + 0.5).clamp(0.0, 1.0);
+                let cover = ring * ends;
+                if cover > 0.0 {
+                    let i = (y * self.w + x) as usize;
+                    self.px[i] = over(premul(rgb, (alpha as f32 * cover) as u8), self.px[i]);
+                }
+            }
+        }
+    }
+
     /// Dessine `img` déformée dans le quadrilatère `quad` (haut-gauche, haut-droit, bas-droit,
     /// bas-gauche) : c'est ce qui donne la perspective. `shade` assombrit (0 : rien, 255 : noir).
     pub fn draw_quad(&mut self, img: &Image, quad: [(f32, f32); 4], alpha: u8, shade: u8) {

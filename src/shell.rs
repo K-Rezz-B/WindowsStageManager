@@ -44,6 +44,34 @@ pub fn taskbar_pins() -> Vec<String> {
     pins
 }
 
+/// Toutes les applis installées (y compris celles du Microsoft Store), telles que les liste le
+/// dossier « Applications » de Windows : (nom, chemin à ouvrir). À appeler depuis un fil COM.
+pub fn installed_apps() -> Vec<(String, String)> {
+    let mut apps = Vec::new();
+    unsafe {
+        let folder: Result<IShellItem> = SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, HANDLE::default());
+        let Ok(folder) = folder else { return apps };
+        let Ok(items) = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return apps };
+        loop {
+            let mut batch: [Option<IShellItem>; 1] = [None];
+            if items.Next(&mut batch, None).is_err() {
+                break;
+            }
+            let Some(item) = batch[0].take() else { break };
+            let text = |kind| -> Option<String> {
+                let raw = item.GetDisplayName(kind).ok()?;
+                let text = raw.to_string().ok();
+                CoTaskMemFree(Some(raw.0 as *const c_void));
+                text
+            };
+            if let (Some(name), Some(id)) = (text(SIGDN_NORMALDISPLAY), text(SIGDN_PARENTRELATIVEPARSING)) {
+                apps.push((name, format!("shell:AppsFolder\\{id}")));
+            }
+        }
+    }
+    apps
+}
+
 /// Ce qu'on sait d'un élément du Dock une fois chargé.
 pub struct Loaded {
     pub path: String,

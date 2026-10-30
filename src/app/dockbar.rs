@@ -6,7 +6,7 @@ use super::*;
 use crate::{
     canvas::round_corners,
     dock::{self, Dock, Kind, Metrics},
-    shell,
+    shell, volume,
 };
 
 pub(super) const WM_DOCKBAR: u32 = WM_APP + 6;
@@ -17,8 +17,8 @@ const TIMER_CLOCK: usize = 3;
 
 /// Largeurs du lecteur (à gauche du Dock) et de l'horloge (à droite), et leur écart avec le
 /// Dock, en pixels à 100 %.
-const PLAYER_WIDTH: i32 = 250;
-const CLOCK_WIDTH: i32 = 110;
+const PLAYER_WIDTH: i32 = 330;
+const CLOCK_WIDTH: i32 = 160;
 const PANEL_GAP: i32 = 10;
 
 const MENU_DOCK_OPEN: usize = 20;
@@ -44,15 +44,51 @@ pub(super) struct DockUi {
     backdrop_loaded: Arc<Mutex<Option<Image>>>,
     tracking: bool,
     trash_full: bool,
-    hover_play: bool,
+    /// Bouton du lecteur ou de l'horloge sous la souris.
+    hover_control: Option<Control>,
     /// Heure et date affichées, pour ne redessiner qu'au changement de minute.
     clock: (String, String),
+    /// Volume (entre 0 et 1) et son coupé, relus chaque seconde.
+    volume: Option<(f32, bool)>,
+}
+
+/// Les boutons des panneaux collés au Dock.
+#[derive(Clone, Copy, PartialEq)]
+enum Control {
+    Previous,
+    PlayPause,
+    Next,
+    Volume,
+    Clock,
 }
 
 /// Panneaux collés au Dock : le lecteur à gauche (s'il y a de la musique), l'horloge à droite.
 struct Panels {
     player: Option<PlayerLayout>,
     clock: RECT,
+    /// Icône du volume, dans le panneau de l'horloge.
+    volume: RECT,
+    /// Heure et date.
+    time: RECT,
+}
+
+impl Panels {
+    fn control_at(&self, pt: POINT) -> Option<Control> {
+        if let Some(p) = &self.player {
+            for (rect, control) in [(p.previous, Control::Previous), (p.button, Control::PlayPause), (p.next, Control::Next)] {
+                if contains(rect, pt) {
+                    return Some(control);
+                }
+            }
+        }
+        if contains(self.volume, pt) {
+            Some(Control::Volume)
+        } else if contains(self.time, pt) {
+            Some(Control::Clock)
+        } else {
+            None
+        }
+    }
 }
 
 impl DockUi {
@@ -70,8 +106,9 @@ impl DockUi {
             backdrop_loaded: Arc::new(Mutex::new(None)),
             tracking: false,
             trash_full: false,
-            hover_play: false,
+            hover_control: None,
             clock: clock_text(),
+            volume: None,
         }
     }
 
@@ -95,9 +132,14 @@ impl App {
             },
             WM_DOCK_LOADED => self.on_dock_loaded(),
             WM_TIMER if wp.0 == TIMER_CLOCK => {
+                // Chaque seconde : l'heure, le volume (il a pu changer au clavier) et la barre
+                // de progression du morceau en cours de lecture.
                 let clock = clock_text();
-                if clock != self.dock.clock {
+                let volume = volume::get();
+                let playing = self.now_playing.as_ref().is_some_and(|np| np.playing && np.timeline.is_some());
+                if clock != self.dock.clock || volume != self.dock.volume || playing {
                     self.dock.clock = clock;
+                    self.dock.volume = volume;
                     self.render_dock();
                 }
             }
@@ -274,20 +316,27 @@ impl App {
         let dpi = self.dock.dpi;
         let s = move |v: i32| v * dpi / 96;
         let (gap, height) = (s(PANEL_GAP), body.bottom - body.top);
+        let cy = (body.top + body.bottom) / 2;
         let clock = RECT { left: body.right + gap, top: body.top, right: body.right + gap + s(CLOCK_WIDTH), bottom: body.bottom };
+        let vsize = s(34);
+        let volume = RECT { left: clock.left + s(10), top: cy - vsize / 2, right: clock.left + s(10) + vsize, bottom: cy + vsize / 2 };
+        let time = RECT { left: volume.right, right: clock.right - s(8), ..clock };
         let player = self.now_playing.as_ref().map(|_| {
             let panel = RECT { left: body.left - gap - s(PLAYER_WIDTH), top: body.top, right: body.left - gap, bottom: body.bottom };
             let pad = s(8);
             let art_size = height - 2 * pad;
             let art = RECT { left: panel.left + pad, top: panel.top + pad, right: panel.left + pad + art_size, bottom: panel.bottom - pad };
-            let size = s(30);
-            let cy = (panel.top + panel.bottom) / 2;
-            let button = RECT { left: panel.right - pad - size, top: cy - size / 2, right: panel.right - pad, bottom: cy + size / 2 };
-            let title = RECT { left: art.right + s(10), top: cy - s(19), right: button.left - s(8), bottom: cy };
-            let artist = RECT { top: cy, bottom: cy + s(18), ..title };
-            PlayerLayout { panel, art, title, artist, button }
+            // Précédent, lecture/pause, suivant, de gauche à droite contre le bord droit.
+            let size = s(28);
+            let next = RECT { left: panel.right - pad - size, top: cy - size / 2, right: panel.right - pad, bottom: cy + size / 2 };
+            let button = offset(next, -size, 0);
+            let previous = offset(button, -size, 0);
+            let title = RECT { left: art.right + s(10), top: cy - s(21), right: previous.left - s(6), bottom: cy - s(3) };
+            let artist = RECT { top: cy - s(3), bottom: cy + s(13), ..title };
+            let progress = RECT { top: cy + s(17), bottom: cy + s(20), ..title };
+            PlayerLayout { panel, art, title, artist, previous, button, next, progress }
         });
-        Panels { player, clock }
+        Panels { player, clock, volume, time }
     }
 
     /// Disposition actuelle du Dock et de ses panneaux, en coordonnées de sa fenêtre.
@@ -345,12 +394,33 @@ impl App {
                 ], 255, 0),
                 None => canvas.round_rect(p.art, s(6), (70, 70, 80), 255),
             }
-            // Bouton lecture/pause : icône pleine posée sur le verre, rond clair au survol.
-            if self.dock.hover_play {
-                canvas.round_rect(p.button, (p.button.right - p.button.left) / 2, white, 40);
+            // Boutons : icônes pleines posées sur le verre, rond clair sous la souris.
+            for (rect, control) in [(p.previous, Control::Previous), (p.button, Control::PlayPause), (p.next, Control::Next)] {
+                if self.dock.hover_control == Some(control) {
+                    canvas.round_rect(rect, (rect.right - rect.left) / 2, white, 40);
+                }
             }
             draw_play_pause(&mut canvas, p.button, np.playing, dpi);
+            draw_skip(&mut canvas, p.previous, false, if np.can_previous { 255 } else { 90 }, dpi);
+            draw_skip(&mut canvas, p.next, true, if np.can_next { 255 } else { 90 }, dpi);
+            // Progression du morceau : piste discrète, partie écoutée en blanc.
+            if let Some(progress) = np.progress(crate::media::filetime_now()) {
+                let bar = p.progress;
+                let radius = (bar.bottom - bar.top) / 2;
+                canvas.round_rect(bar, radius, white, 60);
+                let done = bar.left + ((bar.right - bar.left) as f64 * progress).round() as i32;
+                if done > bar.left {
+                    canvas.round_rect(RECT { right: done.max(bar.left + 2 * radius), ..bar }, radius, white, 230);
+                }
+            }
         }
+        // Volume, dans le panneau de l'horloge.
+        if self.dock.hover_control == Some(Control::Volume) {
+            let v = panels.volume;
+            canvas.round_rect(v, (v.right - v.left) / 2, white, 40);
+        }
+        let (level, muted) = self.dock.volume.unwrap_or((0.0, false));
+        draw_volume(&mut canvas, panels.volume, level, muted, dpi);
         if let Some(x) = layout.separator {
             canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
         }
@@ -370,10 +440,18 @@ impl App {
                 canvas.round_rect(dot, s(2), white, 220);
             }
         }
-        // Étiquette au-dessus de l'icône survolée.
-        let label = self.dock.model.hover.and_then(|i| Some((self.dock.model.items.get(i)?, layout.icons.get(i)?)));
-        let label_box = label.map(|(item, rect)| {
-            let width = text_width(self.font, &item.name) + s(22);
+        // Étiquette au-dessus de l'icône survolée, ou du volume.
+        let volume_label = match self.dock.volume {
+            Some((_, true)) => "Son coupé".to_owned(),
+            Some((level, false)) => format!("Volume {} %", (level * 100.0).round()),
+            None => "Aucune sortie audio".to_owned(),
+        };
+        let label = match self.dock.hover_control {
+            Some(Control::Volume) => Some((volume_label.as_str(), panels.volume)),
+            _ => self.dock.model.hover.and_then(|i| Some((self.dock.model.items.get(i)?.name.as_str(), *layout.icons.get(i)?))),
+        };
+        let label_box = label.map(|(name, rect)| {
+            let width = text_width(self.font, name) + s(22);
             let cx = (rect.left + rect.right) / 2;
             let bottom = rect.top - s(10);
             let r = RECT { left: cx - width / 2, top: bottom - s(26), right: cx + width / 2, bottom };
@@ -386,15 +464,15 @@ impl App {
         canvas.gdi(|dc| unsafe {
             SetBkMode(dc, TRANSPARENT);
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-            if let (Some((item, _)), Some(r)) = (label, label_box) {
+            if let (Some((name, _)), Some(r)) = (label, label_box) {
                 SelectObject(dc, self.font);
                 SetTextColor(dc, TEXT);
-                let mut text: Vec<u16> = item.name.encode_utf16().collect();
+                let mut text: Vec<u16> = name.encode_utf16().collect();
                 let mut rect = r;
                 DrawTextW(dc, &mut text, &mut rect, centered);
             }
             // Horloge : l'heure en gras, la date en dessous.
-            let c = panels.clock;
+            let c = panels.time;
             let mid = (c.top + c.bottom) / 2;
             SelectObject(dc, self.font_time);
             draw_text(dc, time, RECT { top: c.top + s(6), bottom: mid + s(4), ..c }, centered, TEXT, 0);
@@ -438,7 +516,7 @@ impl App {
         layout.icons.iter().position(|r| x >= r.left as f32 - half_gap && x < r.right as f32 + half_gap)
     }
 
-    pub(super) fn dock_mouse(&mut self, msg: u32, lp: LPARAM) {
+    pub(super) fn dock_mouse(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) {
         let pt = point(lp);
         match msg {
             WM_MOUSEMOVE => {
@@ -455,28 +533,51 @@ impl App {
                 // Le Dock ne grossit que sous la souris, pas quand elle passe sur le lecteur ou
                 // l'horloge.
                 self.dock.model.set_hover(hover.map(|_| pt.x as f32), hover);
-                self.dock.hover_play = self.dock_panels().player.is_some_and(|p| contains(p.button, pt));
+                self.dock.hover_control = self.dock_panels().control_at(pt);
                 self.render_dock();
             }
             WM_MOUSELEAVE => {
                 self.dock.tracking = false;
                 self.dock.model.set_hover(None, None);
+                self.dock.hover_control = None;
                 self.render_dock();
             }
-            WM_LBUTTONUP => {
-                let panels = self.dock_panels();
-                if panels.player.as_ref().is_some_and(|p| contains(p.button, pt)) {
+            WM_LBUTTONUP => match self.dock_panels().control_at(pt) {
+                Some(Control::PlayPause) => {
                     self.media.toggle_play_pause();
                     // Affiché tout de suite, sans attendre la confirmation du lecteur.
                     if let Some(np) = self.now_playing.as_mut() {
                         np.playing = !np.playing;
                     }
                     self.render_dock();
-                } else if contains(panels.clock, pt) {
-                    // Comme l'horloge de la barre des tâches : calendrier et notifications.
-                    shell::open("ms-actioncenter:");
-                } else if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
-                    self.dock_click(index);
+                }
+                Some(Control::Previous) => self.media.previous(),
+                Some(Control::Next) => self.media.next(),
+                Some(Control::Volume) => {
+                    volume::toggle_mute();
+                    self.dock.volume = volume::get();
+                    self.render_dock();
+                }
+                // Comme l'horloge de la barre des tâches : calendrier et notifications.
+                Some(Control::Clock) => shell::open("ms-actioncenter:"),
+                None => {
+                    if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
+                        self.dock_click(index);
+                    }
+                }
+            },
+            WM_MOUSEWHEEL => {
+                // La molette au-dessus de l'horloge règle le volume, par pas de 2 %.
+                // (Pour cette molette, Windows donne la position à l'écran.)
+                let win = self.dock.window;
+                let local = POINT { x: pt.x - win.left, y: pt.y - win.top };
+                if contains(self.dock_panels().clock, local) {
+                    let notches = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                    let (level, _) = volume::get().unwrap_or((0.0, false));
+                    volume::set(level + notches * 0.02);
+                    self.dock.volume = volume::get();
+                    self.dock.hover_control = Some(Control::Volume);
+                    self.render_dock();
                 }
             }
             _ => {}
@@ -610,6 +711,49 @@ fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
     }
 }
 
+/// Icône « précédent » ou « suivant » : deux triangles accolés.
+fn draw_skip(canvas: &mut Canvas, button: RECT, forward: bool, alpha: u8, dpi: i32) {
+    let k = dpi as f32 / 96.0;
+    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
+    let (w, h) = (8.0 * k, 10.0 * k);
+    let dir = if forward { 1.0 } else { -1.0 };
+    for start in [cx - dir * w, cx] {
+        let triangle = [(start, cy - h / 2.0), (start + dir * w, cy), (start, cy + h / 2.0)];
+        canvas.fill_convex(&round_corners(&triangle, 1.2 * k), (255, 255, 255), alpha);
+    }
+}
+
+/// Haut-parleur avec une à trois ondes selon le volume, ou une croix si le son est coupé.
+fn draw_volume(canvas: &mut Canvas, button: RECT, level: f32, muted: bool, dpi: i32) {
+    let k = dpi as f32 / 96.0;
+    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
+    let white = (255, 255, 255);
+    let x0 = cx - 9.0 * k;
+    let body = RECT {
+        left: x0.round() as i32,
+        top: (cy - 3.0 * k).round() as i32,
+        right: (x0 + 3.5 * k).round() as i32,
+        bottom: (cy + 3.0 * k).round() as i32,
+    };
+    canvas.round_rect(body, k.round() as i32, white, 255);
+    let cone = [(x0 + 3.0 * k, cy - 3.0 * k), (x0 + 8.0 * k, cy - 7.5 * k), (x0 + 8.0 * k, cy + 7.5 * k), (x0 + 3.0 * k, cy + 3.0 * k)];
+    canvas.fill_convex(&round_corners(&cone, k), white, 255);
+    if muted {
+        // Croix : deux barres fines en diagonale.
+        let (mx, r, t) = (x0 + 14.0 * k, 3.2 * k, 0.8 * k);
+        for s in [1.0, -1.0] {
+            let bar = [(mx - r - t, cy - s * (r - t)), (mx - r + t, cy - s * (r + t)), (mx + r + t, cy + s * (r - t)), (mx + r - t, cy + s * (r + t))];
+            canvas.fill_convex(&bar, white, 255);
+        }
+        return;
+    }
+    // Ondes : allumées selon le volume, les autres restent discrètes.
+    for (i, threshold) in [0.001, 0.34, 0.67].into_iter().enumerate() {
+        let alpha = if level >= threshold { 255 } else { 60 };
+        canvas.arc((x0 + 7.0 * k, cy), (4.5 + 3.2 * i as f32) * k, 0.8, 1.6 * k, white, alpha);
+    }
+}
+
 /// Heure (« 22:15 ») et date courte (« jeu. 30 oct. ») au format de Windows.
 fn clock_text() -> (String, String) {
     use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx};
@@ -624,7 +768,7 @@ fn clock_text() -> (String, String) {
 }
 
 /// Largeur d'un texte dans une police donnée, en pixels.
-fn text_width(font: HFONT, text: &str) -> i32 {
+pub(super) fn text_width(font: HFONT, text: &str) -> i32 {
     unsafe {
         let dc = CreateCompatibleDC(None);
         let old = SelectObject(dc, font);

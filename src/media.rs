@@ -36,6 +36,21 @@ pub struct NowPlaying {
     pub artist: String,
     pub playing: bool,
     pub art: Option<Arc<Image>>,
+    pub can_previous: bool,
+    pub can_next: bool,
+    /// Position et durée du morceau, si le lecteur les donne.
+    pub timeline: Option<Timeline>,
+}
+
+/// Où en est le morceau. Le lecteur ne prévient qu'aux changements (lecture, pause, saut) :
+/// entre deux, on calcule la position à partir de l'heure.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Timeline {
+    /// Position au moment `updated`, en secondes.
+    pub position: f64,
+    pub duration: f64,
+    /// Heure de la dernière mise à jour (FILETIME : centaines de nanosecondes depuis 1601).
+    pub updated: i64,
 }
 
 impl NowPlaying {
@@ -44,11 +59,29 @@ impl NowPlaying {
             && self.artist == other.artist
             && self.playing == other.playing
             && self.art.is_some() == other.art.is_some()
+            && self.can_previous == other.can_previous
+            && self.can_next == other.can_next
+            && self.timeline == other.timeline
     }
+
+    /// Avancement du morceau entre 0 et 1, à l'instant `now` (FILETIME).
+    pub fn progress(&self, now: i64) -> Option<f64> {
+        let t = self.timeline?;
+        let elapsed = if self.playing { (now - t.updated).max(0) as f64 / 1e7 } else { 0.0 };
+        Some(((t.position + elapsed) / t.duration).clamp(0.0, 1.0))
+    }
+}
+
+/// Heure actuelle au format FILETIME, pour `NowPlaying::progress`.
+pub fn filetime_now() -> i64 {
+    let ft = unsafe { windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime() };
+    ((ft.dwHighDateTime as i64) << 32) | ft.dwLowDateTime as i64
 }
 
 enum Command {
     TogglePlayPause,
+    Previous,
+    Next,
 }
 
 pub struct Media {
@@ -74,6 +107,14 @@ impl Media {
     pub fn toggle_play_pause(&self) {
         let _ = self.commands.send(Command::TogglePlayPause);
     }
+
+    pub fn previous(&self) {
+        let _ = self.commands.send(Command::Previous);
+    }
+
+    pub fn next(&self) {
+        let _ = self.commands.send(Command::Next);
+    }
 }
 
 fn worker(state: Arc<Mutex<Option<NowPlaying>>>, commands: mpsc::Receiver<Command>, notify: isize, message: u32) {
@@ -88,9 +129,14 @@ fn worker(state: Arc<Mutex<Option<NowPlaying>>>, commands: mpsc::Receiver<Comman
     loop {
         // Une lecture par seconde suffit ; une commande réveille le fil tout de suite.
         match commands.recv_timeout(Duration::from_millis(1000)) {
-            Ok(Command::TogglePlayPause) => {
+            Ok(command) => {
                 if let Ok(session) = manager.GetCurrentSession() {
-                    let _ = session.TryTogglePlayPauseAsync().and_then(|op| op.get());
+                    let _ = match command {
+                        Command::TogglePlayPause => session.TryTogglePlayPauseAsync(),
+                        Command::Previous => session.TrySkipPreviousAsync(),
+                        Command::Next => session.TrySkipNextAsync(),
+                    }
+                    .and_then(|op| op.get());
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -125,10 +171,20 @@ fn read(
         return None;
     }
     let artist = props.Artist().map(|a| a.to_string()).unwrap_or_default();
-    let playing = session
-        .GetPlaybackInfo()
-        .and_then(|info| info.PlaybackStatus())
-        .is_ok_and(|status| status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+    let info = session.GetPlaybackInfo().ok();
+    let playing = info
+        .as_ref()
+        .and_then(|i| i.PlaybackStatus().ok())
+        .is_some_and(|status| status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+    let controls = info.as_ref().and_then(|i| i.Controls().ok());
+    let can_previous = controls.as_ref().is_some_and(|c| c.IsPreviousEnabled().unwrap_or(false));
+    let can_next = controls.as_ref().is_some_and(|c| c.IsNextEnabled().unwrap_or(false));
+    let timeline = session.GetTimelineProperties().ok().and_then(|t| {
+        let duration = (t.EndTime().ok()?.Duration - t.StartTime().ok()?.Duration) as f64 / 1e7;
+        let position = t.Position().ok()?.Duration as f64 / 1e7;
+        let updated = t.LastUpdatedTime().ok()?.UniversalTime;
+        (duration > 0.0).then_some(Timeline { position, duration, updated })
+    });
     if (title.as_str(), artist.as_str()) != (track.0.as_str(), track.1.as_str()) {
         *track = (title.clone(), artist.clone());
         *art = None;
@@ -137,7 +193,7 @@ fn read(
     if art.is_none() {
         *art = props.Thumbnail().ok().and_then(|t| decode(&t)).map(Arc::new);
     }
-    Some(NowPlaying { title, artist, playing, art: art.clone() })
+    Some(NowPlaying { title, artist, playing, art: art.clone(), can_previous, can_next, timeline })
 }
 
 /// Décode la pochette en carré (on garde le centre : les vignettes vidéo sont en 16/9).
