@@ -155,7 +155,6 @@ struct App {
     tracking_mouse: bool,
     font: HFONT,
     font_bold: HFONT,
-    font_icons: HFONT,
     media: Media,
     /// Morceau en cours, affiché dans le lecteur à gauche du Dock.
     now_playing: Option<NowPlaying>,
@@ -211,7 +210,6 @@ impl App {
             tracking_mouse: false,
             font: HFONT::default(),
             font_bold: HFONT::default(),
-            font_icons: HFONT::default(),
             media: Media::start(hwnd, WM_MEDIA),
             now_playing: None,
             font_time: HFONT::default(),
@@ -863,7 +861,7 @@ impl App {
             self.appbar = Some(r);
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
 
-            for font in [self.font, self.font_bold, self.font_icons, self.font_time] {
+            for font in [self.font, self.font_bold, self.font_time] {
                 if !font.is_invalid() {
                     let _ = DeleteObject(font);
                 }
@@ -872,8 +870,6 @@ impl App {
             // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
             self.font = make_font("Inter", 12, 400, dpi);
             self.font_bold = make_font("Inter SemiBold", 12, 600, dpi);
-            // Icônes de Windows 11 (lecture, pause).
-            self.font_icons = make_font("Segoe Fluent Icons", 14, 400, dpi);
             // L'heure, à droite du Dock.
             self.font_time = make_font("Inter SemiBold", 16, 600, dpi);
         }

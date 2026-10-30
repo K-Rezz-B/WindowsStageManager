@@ -118,6 +118,44 @@ impl Canvas {
         }
     }
 
+    /// Remplit un polygone convexe (sommets dans l'ordre), bords lissés par suréchantillonnage.
+    pub fn fill_convex(&mut self, points: &[(f32, f32)], rgb: (u8, u8, u8), alpha: u8) {
+        if points.len() < 3 {
+            return;
+        }
+        // Orientation du polygone, pour savoir de quel côté de chaque bord est l'intérieur.
+        let area: f32 = (0..points.len())
+            .map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum();
+        let sign = area.signum();
+        let inside = |x: f32, y: f32| {
+            (0..points.len()).all(|i| {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                ((b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0)) * sign >= 0.0
+            })
+        };
+        let x0 = (points.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor() as i32).max(0);
+        let x1 = (points.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as i32).min(self.w);
+        let y0 = (points.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor() as i32).max(0);
+        let y1 = (points.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as i32).min(self.h);
+        const N: usize = 4;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let hits = (0..N * N)
+                    .filter(|k| inside(x as f32 + (k % N) as f32 / N as f32 + 0.125, y as f32 + (k / N) as f32 / N as f32 + 0.125))
+                    .count();
+                if hits > 0 {
+                    let a = (alpha as usize * hits / (N * N)) as u8;
+                    let i = (y * self.w + x) as usize;
+                    self.px[i] = over(premul(rgb, a), self.px[i]);
+                }
+            }
+        }
+    }
+
     /// Dessine `img` déformée dans le quadrilatère `quad` (haut-gauche, haut-droit, bas-droit,
     /// bas-gauche) : c'est ce qui donne la perspective. `shade` assombrit (0 : rien, 255 : noir).
     pub fn draw_quad(&mut self, img: &Image, quad: [(f32, f32); 4], alpha: u8, shade: u8) {
@@ -314,6 +352,30 @@ impl Canvas {
     }
 }
 
+/// Arrondit les coins d'un polygone convexe : chaque sommet devient une petite courbe de
+/// rayon `radius` (en pixels).
+pub fn round_corners(points: &[(f32, f32)], radius: f32) -> Vec<(f32, f32)> {
+    let n = points.len();
+    let mut out = Vec::with_capacity(n * 7);
+    for i in 0..n {
+        let (p, v, q) = (points[(i + n - 1) % n], points[i], points[(i + 1) % n]);
+        let toward = |a: (f32, f32), len: f32| {
+            let (dx, dy) = (a.0 - v.0, a.1 - v.1);
+            let d = dx.hypot(dy).max(1e-3);
+            let r = len.min(d / 2.0);
+            (v.0 + dx / d * r, v.1 + dy / d * r)
+        };
+        let (a, b) = (toward(p, radius), toward(q, radius));
+        // Courbe de Bézier quadratique a → (v) → b.
+        for k in 0..=6 {
+            let t = k as f32 / 6.0;
+            let u = 1.0 - t;
+            out.push((u * u * a.0 + 2.0 * u * t * v.0 + t * t * b.0, u * u * a.1 + 2.0 * u * t * v.1 + t * t * b.1));
+        }
+    }
+    out
+}
+
 /// Transformation projective du carré unité vers un quadrilatère (et retour).
 struct Homography([f32; 9]);
 
@@ -481,6 +543,17 @@ mod tests {
         assert_eq!(c.px[(20 * 40 + 20) as usize] >> 24, 255, "le centre est couvert");
         assert_eq!(c.px[(5 * 40 + 5) as usize] >> 24, 0, "le coin arrondi reste vide");
         assert!(channel(c.px[(20 * 40 + 20) as usize], 8) > 0, "on voit le fond à travers");
+    }
+
+    #[test]
+    fn triangle_lisse() {
+        let mut c = Canvas::new(20, 20);
+        let tri = round_corners(&[(4.0, 2.0), (18.0, 10.0), (4.0, 18.0)], 2.0);
+        c.fill_convex(&tri, (255, 255, 255), 255);
+        assert_eq!(c.px[(10 * 20 + 8) as usize] >> 24, 255, "l'intérieur est plein");
+        assert_eq!(c.px[(2 * 20 + 16) as usize] >> 24, 0, "l'extérieur est vide");
+        let edge = (0..20).map(|x| c.px[(10 * 20 + x) as usize] >> 24).filter(|a| *a > 0 && *a < 255).count();
+        assert!(edge > 0, "les bords sont lissés");
     }
 
     #[test]

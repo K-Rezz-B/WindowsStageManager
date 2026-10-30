@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::{
+    canvas::round_corners,
     dock::{self, Dock, Kind, Metrics},
     shell,
 };
@@ -344,10 +345,11 @@ impl App {
                 ], 255, 0),
                 None => canvas.round_rect(p.art, s(6), (70, 70, 80), 255),
             }
-            // Bulle de verre plus claire pour le bouton, encore plus claire au survol.
-            let frost = if self.dock.hover_play { 0.5 } else { 0.34 };
-            let bubble = Glass { frost, darken: 0.05, refraction: s(6) as f32, bevel: s(9) as f32, rim: 0.9 };
-            plate(&mut canvas, p.button, (p.button.right - p.button.left) as f32 / 2.0, &bubble);
+            // Bouton lecture/pause : icône pleine posée sur le verre, rond clair au survol.
+            if self.dock.hover_play {
+                canvas.round_rect(p.button, (p.button.right - p.button.left) / 2, white, 40);
+            }
+            draw_play_pause(&mut canvas, p.button, np.playing, dpi);
         }
         if let Some(x) = layout.separator {
             canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
@@ -405,10 +407,6 @@ impl App {
                 draw_text(dc, &np.title, p.title, line, TEXT, 0);
                 SelectObject(dc, self.font);
                 draw_text(dc, &np.artist, p.artist, line, TEXT_DIM, 0);
-                // Icônes Segoe Fluent : E769 pause, E768 lecture.
-                SelectObject(dc, self.font_icons);
-                let glyph = String::from_utf16_lossy(&[if np.playing { 0xE769 } else { 0xE768 }]);
-                draw_text(dc, &glyph, p.button, centered, TEXT, 0);
             }
         });
         canvas.present(self.dock.hwnd, POINT { x: window.left, y: window.top });
@@ -588,6 +586,27 @@ pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
         }
         MENU_TRASH_EMPTY => shell::empty_recycle_bin(hwnd),
         _ => {}
+    }
+}
+
+/// Icône pleine du bouton, comme dans les lecteurs d'Apple : deux barres arrondies pendant la
+/// lecture (pour mettre en pause), un triangle aux coins arrondis sinon.
+fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
+    let k = dpi as f32 / 96.0;
+    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
+    let white = (255, 255, 255);
+    if playing {
+        let (w, h, gap) = (5.0 * k, 16.0 * k, 5.0 * k);
+        for x in [cx - gap / 2.0 - w, cx + gap / 2.0] {
+            let bar = RECT { left: x.round() as i32, top: (cy - h / 2.0).round() as i32, right: (x + w).round() as i32, bottom: (cy + h / 2.0).round() as i32 };
+            canvas.round_rect(bar, (1.6 * k).round() as i32, white, 255);
+        }
+    } else {
+        // Décalé vers la droite : un triangle paraît centré quand son centre de gravité l'est.
+        let (w, h) = (14.0 * k, 16.0 * k);
+        let left = cx - w / 2.0 + 1.5 * k;
+        let triangle = [(left, cy - h / 2.0), (left + w, cy), (left, cy + h / 2.0)];
+        canvas.fill_convex(&round_corners(&triangle, 2.2 * k), white, 255);
     }
 }
 
