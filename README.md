@@ -21,6 +21,10 @@ cargo run --release
   barre comme scène à part, et reviendra à sa place d'origine quand on la rouvrira.
 - **Clic droit sur une carte → « Séparer les fenêtres »** : éclate une scène regroupée en une
   scène par fenêtre.
+- **Lecteur de musique** en bas de la barre : pochette, titre, artiste et bouton lecture/pause
+  du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…), sur une
+  plaque de « verre liquide ». Il n'apparaît que lorsqu'un média est ouvert. Le verre est
+  calculé à partir du fond d'écran (seule chose derrière la barre), lu et flouté une seule fois.
 - **Ctrl + Alt + S** : active ou désactive le Stage Manager (toutes les fenêtres sont restaurées).
   Désactiver puis réactiver recrée les scènes, une par application.
 - **Icône dans la zone de notification** (clic droit) : activer/désactiver, lancer au
@@ -79,6 +83,8 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/app.rs` | Barre latérale (AppBar), miniatures DWM, icône de notification, événements |
 | `src/anim.rs` | Animations : fenêtre transparente, trajectoires, courbes d'accélération |
 | `src/canvas.rs` | Dessin avec transparence par pixel pour la barre, projection en perspective |
+| `src/wallpaper.rs` | Fond d'écran derrière la barre, flouté, pour l'effet verre (fil à part) |
+| `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |
 | `src/autostart.rs` | Lancement automatique à l'ouverture de session |
 | `build.rs`, `assets/` | Icône de l'application et son intégration dans l'exécutable |

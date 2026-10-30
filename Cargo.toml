@@ -7,6 +7,11 @@ description = "Un Stage Manager façon macOS pour Windows 11"
 [dependencies.windows]
 version = "0.58"
 features = [
+    "Foundation",
+    "Graphics_Imaging",
+    "Media_Control",
+    "Storage",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
@@ -15,6 +20,7 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
