@@ -3,7 +3,7 @@
 Une reproduction du Stage Manager de macOS pour Windows 11, écrite en Rust.
 
 Une barre transparente sur le bord gauche de l'écran affiche les autres « scènes » sous forme
-de miniatures en direct, posées sur le fond d'écran. La scène active reste seule à l'écran ;
+de cartes inclinées en perspective, comme sur macOS, posées sur le fond d'écran. La scène active reste seule à l'écran ;
 les autres sont réduites.
 
 ## Utilisation
@@ -78,7 +78,8 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/win.rs` | Utilitaires Win32 : filtrage des fenêtres, processus, icônes, premier plan |
 | `src/app.rs` | Barre latérale (AppBar), miniatures DWM, icône de notification, événements |
 | `src/anim.rs` | Animations : fenêtre transparente, trajectoires, courbes d'accélération |
-| `src/canvas.rs` | Dessin avec transparence par pixel pour la barre (fenêtre en couches) |
+| `src/canvas.rs` | Dessin avec transparence par pixel pour la barre, projection en perspective |
+| `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |
 | `src/autostart.rs` | Lancement automatique à l'ouverture de session |
 | `build.rs`, `assets/` | Icône de l'application et son intégration dans l'exécutable |
 | `src/main.rs` | Point d'entrée, instance unique |
@@ -93,5 +94,9 @@ comme la barre des tâches), `ShowWindowAsync` (une appli figée ne bloque pas l
   Stage Manager est lui-même lancé en administrateur.
 - La barre n'apparaît que sur l'écran principal.
 - Les bureaux virtuels ne sont pas encore pris en compte.
+- Les cartes de la barre sont des instantanés pris quand la fenêtre a quitté l'écran (les
+  miniatures DWM, elles, ne peuvent pas être inclinées) : elles ne suivent pas les changements
+  de contenu d'une fenêtre réduite. Pendant le trajet, les miniatures restent plates et se
+  fondent dans la carte inclinée à l'arrivée.
 - Les applis Chromium/Electron (Discord, Chrome…) cessent de se dessiner quand elles restent
-  longtemps réduites : leur miniature peut alors être noire jusqu'à leur réaffichage.
+  longtemps réduites : leur miniature volante peut être noire au début du trajet.

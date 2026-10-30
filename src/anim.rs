@@ -71,6 +71,13 @@ pub fn spring(t: f64) -> f64 {
     raw(t) + (1.0 - raw(1.0)) * t.powi(4)
 }
 
+/// Fondu enchaîné en fin de trajet (0 → 1 sur le dernier tiers) : la miniature plate qui vole
+/// laisse la place à la carte inclinée de la barre.
+pub fn cross_fade(t: f64) -> f64 {
+    let x = ((t - 0.65) / 0.35).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
 /// Opacité d'une miniature qui apparaît : fondu sur le premier tiers de l'animation.
 pub fn fade_in(t: f64) -> u8 {
     (255.0 * ease_out((t / 0.35).min(1.0))) as u8

@@ -5,6 +5,7 @@ mod anim;
 mod app;
 mod autostart;
 mod canvas;
+mod snapshot;
 mod stages;
 mod win;
 

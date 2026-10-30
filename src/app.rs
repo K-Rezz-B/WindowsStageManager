@@ -2,6 +2,7 @@
 
 use std::{
     cell::RefCell,
+    rc::Rc,
     collections::{HashMap, HashSet},
     mem::size_of,
     sync::{
@@ -24,7 +25,8 @@ use windows::{
 use crate::{
     anim::{self, fit, inflate, offset, size, Flight, Switch},
     autostart,
-    canvas::Canvas,
+    canvas::{Canvas, Image},
+    snapshot,
     stages::{Model, Transition, Wid},
     win::{self, hwnd_of, wid_of},
 };
@@ -48,13 +50,14 @@ const MENU_SPLIT: usize = 6;
 const BAR_WIDTH: i32 = 200;
 /// Après un changement de scène, on ignore les événements parasites qu'il provoque.
 const SWITCH_GUARD: Duration = Duration::from_millis(500);
+/// Largeur des instantanés de fenêtres, en pixels (environ deux fois une carte, pour la netteté).
+const SNAPSHOT_WIDTH: i32 = 400;
 /// Durée par défaut des animations (modifiable avec STAGE_MANAGER_ANIM_MS, 0 pour les couper).
 const ANIM_MS: u64 = 650;
 /// Délai entre la restauration des vraies fenêtres et le retrait des miniatures animées :
 /// le temps qu'elles se redessinent et se remettent dans le bon ordre, cachées dessous.
 const SETTLE: Duration = Duration::from_millis(150);
 
-const PLACEHOLDER: COLORREF = rgb(48, 48, 54);
 const TEXT: COLORREF = rgb(245, 245, 248);
 const TEXT_DIM: COLORREF = rgb(200, 200, 208);
 
@@ -81,23 +84,24 @@ pub fn restore_hidden() {
     }
 }
 
+#[derive(Clone)]
 struct Card {
     stage: u64,
     window: Wid,
-    count: usize,
+    /// Fenêtres dessinées sur la carte (trois au plus), celle de devant en premier.
+    windows: Vec<Wid>,
     /// Toute la carte (miniature + libellé).
     rect: RECT,
     /// Zone réservée à la miniature.
     thumb_box: RECT,
-    /// Emplacement réel de la miniature (proportions de la fenêtre).
+    /// Emplacement de la miniature à plat (proportions de la fenêtre), avant l'inclinaison.
     dest: RECT,
     icon: HICON,
-    thumb: Option<isize>,
     /// Écart avec la position précédente, résorbé par l'animation de glissement.
     slide: (i32, i32),
-    /// Carte de la scène qui est en train de rejoindre la barre : cachée jusqu'à son arrivée.
+    /// Carte qu'on est en train de déplacer à la souris : elle quitte la barre.
     hidden: bool,
-    /// Carte qui vient d'apparaître dans la barre : sa miniature arrive en fondu.
+    /// Carte qui vient d'apparaître dans la barre : elle arrive en fondu.
     fade_in: bool,
 }
 
@@ -131,7 +135,10 @@ struct App {
     manageable: HashMap<u32, bool>,
     self_elevated: bool,
     cards: Vec<Card>,
-    thumbs: Vec<isize>,
+    /// Image de chaque fenêtre au moment où elle a quitté l'écran (cartes inclinées).
+    snapshots: HashMap<Wid, Rc<Image>>,
+    /// Carte de la scène qui revient à l'écran : elle s'efface pendant que ses fenêtres partent.
+    departing: Option<Card>,
     layout_key: LayoutKey,
     icons: HashMap<Wid, HICON>,
     hover: Option<u64>,
@@ -178,7 +185,8 @@ impl App {
             manageable: HashMap::new(),
             self_elevated: win::is_elevated(None).unwrap_or(false),
             cards: Vec::new(),
-            thumbs: Vec::new(),
+            snapshots: HashMap::new(),
+            departing: None,
             layout_key: Vec::new(),
             icons: HashMap::new(),
             hover: None,
@@ -302,7 +310,9 @@ impl App {
         self.pending_minimize.clear();
         self.icons.clear();
         self.last_rects.clear();
-        self.clear_thumbnails();
+        self.cards.clear();
+        self.snapshots.clear();
+        self.departing = None;
         self.layout_key.clear();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -457,6 +467,7 @@ impl App {
         self.pending_minimize.remove(&w);
         self.icons.remove(&w);
         self.last_rects.remove(&w);
+        self.snapshots.remove(&w);
         HIDDEN.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != w);
     }
 
@@ -497,6 +508,16 @@ impl App {
             return;
         }
         self.finish_switch();
+        // Dernière occasion de photographier les fenêtres sortantes : réduites, elles ne se
+        // dessinent plus. Ces images servent aux cartes inclinées de la barre.
+        for &w in &t.minimize {
+            let h = hwnd_of(w);
+            if !win::is_minimized(h) {
+                if let Some(image) = snapshot::capture(h, SNAPSHOT_WIDTH) {
+                    self.snapshots.insert(w, Rc::new(image));
+                }
+            }
+        }
         {
             let mut hidden = HIDDEN.lock().unwrap_or_else(|e| e.into_inner());
             hidden.retain(|w| !t.restore.contains(w) && t.focus != Some(*w));
@@ -527,12 +548,21 @@ impl App {
         // Les fenêtres entrantes partent de leur carte actuelle dans la barre.
         let incoming: Vec<Wid> = t.restore.iter().copied().chain(t.focus).collect();
         // Si on vient de lâcher une carte, elles partent de là où on l'a lâchée.
-        let source = self.drag_source.take().or_else(|| {
-            self.cards.iter().find(|c| incoming.contains(&c.window)).map(|c| {
-                let (dx, dy) = self.card_offset(c, now);
-                bar_to_overlay(offset(c.thumb_box, dx, dy))
-            })
+        let dropped = self.drag_source.take();
+        let card = self.cards.iter().find(|c| incoming.contains(&c.window)).map(|c| {
+            // Figée à sa position affichée : elle va s'effacer pendant que ses fenêtres partent.
+            let (dx, dy) = self.card_offset(c, now);
+            Card {
+                rect: offset(c.rect, dx, dy),
+                thumb_box: offset(c.thumb_box, dx, dy),
+                dest: offset(c.dest, dx, dy),
+                slide: (0, 0),
+                fade_in: false,
+                ..c.clone()
+            }
         });
+        let source = dropped.or_else(|| card.as_ref().map(|c| bar_to_overlay(c.thumb_box)));
+        self.departing = if dropped.is_none() { card } else { None };
 
         // La scène sortante prend la première place de la barre ; sa carte reste cachée
         // jusqu'à ce que les miniatures l'aient rejointe.
@@ -584,6 +614,7 @@ impl App {
             fly(w, from, to, true);
         }
         if flights.is_empty() {
+            self.departing = None;
             self.reveal_arriving();
             return false;
         }
@@ -637,28 +668,37 @@ impl App {
     /// Une image d'animation, appelée à chaque rafraîchissement de l'écran.
     fn tick(&mut self) {
         let now = Instant::now();
-        if let Some(start) = self.slide_start {
-            self.place_cards(now);
-            self.invalidate();
-            if anim::progress(start, self.anim_duration, now) >= 1.0 {
-                self.slide_start = None;
+        // La barre se redessine tant que ses cartes bougent ou s'enchaînent en fondu.
+        let mut redraw = self.slide_start.is_some();
+        if self.slide_start.is_some_and(|start| anim::progress(start, self.anim_duration, now) >= 1.0) {
+            self.slide_start = None;
+        }
+        if let Some(switch) = &self.switch {
+            match switch.landed {
+                None => {
+                    let p = anim::progress(switch.start, switch.duration, now);
+                    let e = anim::spring(p);
+                    for f in &switch.flights {
+                        // Les entrantes apparaissent en fondu ; les sortantes laissent la place
+                        // à leur carte inclinée en fin de trajet.
+                        let opacity = if f.fade_in {
+                            anim::fade_in(p)
+                        } else {
+                            ((1.0 - anim::cross_fade(p)) * 255.0) as u8
+                        };
+                        anim::place_thumb(f.thumb, anim::lerp(f.from, f.to, e), true, opacity);
+                    }
+                    redraw |= self.arriving.is_some() || self.departing.is_some();
+                    if p >= 1.0 {
+                        self.land(now);
+                    }
+                }
+                Some(landed) if now.duration_since(landed) >= SETTLE => self.finish_switch(),
+                Some(_) => {}
             }
         }
-        let Some(switch) = &self.switch else { return };
-        match switch.landed {
-            None => {
-                let p = anim::progress(switch.start, switch.duration, now);
-                let e = anim::spring(p);
-                for f in &switch.flights {
-                    let opacity = if f.fade_in { anim::fade_in(p) } else { 255 };
-                    anim::place_thumb(f.thumb, anim::lerp(f.from, f.to, e), true, opacity);
-                }
-                if p >= 1.0 {
-                    self.land(now);
-                }
-            }
-            Some(landed) if now.duration_since(landed) >= SETTLE => self.finish_switch(),
-            Some(_) => {}
+        if redraw {
+            self.render();
         }
     }
 
@@ -669,6 +709,7 @@ impl App {
         let restore = std::mem::take(&mut switch.restore);
         let focus = switch.focus;
         self.reveal(&restore, focus);
+        self.departing = None;
         self.reveal_arriving();
     }
 
@@ -692,14 +733,9 @@ impl App {
     }
 
     fn reveal_arriving(&mut self) {
-        if self.arriving.take().is_none() {
-            return;
+        if self.arriving.take().is_some() {
+            self.render();
         }
-        for card in &mut self.cards {
-            card.hidden = false;
-        }
-        self.place_cards(Instant::now());
-        self.invalidate();
     }
 
     fn reveal(&mut self, restore: &[Wid], focus: Option<Wid>) {
@@ -836,16 +872,7 @@ impl App {
         *self.icons.entry(w).or_insert_with(|| win::icon(hwnd_of(w)))
     }
 
-    fn clear_thumbnails(&mut self) {
-        for thumb in self.thumbs.drain(..) {
-            unsafe {
-                let _ = DwmUnregisterThumbnail(thumb);
-            }
-        }
-        self.cards.clear();
-    }
-
-    /// Recalcule les cartes et, si elles ont changé, réenregistre les miniatures DWM.
+    /// Recalcule la disposition des cartes de la barre.
     fn refresh(&mut self) {
         let mut rc = RECT::default();
         unsafe {
@@ -884,24 +911,18 @@ impl App {
                 (c.stage, offset(c.rect, dx, dy))
             })
             .collect();
-        self.clear_thumbnails();
+        self.cards.clear();
         let mut sliding = false;
-        for &(stage, window, count, rect) in &layout {
-            let thumb_box =
-                RECT { left: rect.left, top: rect.top + stack, right: rect.right - stack, bottom: rect.top + stack + thumb_h };
-            let thumb = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd_of(window)) }.ok();
-            let dest = match thumb {
-                Some(t) => fit(thumb_box, unsafe { DwmQueryThumbnailSourceSize(t) }.unwrap_or_default()),
-                None => thumb_box,
-            };
-            self.thumbs.extend(thumb);
+        for &(stage, window, _, rect) in &layout {
+            let thumb_box = RECT { left: rect.left, top: rect.top + stack, right: rect.right, bottom: rect.top + stack + thumb_h };
+            let windows: Vec<Wid> = self.model.stage(stage).map_or(vec![window], |s| s.windows.iter().take(3).copied().collect());
+            let dest = fit(thumb_box, self.window_size(window));
             let slide = previous.get(&stage).map_or((0, 0), |r| (r.left - rect.left, r.top - rect.top));
-            let hidden = self.arriving == Some(stage);
             // Une carte qui n'était pas affichée (et ne vient pas d'un trajet) apparaît en fondu.
-            let fade_in = !previous.contains_key(&stage) && !hidden;
+            let fade_in = !previous.contains_key(&stage) && self.arriving != Some(stage);
             sliding |= slide != (0, 0) || fade_in;
             let icon = self.icon(window);
-            self.cards.push(Card { stage, window, count, rect, thumb_box, dest, icon, thumb, slide, hidden, fade_in });
+            self.cards.push(Card { stage, window, windows, rect, thumb_box, dest, icon, slide, hidden: false, fade_in });
         }
         self.slide_start = sliding.then_some(now);
         self.layout_key = layout;
@@ -922,15 +943,33 @@ impl App {
         self.slide_start.map_or(1.0, |start| anim::progress(start, self.anim_duration, now))
     }
 
-    fn place_cards(&self, now: Instant) {
-        let p = self.slide_progress(now);
-        for card in &self.cards {
-            if let Some(thumb) = card.thumb {
-                let (dx, dy) = self.card_offset(card, now);
-                let opacity = if card.fade_in { anim::fade_in(p) } else { 255 };
-                anim::place_thumb(thumb, offset(card.dest, dx, dy), !card.hidden, opacity);
-            }
+    fn place_cards(&self, _now: Instant) {
+        self.render();
+    }
+
+    /// Taille de la fenêtre telle qu'on la dessine : son instantané, sinon sa position mémorisée.
+    fn window_size(&self, w: Wid) -> SIZE {
+        if let Some(img) = self.snapshots.get(&w) {
+            return SIZE { cx: img.w, cy: img.h };
         }
+        let rect = self.last_rects.get(&w).copied().unwrap_or_else(|| anim::restored_rect(hwnd_of(w)));
+        size(rect)
+    }
+
+    /// Opacité d'une carte : fondu d'apparition, fondu enchaîné avec les miniatures qui la
+    /// rejoignent, ou invisible pendant qu'on la déplace.
+    fn card_alpha(&self, card: &Card, now: Instant) -> u8 {
+        if self.arriving == Some(card.stage) {
+            let p = self.switch.as_ref().map_or(1.0, |s| anim::progress(s.start, s.duration, now));
+            return (anim::cross_fade(p) * 255.0) as u8;
+        }
+        if card.hidden {
+            return 0;
+        }
+        if card.fade_in {
+            return anim::fade_in(self.slide_progress(now));
+        }
+        255
     }
 
     fn invalidate(&self) {
@@ -1079,15 +1118,23 @@ impl App {
         let dpi = self.dpi();
         let s = move |v: i32| v * dpi / 96;
         let now = Instant::now();
-        let cards: Vec<(&Card, RECT, RECT, i32)> = self
+        // (carte, rectangle, miniature à plat, décalage vertical, opacité)
+        let mut cards: Vec<(&Card, RECT, RECT, i32, u8)> = self
             .cards
             .iter()
-            .filter(|c| !c.hidden)
             .map(|c| {
                 let (dx, dy) = self.card_offset(c, now);
-                (c, offset(c.rect, dx, dy), offset(c.dest, dx, dy), dy)
+                (c, offset(c.rect, dx, dy), offset(c.dest, dx, dy), dy, self.card_alpha(c, now))
             })
+            .filter(|c| c.4 > 0)
             .collect();
+        // La carte de la scène qui revient à l'écran s'efface pendant que ses fenêtres partent.
+        if let (Some(card), Some(switch)) = (&self.departing, &self.switch) {
+            let alpha = 255 - anim::fade_in(anim::progress(switch.start, switch.duration, now));
+            if alpha > 0 {
+                cards.push((card, card.rect, card.dest, 0, alpha));
+            }
+        }
 
         let mut canvas = Canvas::new(w, h);
         // Alpha 1 et non 0 : invisible, mais la barre reste cliquable partout
@@ -1098,24 +1145,40 @@ impl App {
             // Une fenêtre est traînée au-dessus de la barre : la lâcher la sortira de sa scène.
             canvas.round_rect(RECT { left: s(6), top: s(6), right: w - s(6), bottom: h - s(6) }, s(18), white, 56);
         }
-        for &(card, rect, dest, _) in &cards {
+        let solid = |r: u8, g: u8, b: u8| Image { w: 1, h: 1, px: vec![0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32] };
+        let (shadow, placeholder) = (solid(0, 0, 0), solid(58, 58, 66));
+        for &(card, rect, dest, _, alpha) in &cards {
+            let fade = |a: u8| (a as u32 * alpha as u32 / 255) as u8;
             if self.hover == Some(card.stage) {
-                canvas.round_rect(inflate(rect, s(8)), s(16), white, 46);
+                canvas.round_rect(inflate(rect, s(8)), s(16), white, fade(46));
             }
-            // Fenêtres empilées derrière la miniature, comme sur macOS.
-            let off = s(5);
-            if card.count > 2 {
-                canvas.round_rect(offset(dest, 2 * off, -2 * off), s(8), white, 70);
+            // Fenêtres de la scène empilées derrière, de la plus lointaine à la plus proche.
+            for (depth, &window) in card.windows.iter().enumerate().skip(1).rev() {
+                let d = depth as i32;
+                let image = self.snapshots.get(&window);
+                let area = offset(inflate(dest, -s(6) * d), 0, -s(9) * d);
+                let r = image.map_or(area, |img| fit(area, SIZE { cx: img.w, cy: img.h }));
+                let img = image.map_or(&placeholder, |i| i.as_ref());
+                canvas.draw_quad(img, tilt(r), alpha, (50 * d) as u8);
             }
-            if card.count > 1 {
-                canvas.round_rect(offset(dest, off, -off), s(8), white, 120);
-            }
+            // Ombre douce sous la miniature, puis la miniature elle-même.
+            canvas.draw_quad(&shadow, tilt(offset(inflate(dest, s(2)), s(1), s(4))), fade(40), 0);
+            canvas.draw_quad(&shadow, tilt(offset(dest, s(1), s(2))), fade(70), 0);
+            let image = self.snapshots.get(&card.window);
+            canvas.draw_quad(image.map_or(&placeholder, |i| i.as_ref()), tilt(dest), alpha, 0);
         }
         canvas.gdi(|dc| unsafe {
             SelectObject(dc, self.font);
             SetBkMode(dc, TRANSPARENT);
-            for &(card, rect, dest, dy) in &cards {
-                fill(dc, dest, PLACEHOLDER, s(8));
+            // Les libellés n'apparaissent qu'une fois la carte assez visible : GDI ne sait pas
+            // dessiner en semi-transparence.
+            for &(card, rect, dest, dy, _) in cards.iter().filter(|c| c.4 >= 160) {
+                if !self.snapshots.contains_key(&card.window) {
+                    // Pas d'image de la fenêtre : son icône au milieu de la carte.
+                    let big = s(32);
+                    let (cx, cy) = ((dest.left + dest.right - big) / 2, (dest.top + dest.bottom - big) / 2);
+                    let _ = DrawIconEx(dc, cx, cy, card.icon, big, big, 0, None, DI_NORMAL);
+                }
                 let label_top = card.thumb_box.bottom + dy + s(4);
                 let icon = s(16);
                 let _ = DrawIconEx(
@@ -1149,6 +1212,14 @@ impl App {
 
 // --- Géométrie et dessin -------------------------------------------------------------
 
+/// Incline une miniature comme sur macOS : la carte pivote, son bord droit (côté écran)
+/// s'éloigne et rapetisse.
+fn tilt(r: RECT) -> [(f32, f32); 4] {
+    let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+    let (inset, squeeze) = ((b - t) * 0.11, (rr - l) * 0.07);
+    [(l, t), (rr - squeeze, t + inset), (rr - squeeze, b - inset), (l, b)]
+}
+
 fn contains(r: RECT, pt: POINT) -> bool {
     pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
 }
@@ -1166,18 +1237,6 @@ unsafe fn draw_text(dc: HDC, text: &str, rect: RECT, flags: DRAW_TEXT_FORMAT, co
     let mut rect = rect;
     SetTextColor(dc, color);
     DrawTextW(dc, &mut text, &mut rect, flags);
-}
-
-unsafe fn fill(hdc: HDC, r: RECT, color: COLORREF, radius: i32) {
-    let brush = CreateSolidBrush(color);
-    if radius > 0 {
-        let region = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
-        let _ = FillRgn(hdc, region, brush);
-        let _ = DeleteObject(region);
-    } else {
-        FillRect(hdc, &r, brush);
-    }
-    let _ = DeleteObject(brush);
 }
 
 // --- Boucle Win32 --------------------------------------------------------------------

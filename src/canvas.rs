@@ -8,6 +8,51 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA},
 };
 
+/// Petite image en BGRA, alpha prémultiplié (instantané d'une fenêtre).
+pub struct Image {
+    pub w: i32,
+    pub h: i32,
+    pub px: Vec<u32>,
+}
+
+impl Image {
+    /// Arrondit les coins, comme les fenêtres de Windows 11.
+    pub fn round_corners(&mut self, radius: f32) {
+        let r = radius.min(self.w as f32 / 2.0).min(self.h as f32 / 2.0);
+        let ri = r.ceil() as i32;
+        for y in 0..self.h {
+            for x in 0..self.w {
+                if (x >= ri && x < self.w - ri) || (y >= ri && y < self.h - ri) {
+                    continue;
+                }
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let d = (px - px.clamp(r, self.w as f32 - r)).hypot(py - py.clamp(r, self.h as f32 - r));
+                let cover = (r - d + 0.5).clamp(0.0, 1.0);
+                let i = (y * self.w + x) as usize;
+                self.px[i] = scale(self.px[i], cover);
+            }
+        }
+    }
+
+    /// Lecture bilinéaire, en pixels de l'image.
+    fn sample(&self, x: f32, y: f32) -> u32 {
+        let x = x.clamp(0.0, (self.w - 1) as f32);
+        let y = y.clamp(0.0, (self.h - 1) as f32);
+        let (x0, y0) = (x as i32, y as i32);
+        let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |x: i32, y: i32| self.px[(y * self.w + x) as usize];
+        let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+        let mix = |shift: u32| {
+            let ch = |p: u32| ((p >> shift) & 0xFF) as f32;
+            let top = ch(a) + (ch(b) - ch(a)) * fx;
+            let bottom = ch(c) + (ch(d) - ch(c)) * fx;
+            ((top + (bottom - top) * fy).round() as u32).min(255) << shift
+        };
+        mix(24) | mix(16) | mix(8) | mix(0)
+    }
+}
+
 /// Image en BGRA, alpha prémultiplié (le format qu'attend UpdateLayeredWindow).
 pub struct Canvas {
     w: i32,
@@ -38,6 +83,44 @@ impl Canvas {
                     let i = (y * self.w + x) as usize;
                     self.px[i] = over(premul(rgb, (alpha as f32 * cover) as u8), self.px[i]);
                 }
+            }
+        }
+    }
+
+    /// Dessine `img` déformée dans le quadrilatère `quad` (haut-gauche, haut-droit, bas-droit,
+    /// bas-gauche) : c'est ce qui donne la perspective. `shade` assombrit (0 : rien, 255 : noir).
+    pub fn draw_quad(&mut self, img: &Image, quad: [(f32, f32); 4], alpha: u8, shade: u8) {
+        if alpha == 0 || img.w <= 0 || img.h <= 0 {
+            return;
+        }
+        let Some(inv) = Homography::square_to_quad(quad).inverse() else { return };
+        let xs = quad.map(|p| p.0);
+        let ys = quad.map(|p| p.1);
+        let x0 = (xs.iter().copied().fold(f32::MAX, f32::min).floor() as i32).max(0);
+        let x1 = (xs.iter().copied().fold(f32::MIN, f32::max).ceil() as i32).min(self.w);
+        let y0 = (ys.iter().copied().fold(f32::MAX, f32::min).floor() as i32).max(0);
+        let y1 = (ys.iter().copied().fold(f32::MIN, f32::max).ceil() as i32).min(self.h);
+        // Taille du quadrilatère, pour lisser ses bords sur un pixel environ.
+        let dist = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).hypot(a.1 - b.1);
+        let qw = dist(quad[0], quad[1]).max(dist(quad[3], quad[2]));
+        let qh = dist(quad[0], quad[3]).max(dist(quad[1], quad[2]));
+        let edge = |t: f32, len: f32| (t.min(1.0 - t) * len + 0.5).clamp(0.0, 1.0);
+        let opacity = alpha as f32 / 255.0;
+        let light = (255 - shade) as u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let Some((u, v)) = inv.apply(x as f32 + 0.5, y as f32 + 0.5) else { continue };
+                let cover = edge(u, qw) * edge(v, qh);
+                if cover <= 0.0 {
+                    continue;
+                }
+                let mut src = img.sample(u * img.w as f32 - 0.5, v * img.h as f32 - 0.5);
+                if shade > 0 {
+                    let dim = |shift: u32| (((src >> shift) & 0xFF) * light / 255) << shift;
+                    src = (src & 0xFF00_0000) | dim(16) | dim(8) | dim(0);
+                }
+                let i = (y * self.w + x) as usize;
+                self.px[i] = over(scale(src, cover * opacity), self.px[i]);
             }
         }
     }
@@ -100,6 +183,49 @@ impl Canvas {
     }
 }
 
+/// Transformation projective du carré unité vers un quadrilatère (et retour).
+struct Homography([f32; 9]);
+
+impl Homography {
+    /// Coins dans l'ordre : (0,0), (1,0), (1,1), (0,1).
+    fn square_to_quad(q: [(f32, f32); 4]) -> Self {
+        let [(x0, y0), (x1, y1), (x2, y2), (x3, y3)] = q;
+        let (sx, sy) = (x0 - x1 + x2 - x3, y0 - y1 + y2 - y3);
+        if sx.abs() < 1e-6 && sy.abs() < 1e-6 {
+            // Parallélogramme : transformation affine.
+            return Self([x1 - x0, x3 - x0, x0, y1 - y0, y3 - y0, y0, 0.0, 0.0, 1.0]);
+        }
+        let (dx1, dx2, dy1, dy2) = (x1 - x2, x3 - x2, y1 - y2, y3 - y2);
+        let det = dx1 * dy2 - dx2 * dy1;
+        let g = (sx * dy2 - dx2 * sy) / det;
+        let h = (dx1 * sy - sx * dy1) / det;
+        Self([x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h, 1.0])
+    }
+
+    fn inverse(&self) -> Option<Self> {
+        let [a, b, c, d, e, f, g, h, i] = self.0;
+        let (ca, cb, cc) = (e * i - f * h, f * g - d * i, d * h - e * g);
+        let det = a * ca + b * cb + c * cc;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        let m = [ca, c * h - b * i, b * f - c * e, cb, a * i - c * g, c * d - a * f, cc, b * g - a * h, a * e - b * d];
+        Some(Self(m.map(|v| v / det)))
+    }
+
+    fn apply(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let m = &self.0;
+        let w = m[6] * x + m[7] * y + m[8];
+        (w.abs() > 1e-9).then(|| ((m[0] * x + m[1] * y + m[2]) / w, (m[3] * x + m[4] * y + m[5]) / w))
+    }
+}
+
+/// Multiplie un pixel prémultiplié par `k` (entre 0 et 1).
+fn scale(px: u32, k: f32) -> u32 {
+    let mul = |shift: u32| ((((px >> shift) & 0xFF) as f32 * k).round() as u32).min(255) << shift;
+    mul(24) | mul(16) | mul(8) | mul(0)
+}
+
 fn channel(px: u32, shift: u32) -> i32 {
     ((px >> shift) & 0xFF) as i32
 }
@@ -117,8 +243,8 @@ fn over(src: u32, dst: u32) -> u32 {
 }
 
 /// Bitmap 32 bits sélectionné dans un DC mémoire, dont on peut lire et écrire les pixels.
-struct Dib {
-    dc: HDC,
+pub(crate) struct Dib {
+    pub dc: HDC,
     bmp: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u32,
@@ -126,7 +252,7 @@ struct Dib {
 }
 
 impl Dib {
-    unsafe fn new(screen: HDC, w: i32, h: i32) -> Option<Self> {
+    pub unsafe fn new(screen: HDC, w: i32, h: i32) -> Option<Self> {
         if w <= 0 || h <= 0 {
             return None;
         }
@@ -149,7 +275,8 @@ impl Dib {
         Some(Self { dc, bmp, old, bits: bits as *mut u32, len: (w * h) as usize })
     }
 
-    fn pixels(&self) -> &mut [u32] {
+    #[allow(clippy::mut_from_ref)]
+    pub fn pixels(&self) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.bits, self.len) }
     }
 }
@@ -177,6 +304,30 @@ mod tests {
         assert_eq!(result >> 24, 255);
         assert_eq!(channel(result, 16), 255);
         assert!((channel(result, 8) - 128).abs() <= 1);
+    }
+
+    #[test]
+    fn perspective_du_carre_vers_un_trapeze() {
+        // Bord gauche plus court, comme une carte tournée vers le centre de l'écran.
+        let quad = [(0.0, 10.0), (100.0, 0.0), (100.0, 80.0), (0.0, 70.0)];
+        let hom = Homography::square_to_quad(quad);
+        let inv = hom.inverse().unwrap();
+        for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.3, 0.6)] {
+            let (x, y) = hom.apply(u, v).unwrap();
+            let (u2, v2) = inv.apply(x, y).unwrap();
+            assert!((u - u2).abs() < 1e-4 && (v - v2).abs() < 1e-4);
+        }
+        let (x, y) = hom.apply(0.0, 1.0).unwrap();
+        assert!((x - 0.0).abs() < 1e-3 && (y - 70.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn image_dessinee_en_perspective() {
+        let img = Image { w: 4, h: 4, px: vec![premul((255, 0, 0), 255); 16] };
+        let mut c = Canvas::new(40, 40);
+        c.draw_quad(&img, [(5.0, 10.0), (35.0, 5.0), (35.0, 35.0), (5.0, 30.0)], 255, 0);
+        assert_eq!(c.px[(20 * 40 + 20) as usize], premul((255, 0, 0), 255), "le centre est rempli");
+        assert_eq!(c.px[(6 * 40 + 6) as usize] >> 24, 0, "le coin rogné par la perspective est vide");
     }
 
     #[test]
