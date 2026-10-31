@@ -294,14 +294,11 @@ impl App {
         let panel = l.panel();
         let white = (255, 255, 255);
         let mut canvas = Canvas::new(w, h);
-        // Ombre, puis plaque de verre sombre (comme Spotlight en mode sombre).
+        // Ombre, puis panneau gris foncé presque plein (Spotlight en mode sombre).
         canvas.round_rect(offset(inflate(panel, s(4)), 0, s(8)), s(24), (0, 0, 0), 40);
         canvas.round_rect(offset(inflate(panel, s(1)), 0, s(3)), s(20), (0, 0, 0), 60);
-        let look = Glass { frost: 0.06, darken: 0.42, refraction: s(12) as f32, bevel: s(16) as f32, rim: 0.7 };
-        match &l.backdrop {
-            Some(backdrop) => canvas.glass(panel, s(18) as f32, backdrop, (0, 0), &look),
-            None => canvas.round_rect(panel, s(18), (30, 30, 36), 235),
-        }
+        let look = Material { tint: (34, 34, 38), opacity: 0.9, border: 0.14 };
+        canvas.material(panel, s(18) as f32, l.backdrop.as_ref(), (0, 0), &look);
         // Loupe.
         let field_cy = (panel.top + l.field_height() / 2) as f32;
         let k = l.dpi as f32 / 96.0;

@@ -25,7 +25,7 @@ use windows::{
 use crate::{
     anim::{self, fit, inflate, offset, size, Flight, Switch},
     autostart,
-    canvas::{Canvas, Glass, Image},
+    canvas::{Canvas, Image, Material},
     media::{Media, NowPlaying},
     snapshot, taskbar, wallpaper,
     stages::{Model, Transition, Wid},

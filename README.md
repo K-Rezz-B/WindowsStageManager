@@ -23,18 +23,18 @@ cargo run --release
   scène par fenêtre.
 - **Lecteur de musique** collé à gauche du Dock : pochette, titre, artiste et bouton
   lecture/pause du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify,
-  Deezer…), sur une plaque de « verre liquide ». Il n'apparaît que lorsqu'un média est ouvert.
+  Deezer…). Il n'apparaît que lorsqu'un média est ouvert.
   Boutons précédent / lecture-pause / suivant, et barre de progression quand le lecteur
   donne la durée du morceau.
 - **Horloge** collée à droite du Dock : l'heure et la date ; un clic ouvre le calendrier et
   les notifications de Windows. À sa gauche, le **volume** : un clic ouvre un curseur au-dessus
   de l'horloge (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
   le règle aussi, le pourcentage s'affiche au survol.
-- **Lanceur façon Spotlight** : **Alt + Espace** ouvre une barre de recherche en verre ; tapez
+- **Lanceur façon Spotlight** : **Alt + Espace** ouvre une barre de recherche ; tapez
   quelques lettres (accents et majuscules ignorés), ↑ ↓ pour choisir, Entrée pour lancer,
   Échap pour fermer. Il trouve toutes les applis installées, y compris celles du Store.
-- Le verre du Dock et de ses panneaux est calculé à partir du fond d'écran (seule chose
-  derrière eux), lu et flouté une seule fois.
+- Le Dock, ses panneaux et le lanceur suivent le style de macOS d'avant Tahoe (mode sombre) :
+  panneaux gris foncé presque pleins, à peine teintés par le fond flouté, avec un fin liseré.
 - **Dock** en bas de l'écran, comme sur macOS : applis épinglées (reprises au départ de la
   barre des tâches), applis ouvertes à la suite, puis la corbeille. Les icônes grossissent en
   vague sous la souris, le nom de l'appli s'affiche au-dessus, un point marque les applis
@@ -111,9 +111,9 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/app/dockbar.rs` | Fenêtre du Dock : place réservée, dessin, clics, menu |
 | `src/shell.rs` | Raccourcis épinglés, grandes icônes, noms d'applis, lancement, corbeille |
 | `src/taskbar.rs` | Masquage automatique de la barre des tâches, et sa remise en état |
-| `src/wallpaper.rs` | Fond d'écran derrière la barre, flouté, pour l'effet verre (fil à part) |
+| `src/wallpaper.rs` | Fond d'écran derrière le Dock, flouté, pour la teinte des panneaux (fil à part) |
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
-| `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats, verre |
+| `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
 | `src/volume.rs` | Volume de la sortie audio par défaut |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |

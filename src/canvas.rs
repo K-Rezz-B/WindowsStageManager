@@ -302,77 +302,51 @@ fn box_blur(src: &[u32], dst: &mut [u32], lines: usize, len: usize, step: usize,
     }
 }
 
-/// Réglages de l'effet « verre liquide ».
-pub struct Glass {
-    /// Part de blanc mêlée au fond (0 : aucun, 1 : blanc).
-    pub frost: f32,
-    /// Assombrissement du fond, pour que le texte blanc reste lisible.
-    pub darken: f32,
-    /// Déviation de l'image près des bords, en pixels (effet de lentille).
-    pub refraction: f32,
-    /// Largeur de la zone courbée le long du bord, en pixels.
-    pub bevel: f32,
-    /// Intensité du liseré lumineux.
-    pub rim: f32,
+/// Matière des panneaux, à la manière de macOS (Big Sur à Sonoma, mode sombre) : un gris foncé
+/// presque plein, à peine teinté par le fond flouté, avec un fin liseré clair.
+pub struct Material {
+    pub tint: (u8, u8, u8),
+    /// Part de la teinte par-dessus le fond (1 : entièrement plein).
+    pub opacity: f32,
+    /// Opacité du liseré clair qui fait le tour du panneau.
+    pub border: f32,
 }
 
 impl Canvas {
-    /// Pose une plaque de verre en `r` (coins arrondis) : `backdrop`, ce qu'il y a derrière la
-    /// fenêtre, déjà flouté, y est vu à travers une lentille. `origin` : position du canevas
-    /// dans `backdrop`.
-    pub fn glass(&mut self, r: RECT, radius: f32, backdrop: &Image, origin: (i32, i32), look: &Glass) {
+    /// Pose un panneau plein en `r` (coins arrondis). `backdrop`, ce qu'il y a derrière la
+    /// fenêtre (déjà flouté), transparaît à peine ; `origin` : position du canevas dans `backdrop`.
+    /// Sans `backdrop`, le panneau est simplement de la couleur de la teinte.
+    pub fn material(&mut self, r: RECT, radius: f32, backdrop: Option<&Image>, origin: (i32, i32), look: &Material) {
         let (ox, oy) = (origin.0 as f32, origin.1 as f32);
         let (cx, cy) = ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0);
         let (hx, hy) = ((r.right - r.left) as f32 / 2.0, (r.bottom - r.top) as f32 / 2.0);
         let rad = radius.min(hx).min(hy);
+        let tint = [look.tint.0 as f32, look.tint.1 as f32, look.tint.2 as f32];
         for y in (r.top - 1).max(0)..(r.bottom + 1).min(self.h) {
             for x in (r.left - 1).max(0)..(r.right + 1).min(self.w) {
                 let (px, py) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
                 // Distance signée au bord du rectangle arrondi (négative à l'intérieur).
                 let (qx, qy) = (px.abs() - (hx - rad), py.abs() - (hy - rad));
-                let outside = qx.max(0.0).hypot(qy.max(0.0));
-                let sd = outside + qx.max(qy).min(0.0) - rad;
+                let sd = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - rad;
                 let cover = (0.5 - sd).clamp(0.0, 1.0);
                 if cover <= 0.0 {
                     continue;
                 }
-                let depth = (-sd).max(0.0);
-                // Normale au bord, vers l'extérieur.
-                let (nx, ny) = if qx > 0.0 && qy > 0.0 {
-                    (qx / outside.max(1e-3) * px.signum(), qy / outside.max(1e-3) * py.signum())
-                } else if qx > qy {
-                    (px.signum(), 0.0)
-                } else {
-                    (0.0, py.signum())
+                let behind = match backdrop {
+                    Some(b) => {
+                        let p = b.sample(x as f32 + ox, y as f32 + oy);
+                        [((p >> 16) & 0xFF) as f32, ((p >> 8) & 0xFF) as f32, (p & 0xFF) as f32]
+                    }
+                    None => tint,
                 };
-                // Réfraction : près du bord, l'image est prise plus vers le centre, comme à
-                // travers l'épaisseur arrondie d'un verre.
-                let t = (1.0 - depth / look.bevel).clamp(0.0, 1.0);
-                let bend = t * t * look.refraction;
-                let src = backdrop.sample(x as f32 + ox - nx * bend, y as f32 + oy - ny * bend);
-                let ch = |shift: u32| ((src >> shift) & 0xFF) as f32;
-                let (mut rr, mut gg, mut bb) = (ch(16), ch(8), ch(0));
-                // Couleurs un peu plus vives, fond assombri puis givré.
-                let grey = (rr + gg + bb) / 3.0;
-                for c in [&mut rr, &mut gg, &mut bb] {
-                    *c = (grey + (*c - grey) * 1.25) * (1.0 - look.darken);
-                    *c += (255.0 - *c) * look.frost;
-                }
-                // Liseré : brillant côté haut-gauche (la lumière), plus sombre en bas à droite,
-                // plus un léger reflet sur le haut de la plaque.
-                let edge = (1.0 - depth / 1.6).clamp(0.0, 1.0);
-                let lit = (-(nx * 0.6 + ny * 0.8)).max(0.0);
-                let unlit = (nx * 0.6 + ny * 0.8).max(0.0);
-                // Reflet du haut : fort près du bord supérieur, il s'estompe vers le milieu.
-                let top = (1.0 - (py + hy) / hy).max(0.0);
-                let shine = edge * look.rim * (0.3 + 0.7 * lit) + top * top * 0.16;
-                let shade = edge * 0.3 * unlit;
-                for c in [&mut rr, &mut gg, &mut bb] {
-                    *c = (*c + (255.0 - *c) * shine) * (1.0 - shade);
-                }
-                let color = (rr.clamp(0.0, 255.0) as u8, gg.clamp(0.0, 255.0) as u8, bb.clamp(0.0, 255.0) as u8);
+                // Liseré d'un pixel le long du bord.
+                let edge = (1.0 - (-sd).max(0.0)).clamp(0.0, 1.0) * look.border;
+                let mix = |c: usize| {
+                    let solid = behind[c] + (tint[c] - behind[c]) * look.opacity;
+                    (solid + (255.0 - solid) * edge).clamp(0.0, 255.0) as u8
+                };
                 let i = (y * self.w + x) as usize;
-                self.px[i] = over(premul(color, (255.0 * cover) as u8), self.px[i]);
+                self.px[i] = over(premul((mix(0), mix(1), mix(2)), (255.0 * cover) as u8), self.px[i]);
             }
         }
     }
@@ -561,14 +535,18 @@ mod tests {
     }
 
     #[test]
-    fn plaque_de_verre() {
+    fn panneau_plein_avec_liseré() {
         let backdrop = Image { w: 40, h: 40, px: vec![premul((0, 100, 0), 255); 1600] };
         let mut c = Canvas::new(40, 40);
-        let look = Glass { frost: 0.1, darken: 0.2, refraction: 4.0, bevel: 6.0, rim: 0.6 };
-        c.glass(RECT { left: 5, top: 5, right: 35, bottom: 35 }, 8.0, &backdrop, (0, 0), &look);
-        assert_eq!(c.px[(20 * 40 + 20) as usize] >> 24, 255, "le centre est couvert");
+        let look = Material { tint: (30, 30, 34), opacity: 0.8, border: 0.12 };
+        c.material(RECT { left: 5, top: 5, right: 35, bottom: 35 }, 8.0, Some(&backdrop), (0, 0), &look);
+        let center = c.px[(20 * 40 + 20) as usize];
+        assert_eq!(center >> 24, 255, "le centre est couvert");
         assert_eq!(c.px[(5 * 40 + 5) as usize] >> 24, 0, "le coin arrondi reste vide");
-        assert!(channel(c.px[(20 * 40 + 20) as usize], 8) > 0, "on voit le fond à travers");
+        // Surtout la teinte (30) ; le vert du fond (100) ne transparaît qu'un peu.
+        assert!((40..=50).contains(&channel(center, 8)), "vert : {}", channel(center, 8));
+        // Le liseré, sur le bord du haut, est plus clair que l'intérieur.
+        assert!(channel(c.px[(5 * 40 + 20) as usize], 16) > channel(center, 16));
     }
 
     #[test]

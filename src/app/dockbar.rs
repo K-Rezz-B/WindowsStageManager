@@ -416,15 +416,13 @@ impl App {
             canvas.round_rect(RECT { left: body.left - s(6), top: body.top - lift, right: body.right + s(6), bottom: h }, 0, (0, 0, 0), 1);
         }
         let radius = m.radius;
-        let look = Glass { frost: 0.18, darken: 0.04, refraction: s(10) as f32, bevel: s(14) as f32, rim: 0.8 };
+        // Style macOS d'avant Tahoe : gris foncé presque plein, fin liseré clair.
+        let look = Material { tint: (38, 38, 42), opacity: 0.84, border: 0.14 };
         let origin = (window.left - self.dock.backdrop_rect.left, window.top - self.dock.backdrop_rect.top);
-        // Plaque de verre avec son ombre : le Dock, le lecteur et l'horloge.
-        let plate = |canvas: &mut Canvas, r: RECT, radius: f32, look: &Glass| {
+        // Panneau avec son ombre : le Dock, le lecteur, l'horloge et le curseur de volume.
+        let plate = |canvas: &mut Canvas, r: RECT, radius: f32, look: &Material| {
             canvas.round_rect(offset(inflate(r, s(1)), 0, s(3)), radius as i32 + s(1), (0, 0, 0), 45);
-            match &self.dock.backdrop {
-                Some(backdrop) => canvas.glass(r, radius, backdrop, origin, look),
-                None => canvas.round_rect(r, radius as i32, (30, 30, 36), 170),
-            }
+            canvas.material(r, radius, self.dock.backdrop.as_deref(), origin, look);
         };
         plate(&mut canvas, body, radius, &look);
         let panels = self.panels(body);
