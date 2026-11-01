@@ -158,11 +158,9 @@ struct App {
     hover: Option<u64>,
     tracking_mouse: bool,
     font: HFONT,
-    font_bold: HFONT,
     media: Media,
-    /// Morceau en cours, affiché dans le lecteur à gauche du Dock.
+    /// Morceau en cours, affiché dans l'encoche.
     now_playing: Option<NowPlaying>,
-    font_time: HFONT,
     appbar: Option<RECT>,
     monitor: RECT,
     taskbar_created: u32,
@@ -217,10 +215,8 @@ impl App {
             hover: None,
             tracking_mouse: false,
             font: HFONT::default(),
-            font_bold: HFONT::default(),
             media: Media::start(hwnd, WM_MEDIA),
             now_playing: None,
-            font_time: HFONT::default(),
             appbar: None,
             monitor: RECT::default(),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
@@ -253,9 +249,8 @@ impl App {
         match msg {
             WM_WINEVENT => self.on_event(wp.0 as u32, HWND(lp.0 as _)),
             WM_MEDIA => {
-                // Le lecteur est collé à gauche du Dock, et dans l'encoche.
+                // Le lecteur est dans l'encoche.
                 self.now_playing = self.media.now_playing();
-                self.render_dock();
                 self.notch_retarget();
             }
             WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => self.reload_dock_backdrop(),
@@ -894,17 +889,12 @@ impl App {
             self.appbar = Some(r);
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
 
-            for font in [self.font, self.font_bold, self.font_time] {
-                if !font.is_invalid() {
-                    let _ = DeleteObject(font);
-                }
+            if !self.font.is_invalid() {
+                let _ = DeleteObject(self.font);
             }
             let dpi = self.dpi();
             // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
             self.font = make_font("Inter", 12, 400, dpi);
-            self.font_bold = make_font("Inter SemiBold", 12, 600, dpi);
-            // L'heure, à droite du Dock.
-            self.font_time = make_font("Inter SemiBold", 16, 600, dpi);
         }
         self.layout_key.clear();
         self.refresh();
@@ -1324,19 +1314,6 @@ unsafe fn make_font(face: &str, points: i32, weight: i32, dpi: i32) -> HFONT {
         lf.lfFaceName[i] = c;
     }
     CreateFontIndirectW(&lf)
-}
-
-/// Emplacement des éléments du lecteur de musique, en bas de la barre.
-struct PlayerLayout {
-    panel: RECT,
-    art: RECT,
-    title: RECT,
-    artist: RECT,
-    previous: RECT,
-    button: RECT,
-    next: RECT,
-    /// Barre de progression du morceau, sous le titre.
-    progress: RECT,
 }
 
 /// Texte avec une ombre portée, pour rester lisible sur n'importe quel fond d'écran.

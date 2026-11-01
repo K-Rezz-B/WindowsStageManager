@@ -3,7 +3,7 @@
 //! symbole de lecture. Au survol, elle s'agrandit et montre le lecteur complet.
 
 use super::{
-    dockbar::{clock_text, draw_play_pause, draw_skip, text_width},
+    dockbar::{clock_text, text_width},
     *,
 };
 use crate::{canvas::round_corners, media::filetime_now};
@@ -493,7 +493,6 @@ impl App {
                         np.playing = !np.playing;
                     }
                     self.notch_retarget();
-                    self.render_dock();
                 }
                 Some(Control::Previous) => self.media.previous(),
                 Some(Control::Next) => self.media.next(),
@@ -508,6 +507,39 @@ impl App {
 fn quad(r: RECT) -> [(f32, f32); 4] {
     let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
     [(l, t), (rr, t), (rr, b), (l, b)]
+}
+
+/// Icône pleine du bouton, comme dans les lecteurs d'Apple : deux barres arrondies pendant la
+/// lecture (pour mettre en pause), un triangle aux coins arrondis sinon.
+fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
+    let k = dpi as f32 / 96.0;
+    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
+    let white = (255, 255, 255);
+    if playing {
+        let (w, h, gap) = (5.0 * k, 16.0 * k, 5.0 * k);
+        for x in [cx - gap / 2.0 - w, cx + gap / 2.0] {
+            let bar = RECT { left: x.round() as i32, top: (cy - h / 2.0).round() as i32, right: (x + w).round() as i32, bottom: (cy + h / 2.0).round() as i32 };
+            canvas.round_rect(bar, (1.6 * k).round() as i32, white, 255);
+        }
+    } else {
+        // Décalé vers la droite : un triangle paraît centré quand son centre de gravité l'est.
+        let (w, h) = (14.0 * k, 16.0 * k);
+        let left = cx - w / 2.0 + 1.5 * k;
+        let triangle = [(left, cy - h / 2.0), (left + w, cy), (left, cy + h / 2.0)];
+        canvas.fill_convex(&round_corners(&triangle, 2.2 * k), white, 255);
+    }
+}
+
+/// Icône « précédent » ou « suivant » : deux triangles accolés.
+fn draw_skip(canvas: &mut Canvas, button: RECT, forward: bool, alpha: u8, dpi: i32) {
+    let k = dpi as f32 / 96.0;
+    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
+    let (w, h) = (8.0 * k, 10.0 * k);
+    let dir = if forward { 1.0 } else { -1.0 };
+    for start in [cx - dir * w, cx] {
+        let triangle = [(start, cy - h / 2.0), (start + dir * w, cy), (start, cy + h / 2.0)];
+        canvas.fill_convex(&round_corners(&triangle, 1.2 * k), (255, 255, 255), alpha);
+    }
 }
 
 /// Égaliseur : quatre barres qui dansent pendant la lecture, à plat en pause.

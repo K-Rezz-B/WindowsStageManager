@@ -15,10 +15,8 @@ pub(super) const WM_DOCK_WALLPAPER: u32 = WM_APP + 8;
 
 const TIMER_CLOCK: usize = 3;
 
-/// Largeurs du lecteur (à gauche du Dock) et de l'horloge (à droite), et leur écart avec le
-/// Dock, en pixels à 100 %.
-const PLAYER_WIDTH: i32 = 330;
-const CLOCK_WIDTH: i32 = 160;
+/// Largeur du panneau du volume (à droite du Dock) et son écart avec le Dock, en pixels à 100 %.
+const VOLUME_WIDTH: i32 = 54;
 const PANEL_GAP: i32 = 10;
 
 const MENU_DOCK_OPEN: usize = 20;
@@ -44,41 +42,34 @@ pub(super) struct DockUi {
     backdrop_loaded: Arc<Mutex<Option<Image>>>,
     tracking: bool,
     trash_full: bool,
-    /// Bouton du lecteur ou de l'horloge sous la souris.
+    /// Bouton du panneau du volume sous la souris.
     hover_control: Option<Control>,
-    /// Heure et date affichées, pour ne redessiner qu'au changement de minute.
+    /// Heure et date, pour redessiner l'heure de l'encoche au changement de minute.
     clock: (String, String),
     /// Volume (entre 0 et 1) et son coupé, relus chaque seconde.
     volume: Option<(f32, bool)>,
-    /// Le curseur de volume est ouvert au-dessus de l'horloge.
+    /// Le curseur de volume est ouvert au-dessus de son panneau.
     slider_open: bool,
     /// On fait glisser le curseur de volume.
     slider_drag: bool,
 }
 
-/// Les boutons des panneaux collés au Dock.
+/// Les boutons du panneau du volume.
 #[derive(Clone, Copy, PartialEq)]
 enum Control {
-    Previous,
-    PlayPause,
-    Next,
     Volume,
-    Clock,
     /// Haut-parleur du curseur de volume : coupe ou rétablit le son.
     Mute,
     /// Piste du curseur de volume.
     Slider,
 }
 
-/// Panneaux collés au Dock : le lecteur à gauche (s'il y a de la musique), l'horloge à droite.
+/// Panneau collé à droite du Dock : le volume (le lecteur et l'heure sont dans l'encoche).
 struct Panels {
-    player: Option<PlayerLayout>,
-    clock: RECT,
-    /// Icône du volume, dans le panneau de l'horloge.
+    audio: RECT,
+    /// Icône du volume, au milieu du panneau.
     volume: RECT,
-    /// Heure et date.
-    time: RECT,
-    /// Curseur de volume, ouvert au-dessus de l'horloge.
+    /// Curseur de volume, ouvert au-dessus du panneau.
     slider: Option<SliderLayout>,
 }
 
@@ -108,20 +99,7 @@ impl Panels {
                 return Some(Control::Slider);
             }
         }
-        if let Some(p) = &self.player {
-            for (rect, control) in [(p.previous, Control::Previous), (p.button, Control::PlayPause), (p.next, Control::Next)] {
-                if contains(rect, pt) {
-                    return Some(control);
-                }
-            }
-        }
-        if contains(self.volume, pt) {
-            Some(Control::Volume)
-        } else if contains(self.time, pt) {
-            Some(Control::Clock)
-        } else {
-            None
-        }
+        contains(self.volume, pt).then_some(Control::Volume)
     }
 }
 
@@ -168,19 +146,15 @@ impl App {
             },
             WM_DOCK_LOADED => self.on_dock_loaded(),
             WM_TIMER if wp.0 == TIMER_CLOCK => {
-                // Chaque seconde : l'heure, le volume (il a pu changer au clavier) et la barre
-                // de progression du morceau en cours de lecture.
-                let clock = clock_text();
+                // Chaque seconde : le volume (il a pu changer au clavier) et l'heure de l'encoche.
                 let volume = volume::get();
-                let playing = self.now_playing.as_ref().is_some_and(|np| np.playing && np.timeline.is_some());
-                let minute = clock != self.dock.clock;
-                if minute || volume != self.dock.volume || playing {
-                    self.dock.clock = clock;
+                if volume != self.dock.volume {
                     self.dock.volume = volume;
                     self.render_dock();
                 }
-                // L'encoche fermée affiche aussi l'heure.
-                if minute {
+                let clock = clock_text();
+                if clock != self.dock.clock {
+                    self.dock.clock = clock;
                     self.render_notch();
                 }
             }
@@ -344,44 +318,28 @@ impl App {
 
     fn dock_window_rect(&self, m: &Metrics) -> RECT {
         let mon = self.monitor;
-        // Place pour les panneaux des deux côtés, à égalité pour que le Dock reste centré.
-        let side = (PLAYER_WIDTH.max(CLOCK_WIDTH) + PANEL_GAP) * self.dock.dpi / 96;
+        // Place pour le panneau du volume, des deux côtés pour que le Dock reste centré.
+        let side = (VOLUME_WIDTH + PANEL_GAP) * self.dock.dpi / 96;
         let w = self.dock.model.window_width(m) + 2 * side;
         let left = (mon.left + mon.right - w) / 2;
         let bottom = mon.bottom - 3;
         RECT { left, top: bottom - m.height, right: left + w, bottom }
     }
 
-    /// Emplacement du lecteur et de l'horloge, collés aux bords du Dock (qui s'élargit au survol).
+    /// Emplacement du panneau du volume, collé au bord droit du Dock (qui s'élargit au survol).
     fn panels(&self, body: RECT) -> Panels {
         let dpi = self.dock.dpi;
         let s = move |v: i32| v * dpi / 96;
-        let (gap, height) = (s(PANEL_GAP), body.bottom - body.top);
-        let cy = (body.top + body.bottom) / 2;
-        let clock = RECT { left: body.right + gap, top: body.top, right: body.right + gap + s(CLOCK_WIDTH), bottom: body.bottom };
+        let gap = s(PANEL_GAP);
+        let (cx, cy) = (body.right + gap + s(VOLUME_WIDTH) / 2, (body.top + body.bottom) / 2);
+        let audio = RECT { left: body.right + gap, top: body.top, right: body.right + gap + s(VOLUME_WIDTH), bottom: body.bottom };
         let vsize = s(34);
-        let volume = RECT { left: clock.left + s(10), top: cy - vsize / 2, right: clock.left + s(10) + vsize, bottom: cy + vsize / 2 };
-        let time = RECT { left: volume.right, right: clock.right - s(8), ..clock };
-        let player = self.now_playing.as_ref().map(|_| {
-            let panel = RECT { left: body.left - gap - s(PLAYER_WIDTH), top: body.top, right: body.left - gap, bottom: body.bottom };
-            let pad = s(8);
-            let art_size = height - 2 * pad;
-            let art = RECT { left: panel.left + pad, top: panel.top + pad, right: panel.left + pad + art_size, bottom: panel.bottom - pad };
-            // Précédent, lecture/pause, suivant, de gauche à droite contre le bord droit.
-            let size = s(28);
-            let next = RECT { left: panel.right - pad - size, top: cy - size / 2, right: panel.right - pad, bottom: cy + size / 2 };
-            let button = offset(next, -size, 0);
-            let previous = offset(button, -size, 0);
-            let title = RECT { left: art.right + s(10), top: cy - s(21), right: previous.left - s(6), bottom: cy - s(3) };
-            let artist = RECT { top: cy - s(3), bottom: cy + s(13), ..title };
-            let progress = RECT { top: cy + s(17), bottom: cy + s(20), ..title };
-            PlayerLayout { panel, art, title, artist, previous, button, next, progress }
-        });
-        // Curseur de volume : plaque centrée au-dessus de l'horloge.
+        let volume = RECT { left: cx - vsize / 2, top: cy - vsize / 2, right: cx + vsize / 2, bottom: cy + vsize / 2 };
+        // Curseur de volume : plaque au-dessus du panneau, alignée sur son bord droit (elle
+        // déborde au-dessus du Dock plutôt que hors de l'écran).
         let slider = self.dock.slider_open.then(|| {
             let (w, h) = (s(250), s(46));
-            let cx = (clock.left + clock.right) / 2;
-            let panel = RECT { left: cx - w / 2, top: clock.top - s(10) - h, right: cx + w / 2, bottom: clock.top - s(10) };
+            let panel = RECT { left: audio.right - w, top: audio.top - s(10) - h, right: audio.right, bottom: audio.top - s(10) };
             let mid = (panel.top + panel.bottom) / 2;
             let mute = RECT { left: panel.left + s(6), top: mid - s(17), right: panel.left + s(40), bottom: mid + s(17) };
             let percent = RECT { left: panel.right - s(52), top: panel.top, right: panel.right - s(10), bottom: panel.bottom };
@@ -389,7 +347,7 @@ impl App {
             let hit = RECT { left: track.left - s(8), top: panel.top, right: track.right + s(8), bottom: panel.bottom };
             SliderLayout { panel, mute, track, hit, percent }
         });
-        Panels { player, clock, volume, time, slider }
+        Panels { audio, volume, slider }
     }
 
     /// Disposition actuelle du Dock et de ses panneaux, en coordonnées de sa fenêtre.
@@ -424,59 +382,25 @@ impl App {
         // Style macOS d'avant Tahoe : gris foncé presque plein, fin liseré clair.
         let look = Material { tint: (38, 38, 42), opacity: 0.84, border: 0.14 };
         let origin = (window.left - self.dock.backdrop_rect.left, window.top - self.dock.backdrop_rect.top);
-        // Panneau avec son ombre : le Dock, le lecteur, l'horloge et le curseur de volume.
+        // Panneau avec son ombre : le Dock, le volume et son curseur.
         let plate = |canvas: &mut Canvas, r: RECT, radius: f32, look: &Material| {
             canvas.round_rect(offset(inflate(r, s(1)), 0, s(3)), radius as i32 + s(1), (0, 0, 0), 45);
             canvas.material(r, radius, self.dock.backdrop.as_deref(), origin, look);
         };
         plate(&mut canvas, body, radius, &look);
         let panels = self.panels(body);
-        plate(&mut canvas, panels.clock, radius, &look);
-        let player = panels.player.as_ref().zip(self.now_playing.as_ref());
-        if let Some((p, np)) = player {
-            plate(&mut canvas, p.panel, radius, &look);
-            canvas.round_rect(offset(p.art, 0, s(2)), s(8), (0, 0, 0), 70);
-            match &np.art {
-                Some(art) => canvas.draw_quad(art, [
-                    (p.art.left as f32, p.art.top as f32),
-                    (p.art.right as f32, p.art.top as f32),
-                    (p.art.right as f32, p.art.bottom as f32),
-                    (p.art.left as f32, p.art.bottom as f32),
-                ], 255, 0),
-                None => canvas.round_rect(p.art, s(6), (70, 70, 80), 255),
-            }
-            // Boutons : icônes pleines posées sur le verre, rond clair sous la souris.
-            for (rect, control) in [(p.previous, Control::Previous), (p.button, Control::PlayPause), (p.next, Control::Next)] {
-                if self.dock.hover_control == Some(control) {
-                    canvas.round_rect(rect, (rect.right - rect.left) / 2, white, 40);
-                }
-            }
-            draw_play_pause(&mut canvas, p.button, np.playing, dpi);
-            draw_skip(&mut canvas, p.previous, false, if np.can_previous { 255 } else { 90 }, dpi);
-            draw_skip(&mut canvas, p.next, true, if np.can_next { 255 } else { 90 }, dpi);
-            // Progression du morceau : piste discrète, partie écoutée en blanc.
-            if let Some(progress) = np.progress(crate::media::filetime_now()) {
-                let bar = p.progress;
-                let radius = (bar.bottom - bar.top) / 2;
-                canvas.round_rect(bar, radius, white, 60);
-                let done = bar.left + ((bar.right - bar.left) as f64 * progress).round() as i32;
-                if done > bar.left {
-                    canvas.round_rect(RECT { right: done.max(bar.left + 2 * radius), ..bar }, radius, white, 230);
-                }
-            }
-        }
-        // Volume, dans le panneau de l'horloge.
+        plate(&mut canvas, panels.audio, radius, &look);
         if self.dock.hover_control == Some(Control::Volume) {
             let v = panels.volume;
             canvas.round_rect(v, (v.right - v.left) / 2, white, 40);
         }
         let (level, muted) = self.dock.volume.unwrap_or((0.0, false));
         draw_volume(&mut canvas, panels.volume, level, muted, dpi);
-        // Curseur de volume au-dessus de l'horloge.
+        // Curseur de volume au-dessus de son panneau.
         if let Some(sl) = &panels.slider {
-            // Zone invisible mais « pleine » entre l'horloge et le curseur : la souris peut passer
+            // Zone invisible mais « pleine » entre le panneau et le curseur : la souris peut passer
             // de l'un à l'autre sans quitter le Dock (ce qui fermerait le curseur).
-            let bridge = RECT { left: sl.panel.left.min(panels.clock.left), top: sl.panel.top, right: sl.panel.right.max(panels.clock.right), bottom: panels.clock.bottom };
+            let bridge = RECT { left: sl.panel.left, top: sl.panel.top, right: sl.panel.right, bottom: panels.audio.bottom };
             canvas.round_rect(bridge, 0, (0, 0, 0), 1);
             plate(&mut canvas, sl.panel, s(16) as f32, &look);
             if self.dock.hover_control == Some(Control::Mute) {
@@ -537,7 +461,6 @@ impl App {
         if let Some(r) = label_box {
             canvas.round_rect(r, s(8), (28, 28, 32), 225);
         }
-        let (time, date) = &self.dock.clock;
         canvas.gdi(|dc| unsafe {
             SetBkMode(dc, TRANSPARENT);
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
@@ -553,21 +476,6 @@ impl App {
                 SelectObject(dc, self.font);
                 let text = if muted { "—".to_owned() } else { format!("{} %", (level * 100.0).round()) };
                 draw_text(dc, &text, sl.percent, centered, TEXT, 0);
-            }
-            // Horloge : l'heure en gras, la date en dessous.
-            let c = panels.time;
-            let mid = (c.top + c.bottom) / 2;
-            SelectObject(dc, self.font_time);
-            draw_text(dc, time, RECT { top: c.top + s(6), bottom: mid + s(4), ..c }, centered, TEXT, 0);
-            SelectObject(dc, self.font);
-            draw_text(dc, date, RECT { top: mid + s(2), bottom: c.bottom - s(6), ..c }, centered, TEXT_DIM, 0);
-            // Lecteur : titre, artiste et icône lecture/pause.
-            if let Some((p, np)) = player {
-                let line = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-                SelectObject(dc, self.font_bold);
-                draw_text(dc, &np.title, p.title, line, TEXT, 0);
-                SelectObject(dc, self.font);
-                draw_text(dc, &np.artist, p.artist, line, TEXT_DIM, 0);
             }
         });
         canvas.present(self.dock.hwnd, POINT { x: window.left, y: window.top });
@@ -672,12 +580,12 @@ impl App {
                 }
             },
             WM_MOUSEWHEEL => {
-                // La molette au-dessus de l'horloge (ou du curseur) règle le volume, par pas de 2 %.
+                // La molette au-dessus du volume (ou du curseur) le règle, par pas de 2 %.
                 // (Pour cette molette, Windows donne la position à l'écran.)
                 let win = self.dock.window;
                 let local = POINT { x: pt.x - win.left, y: pt.y - win.top };
                 let panels = self.dock_panels();
-                if contains(panels.clock, local) || panels.slider.as_ref().is_some_and(|s| contains(s.panel, local)) {
+                if contains(panels.audio, local) || panels.slider.as_ref().is_some_and(|s| contains(s.panel, local)) {
                     let notches = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
                     let (level, _) = volume::get().unwrap_or((0.0, false));
                     volume::set(level + notches * 0.02);
@@ -700,28 +608,12 @@ impl App {
         self.render_dock();
     }
 
-    /// Clic sur un bouton du lecteur ou de l'horloge, ou sur une icône du Dock.
+    /// Clic sur une icône du Dock (les boutons du volume sont gérés par `dock_mouse`).
     fn dock_control_click(&mut self, control: Option<Control>, pt: POINT) {
-        match control {
-                Some(Control::PlayPause) => {
-                    self.media.toggle_play_pause();
-                    // Affiché tout de suite, sans attendre la confirmation du lecteur.
-                    if let Some(np) = self.now_playing.as_mut() {
-                        np.playing = !np.playing;
-                    }
-                    self.render_dock();
-                }
-                Some(Control::Previous) => self.media.previous(),
-                Some(Control::Next) => self.media.next(),
-                // Comme l'horloge de la barre des tâches : calendrier et notifications.
-                Some(Control::Clock) => shell::open("ms-actioncenter:"),
-                // Gérés par `dock_mouse`.
-                Some(Control::Volume | Control::Mute | Control::Slider) => {}
-                None => {
-                    if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
-                        self.dock_click(index);
-                    }
-                }
+        if control.is_none() {
+            if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
+                self.dock_click(index);
+            }
         }
     }
 
@@ -828,39 +720,6 @@ pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
         }
         MENU_TRASH_EMPTY => shell::empty_recycle_bin(hwnd),
         _ => {}
-    }
-}
-
-/// Icône pleine du bouton, comme dans les lecteurs d'Apple : deux barres arrondies pendant la
-/// lecture (pour mettre en pause), un triangle aux coins arrondis sinon.
-pub(super) fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
-    let k = dpi as f32 / 96.0;
-    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
-    let white = (255, 255, 255);
-    if playing {
-        let (w, h, gap) = (5.0 * k, 16.0 * k, 5.0 * k);
-        for x in [cx - gap / 2.0 - w, cx + gap / 2.0] {
-            let bar = RECT { left: x.round() as i32, top: (cy - h / 2.0).round() as i32, right: (x + w).round() as i32, bottom: (cy + h / 2.0).round() as i32 };
-            canvas.round_rect(bar, (1.6 * k).round() as i32, white, 255);
-        }
-    } else {
-        // Décalé vers la droite : un triangle paraît centré quand son centre de gravité l'est.
-        let (w, h) = (14.0 * k, 16.0 * k);
-        let left = cx - w / 2.0 + 1.5 * k;
-        let triangle = [(left, cy - h / 2.0), (left + w, cy), (left, cy + h / 2.0)];
-        canvas.fill_convex(&round_corners(&triangle, 2.2 * k), white, 255);
-    }
-}
-
-/// Icône « précédent » ou « suivant » : deux triangles accolés.
-pub(super) fn draw_skip(canvas: &mut Canvas, button: RECT, forward: bool, alpha: u8, dpi: i32) {
-    let k = dpi as f32 / 96.0;
-    let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
-    let (w, h) = (8.0 * k, 10.0 * k);
-    let dir = if forward { 1.0 } else { -1.0 };
-    for start in [cx - dir * w, cx] {
-        let triangle = [(start, cy - h / 2.0), (start + dir * w, cy), (start, cy + h / 2.0)];
-        canvas.fill_convex(&round_corners(&triangle, 1.2 * k), (255, 255, 255), alpha);
     }
 }
 

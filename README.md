@@ -21,21 +21,16 @@ cargo run --release
   barre comme scène à part, et reviendra à sa place d'origine quand on la rouvrira.
 - **Clic droit sur une carte → « Séparer les fenêtres »** : éclate une scène regroupée en une
   scène par fenêtre.
-- **Lecteur de musique** collé à gauche du Dock : pochette, titre, artiste et bouton
-  lecture/pause du morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify,
-  Deezer…). Il n'apparaît que lorsqu'un média est ouvert.
-  Boutons précédent / lecture-pause / suivant, et barre de progression quand le lecteur
-  donne la durée du morceau.
 - **Encoche** en haut de l'écran, au milieu, comme celle des MacBook Pro : noire, collée au
   bord, raccordée à lui par deux petits congés. Fermée, elle affiche l'heure. Pendant la
   lecture, elle s'élargit un peu : l'heure glisse à gauche et un petit symbole de lecture
   apparaît à droite (de la couleur de la pochette). Au survol (ou au clic), elle
-  s'agrandit d'un mouvement de ressort et montre le lecteur complet : grande pochette, titre,
-  artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Elle se referme quand
-  la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.
-- **Horloge** collée à droite du Dock : l'heure et la date ; un clic ouvre le calendrier et
-  les notifications de Windows. À sa gauche, le **volume** : un clic ouvre un curseur au-dessus
-  de l'horloge (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
+  s'agrandit d'un mouvement de ressort et montre le lecteur de musique : grande pochette,
+  titre, artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Il suit le
+  morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…). Elle se
+  referme quand la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.
+- **Volume** dans un petit panneau collé à droite du Dock : un clic ouvre un curseur
+  au-dessus (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
   le règle aussi, le pourcentage s'affiche au survol.
 - **Lanceur façon Spotlight** : **Alt + Espace** ouvre une barre de recherche ; tapez
   quelques lettres (accents et majuscules ignorés), ↑ ↓ pour choisir, Entrée pour lancer,
