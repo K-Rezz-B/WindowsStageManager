@@ -27,8 +27,9 @@ cargo run --release
   Boutons précédent / lecture-pause / suivant, et barre de progression quand le lecteur
   donne la durée du morceau.
 - **Encoche** en haut de l'écran, au milieu, comme celle des MacBook Pro : noire, collée au
-  bord, raccordée à lui par deux petits congés. Pendant la lecture, elle s'élargit : pochette à
-  gauche, égaliseur animé à droite (de la couleur de la pochette). Au survol (ou au clic), elle
+  bord, raccordée à lui par deux petits congés. Fermée, elle affiche l'heure. Pendant la
+  lecture, elle s'élargit un peu : l'heure glisse à gauche et un petit symbole de lecture
+  apparaît à droite (de la couleur de la pochette). Au survol (ou au clic), elle
   s'agrandit d'un mouvement de ressort et montre le lecteur complet : grande pochette, titre,
   artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Elle se referme quand
   la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.

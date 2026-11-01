@@ -1,12 +1,12 @@
 //! L'encoche en haut de l'écran, comme celle des MacBook Pro : noire, collée au bord.
-//! Pendant la lecture, elle s'élargit (pochette à gauche, égaliseur à droite) ; au survol,
-//! elle s'agrandit et montre le lecteur complet.
+//! Fermée, elle affiche l'heure ; pendant la lecture, elle s'élargit un peu et montre un petit
+//! symbole de lecture. Au survol, elle s'agrandit et montre le lecteur complet.
 
 use super::{
-    dockbar::{draw_play_pause, draw_skip},
+    dockbar::{clock_text, draw_play_pause, draw_skip, text_width},
     *,
 };
-use crate::media::filetime_now;
+use crate::{canvas::round_corners, media::filetime_now};
 
 const TIMER_NOTCH_HOVER: usize = 5;
 const TIMER_NOTCH_EQ: usize = 6;
@@ -19,7 +19,7 @@ const ANIM: Duration = Duration::from_millis(450);
 /// Formes de l'encoche, en pixels à 100 % : au repos, pendant la lecture, ouverte sur le
 /// lecteur, ouverte sans rien à lire.
 const REST: Shape = Shape { w: 190.0, h: 32.0, radius: 10.0 };
-const LIVE: Shape = Shape { w: 280.0, h: 32.0, radius: 10.0 };
+const LIVE: Shape = Shape { w: 220.0, h: 32.0, radius: 10.0 };
 const OPEN: Shape = Shape { w: 440.0, h: 186.0, radius: 30.0 };
 const EMPTY: Shape = Shape { w: 320.0, h: 84.0, radius: 24.0 };
 /// Congés creux qui raccordent l'encoche au bord de l'écran.
@@ -91,6 +91,7 @@ pub(super) struct NotchUi {
     font_title: HFONT,
     font_artist: HFONT,
     font_small: HFONT,
+    font_time: HFONT,
 }
 
 impl NotchUi {
@@ -114,6 +115,7 @@ impl NotchUi {
             font_title: HFONT::default(),
             font_artist: HFONT::default(),
             font_small: HFONT::default(),
+            font_time: HFONT::default(),
         }
     }
 
@@ -225,7 +227,7 @@ impl App {
             let (mut dpi, mut dpi_y) = (96u32, 96u32);
             let _ = GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
             n.dpi = dpi as i32;
-            for font in [n.font_title, n.font_artist, n.font_small] {
+            for font in [n.font_title, n.font_artist, n.font_small, n.font_time] {
                 if !font.is_invalid() {
                     let _ = DeleteObject(font);
                 }
@@ -233,6 +235,7 @@ impl App {
             n.font_title = make_font("Inter SemiBold", 14, 600, n.dpi);
             n.font_artist = make_font("Inter", 13, 400, n.dpi);
             n.font_small = make_font("Inter", 10, 400, n.dpi);
+            n.font_time = make_font("Inter SemiBold", 13, 600, n.dpi);
         }
         n.anchor = POINT { x: (mon.left + mon.right) / 2, y: mon.top };
         self.render_notch();
@@ -273,8 +276,9 @@ impl App {
             n.target = target;
             n.start = Some(now);
         }
+        // Fermée, l'encoche ne bouge pas : l'égaliseur ne danse que dans le lecteur ouvert.
         unsafe {
-            if playing && n.shown && !n.fullscreen {
+            if playing && n.open && n.shown && !n.fullscreen {
                 SetTimer(self.hwnd, TIMER_NOTCH_EQ, 66, None);
             } else {
                 let _ = KillTimer(self.hwnd, TIMER_NOTCH_EQ);
@@ -341,20 +345,31 @@ impl App {
         }
         canvas.notch(r, shape.radius * k, SHOULDER * k, (0, 0, 0), 255);
 
-        // Pendant la lecture, encoche refermée : pochette à gauche, égaliseur à droite.
-        let live = if playing { ((shape.w - REST.w) / (LIVE.w - REST.w)).clamp(0.0, 1.0) * (1.0 - opened * 4.0).clamp(0.0, 1.0) } else { 0.0 };
-        if live > 0.0 {
+        // Encoche fermée : l'heure au milieu. Pendant la lecture, l'encoche s'élargit, l'heure
+        // glisse à gauche et un petit symbole de lecture apparaît à droite.
+        let closed = (1.0 - opened * 4.0).clamp(0.0, 1.0);
+        if closed > 0.0 {
             let mut layer = Canvas::new(size.cx, size.cy);
             let band = s(REST.h as i32);
-            let a = s(20);
-            let cover = RECT { left: r.left + s(12), top: (band - a) / 2, right: r.left + s(12) + a, bottom: (band + a) / 2 };
-            match &art {
-                Some(img) => layer.draw_quad(img, quad(cover), 255, 0),
-                None => layer.round_rect(cover, s(5), (70, 70, 80), 255),
+            let live = if playing { ((shape.w - REST.w) / (LIVE.w - REST.w)).clamp(0.0, 1.0) } else { 0.0 };
+            let (time, _) = clock_text();
+            let tw = text_width(n.font_time, &time);
+            let middle = (r.left + r.right - tw) / 2;
+            let x = middle + ((r.left + s(16) - middle) as f32 * live).round() as i32;
+            if live > 0.0 {
+                let (cx, cy) = ((r.right - s(20)) as f32, band as f32 / 2.0);
+                let (w, h) = (9.0 * k, 11.0 * k);
+                let left = cx - w / 2.0 + 1.0 * k;
+                let triangle = [(left, cy - h / 2.0), (left + w, cy), (left, cy + h / 2.0)];
+                layer.fill_convex(&round_corners(&triangle, 1.5 * k), accent, (255.0 * live) as u8);
             }
-            let eq = RECT { left: r.right - s(30), top: s(9), right: r.right - s(12), bottom: band - s(9) };
-            draw_equalizer(&mut layer, eq, t, true, accent);
-            canvas.overlay_inside(&layer, live);
+            let text = RECT { left: x, top: 0, right: x + tw + s(4), bottom: band };
+            layer.gdi(|dc| unsafe {
+                SetBkMode(dc, TRANSPARENT);
+                SelectObject(dc, n.font_time);
+                draw_text(dc, &time, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, TEXT, 0);
+            });
+            canvas.overlay_inside(&layer, closed);
         }
 
         // Encoche ouverte : le lecteur complet, qui apparaît en fin d'ouverture.

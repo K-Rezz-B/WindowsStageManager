@@ -173,10 +173,15 @@ impl App {
                 let clock = clock_text();
                 let volume = volume::get();
                 let playing = self.now_playing.as_ref().is_some_and(|np| np.playing && np.timeline.is_some());
-                if clock != self.dock.clock || volume != self.dock.volume || playing {
+                let minute = clock != self.dock.clock;
+                if minute || volume != self.dock.volume || playing {
                     self.dock.clock = clock;
                     self.dock.volume = volume;
                     self.render_dock();
+                }
+                // L'encoche fermée affiche aussi l'heure.
+                if minute {
+                    self.render_notch();
                 }
             }
             WM_DOCK_WALLPAPER => {
@@ -891,7 +896,7 @@ fn draw_volume(canvas: &mut Canvas, button: RECT, level: f32, muted: bool, dpi: 
 }
 
 /// Heure (« 22:15 ») et date courte (« jeu. 30 oct. ») au format de Windows.
-fn clock_text() -> (String, String) {
+pub(super) fn clock_text() -> (String, String) {
     use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx};
     let read = |buf: &[u16], n: i32| String::from_utf16_lossy(&buf[..(n - 1).max(0) as usize]);
     unsafe {
