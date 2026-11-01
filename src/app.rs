@@ -32,10 +32,12 @@ use crate::{
     win::{self, hwnd_of, wid_of},
 };
 
+mod corners;
 mod dockbar;
 mod launcherui;
 mod notch;
 
+use corners::Corners;
 use dockbar::{DockUi, DOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 use notch::{NotchUi, NOTCH};
@@ -177,6 +179,8 @@ struct App {
     launcher: LauncherUi,
     /// L'encoche en haut de l'écran, qui s'ouvre sur le lecteur.
     notch: NotchUi,
+    /// Coins arrondis de l'écran.
+    corners: Corners,
     /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
     /// la sort de sa scène.
     window_drag: Option<WindowDrag>,
@@ -195,7 +199,7 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND, notch: HWND) -> Self {
+    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND, notch: HWND, corners: Corners) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
@@ -229,6 +233,7 @@ impl App {
             dock: DockUi::new(dock),
             launcher: LauncherUi::new(launcher),
             notch: NotchUi::new(notch),
+            corners,
             window_drag: None,
             drop_target: false,
             pending_placements: Vec::new(),
@@ -280,12 +285,18 @@ impl App {
                     }
                     // L'encoche n'est pas une barre réservée : elle suit la barre latérale.
                     self.notch_fullscreen(fullscreen);
+                    // Les coins aussi : posés sur un jeu, ils l'obligeraient à passer par la
+                    // composition du bureau (un peu plus de latence).
+                    self.corners.set_visible(!fullscreen);
                 }
                 _ => {}
             },
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
                 self.place_appbar();
                 self.place_notch();
+                if self.enabled {
+                    self.corners.show(self.monitor);
+                }
             }
             WM_ENDSESSION if wp.0 != 0 => restore_hidden(),
             WM_CLOSE => {}
@@ -320,6 +331,7 @@ impl App {
         self.register_appbar();
         self.enable_dock();
         self.enable_notch();
+        self.corners.show(self.monitor);
         self.preload_launcher();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -368,6 +380,7 @@ impl App {
         self.remove_appbar();
         self.disable_dock();
         self.disable_notch();
+        self.corners.hide();
     }
 
     // --- Scènes ---------------------------------------------------------------------
@@ -394,6 +407,10 @@ impl App {
     fn on_event(&mut self, event: u32, h: HWND) {
         if !self.enabled {
             return;
+        }
+        if event == EVENT_SYSTEM_FOREGROUND {
+            // Une fenêtre « toujours au premier plan » a pu passer devant les coins.
+            self.corners.raise();
         }
         let w = wid_of(h);
         let guarded = Instant::now() < self.guard_until;
@@ -1578,7 +1595,8 @@ pub fn run() -> Result<()> {
             None,
         )?;
         NOTCH.store(notch.0 as isize, Ordering::Relaxed);
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher, notch)));
+        let corners = Corners::create(instance)?;
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher, notch, corners)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [

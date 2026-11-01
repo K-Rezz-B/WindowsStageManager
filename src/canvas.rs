@@ -385,6 +385,21 @@ impl Canvas {
         }
     }
 
+    /// Remplit tout ce qui est hors du cercle (`center`, `radius`), bord lissé : posé dans un coin,
+    /// ça l'arrondit.
+    pub fn fill_outside_circle(&mut self, center: (f32, f32), radius: f32, rgb: (u8, u8, u8), alpha: u8) {
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let d = (x as f32 + 0.5 - center.0).hypot(y as f32 + 0.5 - center.1);
+                let cover = (d - radius + 0.5).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    let i = (y * self.w + x) as usize;
+                    self.px[i] = over(premul(rgb, (alpha as f32 * cover).round() as u8), self.px[i]);
+                }
+            }
+        }
+    }
+
     /// Pose `layer` (de même taille) par-dessus, avec l'opacité `alpha`.
     pub fn overlay(&mut self, layer: &Canvas, alpha: f32) {
         for (dst, &src) in self.px.iter_mut().zip(&layer.px) {
@@ -636,6 +651,19 @@ mod tests {
         assert_eq!(alpha(30, 0), 255, "et vers la droite");
         assert_eq!(alpha(7, 3), 0, "il se creuse en descendant");
         assert_eq!(alpha(9, 8), 0, "rien sous le congé");
+    }
+
+    #[test]
+    fn coin_d_ecran_arrondi() {
+        // Coin en haut à gauche : le cercle est centré sur le coin opposé du carré.
+        let mut c = Canvas::new(12, 12);
+        c.fill_outside_circle((12.0, 12.0), 12.0, (0, 0, 0), 255);
+        let alpha = |x: i32, y: i32| c.px[(y * 12 + x) as usize] >> 24;
+        assert_eq!(alpha(0, 0), 255, "le coin est noir");
+        assert_eq!(alpha(11, 11), 0, "le reste de l'écran reste visible");
+        assert!(alpha(11, 0) < 20, "au bout de la courbe, presque rien");
+        let edge = (0..12).map(|i| alpha(i, i)).filter(|a| *a > 0 && *a < 255).count();
+        assert!(edge > 0, "la courbe est lissée");
     }
 
     #[test]

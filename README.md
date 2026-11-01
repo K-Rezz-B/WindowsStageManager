@@ -29,6 +29,9 @@ cargo run --release
   titre, artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Il suit le
   morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…). Elle se
   referme quand la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.
+- **Coins de l'écran arrondis**, comme sur les Mac : un quart de cercle noir dans chaque coin
+  (20 pixels à 100 %), par-dessus tout, que la souris traverse. Ils s'effacent devant un jeu ou
+  une vidéo en plein écran, pour ne pas lui ajouter de latence.
 - **Volume** dans un petit panneau collé à droite du Dock : un clic ouvre un curseur
   au-dessus (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
   le règle aussi, le pourcentage s'affiche au survol.
@@ -117,6 +120,7 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
 | `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
 | `src/app/notch.rs` | Encoche en haut de l'écran : formes, animation, lecteur complet |
+| `src/app/corners.rs` | Coins arrondis de l'écran |
 | `src/volume.rs` | Volume de la sortie audio par défaut |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |
@@ -132,7 +136,7 @@ comme la barre des tâches), `ShowWindowAsync` (une appli figée ne bloque pas l
 
 - Les fenêtres lancées en administrateur ne sont pas gérées (Windows l'interdit), sauf si
   Stage Manager est lui-même lancé en administrateur.
-- La barre et l'encoche n'apparaissent que sur l'écran principal.
+- La barre, l'encoche et les coins arrondis n'apparaissent que sur l'écran principal.
 - L'encoche recouvre le milieu du haut de l'écran (environ 190 × 32 pixels à 100 %) : un clic
   à cet endroit l'ouvre au lieu d'atteindre la fenêtre en dessous (onglet, barre de titre).
 - Les bureaux virtuels ne sont pas encore pris en compte.
