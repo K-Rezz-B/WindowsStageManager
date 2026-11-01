@@ -18,6 +18,11 @@ const TIMER_CLOCK: usize = 3;
 /// Largeur du panneau du volume (à droite du Dock) et son écart avec le Dock, en pixels à 100 %.
 const VOLUME_WIDTH: i32 = 54;
 const PANEL_GAP: i32 = 10;
+/// Hauteur du curseur de volume, vertical au-dessus de son bouton (pixels à 100 %).
+const SLIDER_HEIGHT: i32 = 210;
+/// Ouverture (avec un léger rebond) et fermeture du curseur.
+const SLIDER_OPEN: Duration = Duration::from_millis(320);
+const SLIDER_CLOSE: Duration = Duration::from_millis(180);
 
 const MENU_DOCK_OPEN: usize = 20;
 const MENU_DOCK_PIN: usize = 21;
@@ -50,6 +55,8 @@ pub(super) struct DockUi {
     volume: Option<(f32, bool)>,
     /// Le curseur de volume est ouvert au-dessus de son panneau.
     slider_open: bool,
+    /// Animation d'ouverture ou de fermeture du curseur : début, et ouverture de départ (0 à 1).
+    slider_anim: Option<(Instant, f32)>,
     /// On fait glisser le curseur de volume.
     slider_drag: bool,
 }
@@ -69,29 +76,33 @@ struct Panels {
     audio: RECT,
     /// Icône du volume, au milieu du panneau.
     volume: RECT,
-    /// Curseur de volume, ouvert au-dessus du panneau.
+    /// Curseur de volume au-dessus du panneau, quand il est affiché (ou en train de s'ouvrir ou
+    /// de se fermer).
     slider: Option<SliderLayout>,
+    /// Le curseur répond à la souris (pas pendant qu'il se referme).
+    slider_live: bool,
 }
 
+/// Curseur vertical : le pourcentage en haut, la piste, le haut-parleur en bas.
 struct SliderLayout {
     panel: RECT,
     mute: RECT,
     track: RECT,
-    /// Zone cliquable de la piste, plus haute que la piste elle-même.
+    /// Zone cliquable de la piste, plus large que la piste elle-même.
     hit: RECT,
     percent: RECT,
 }
 
 impl SliderLayout {
-    /// Volume correspondant à l'abscisse `x` sur la piste.
-    fn level_at(&self, x: i32) -> f32 {
-        ((x - self.track.left) as f32 / (self.track.right - self.track.left).max(1) as f32).clamp(0.0, 1.0)
+    /// Volume correspondant à l'ordonnée `y` sur la piste (plein en haut).
+    fn level_at(&self, y: i32) -> f32 {
+        ((self.track.bottom - y) as f32 / (self.track.bottom - self.track.top).max(1) as f32).clamp(0.0, 1.0)
     }
 }
 
 impl Panels {
     fn control_at(&self, pt: POINT) -> Option<Control> {
-        if let Some(s) = &self.slider {
+        if let Some(s) = self.slider.as_ref().filter(|_| self.slider_live) {
             if contains(s.mute, pt) {
                 return Some(Control::Mute);
             }
@@ -120,6 +131,7 @@ impl DockUi {
             trash_full: false,
             hover_control: None,
             slider_open: false,
+            slider_anim: None,
             slider_drag: false,
             clock: clock_text(),
             volume: None,
@@ -130,6 +142,23 @@ impl DockUi {
         if self.requested.insert(path.to_owned()) {
             self.loader.request(path);
         }
+    }
+
+    /// Ouverture du curseur de volume : 0 fermé, 1 ouvert (un peu plus au rebond).
+    fn slider_shown(&self, now: Instant) -> f32 {
+        let target = if self.slider_open { 1.0 } else { 0.0 };
+        let Some((start, from)) = self.slider_anim else { return target };
+        let e = if self.slider_open {
+            anim::spring(anim::progress(start, SLIDER_OPEN, now))
+        } else {
+            anim::ease_out(anim::progress(start, SLIDER_CLOSE, now))
+        };
+        from + (target - from) * e as f32
+    }
+
+    /// Le curseur est à l'écran, ouvert ou en train de s'ouvrir ou de se fermer.
+    fn slider_visible(&self) -> bool {
+        self.slider_open || self.slider_anim.is_some()
     }
 }
 
@@ -323,7 +352,10 @@ impl App {
         let w = self.dock.model.window_width(m) + 2 * side;
         let left = (mon.left + mon.right - w) / 2;
         let bottom = mon.bottom - 3;
-        RECT { left, top: bottom - m.height, right: left + w, bottom }
+        // La fenêtre grandit vers le haut le temps que le curseur de volume est affiché (avec de
+        // la marge pour son rebond) ; le reste du temps, elle reste basse.
+        let extra = if self.dock.slider_visible() { (SLIDER_HEIGHT + PANEL_GAP + 30) * self.dock.dpi / 96 } else { 0 };
+        RECT { left, top: bottom - m.height - extra, right: left + w, bottom }
     }
 
     /// Emplacement du panneau du volume, collé au bord droit du Dock (qui s'élargit au survol).
@@ -335,19 +367,16 @@ impl App {
         let audio = RECT { left: body.right + gap, top: body.top, right: body.right + gap + s(VOLUME_WIDTH), bottom: body.bottom };
         let vsize = s(34);
         let volume = RECT { left: cx - vsize / 2, top: cy - vsize / 2, right: cx + vsize / 2, bottom: cy + vsize / 2 };
-        // Curseur de volume : plaque au-dessus du panneau, alignée sur son bord droit (elle
-        // déborde au-dessus du Dock plutôt que hors de l'écran).
-        let slider = self.dock.slider_open.then(|| {
-            let (w, h) = (s(250), s(46));
-            let panel = RECT { left: audio.right - w, top: audio.top - s(10) - h, right: audio.right, bottom: audio.top - s(10) };
-            let mid = (panel.top + panel.bottom) / 2;
-            let mute = RECT { left: panel.left + s(6), top: mid - s(17), right: panel.left + s(40), bottom: mid + s(17) };
-            let percent = RECT { left: panel.right - s(52), top: panel.top, right: panel.right - s(10), bottom: panel.bottom };
-            let track = RECT { left: mute.right + s(8), top: mid - s(3), right: percent.left - s(10), bottom: mid + s(3) };
-            let hit = RECT { left: track.left - s(8), top: panel.top, right: track.right + s(8), bottom: panel.bottom };
+        // Curseur de volume : colonne au-dessus du bouton, de la largeur de son panneau.
+        let slider = self.dock.slider_visible().then(|| {
+            let panel = RECT { left: audio.left, top: audio.top - gap - s(SLIDER_HEIGHT), right: audio.right, bottom: audio.top - gap };
+            let percent = RECT { left: panel.left, top: panel.top + s(10), right: panel.right, bottom: panel.top + s(30) };
+            let mute = RECT { left: cx - s(17), top: panel.bottom - s(42), right: cx + s(17), bottom: panel.bottom - s(8) };
+            let track = RECT { left: cx - s(3), top: percent.bottom + s(14), right: cx + s(3), bottom: mute.top - s(14) };
+            let hit = RECT { left: panel.left, top: track.top - s(10), right: panel.right, bottom: track.bottom + s(10) };
             SliderLayout { panel, mute, track, hit, percent }
         });
-        Panels { audio, volume, slider }
+        Panels { audio, volume, slider, slider_live: self.dock.slider_open }
     }
 
     /// Disposition actuelle du Dock et de ses panneaux, en coordonnées de sa fenêtre.
@@ -396,31 +425,49 @@ impl App {
         }
         let (level, muted) = self.dock.volume.unwrap_or((0.0, false));
         draw_volume(&mut canvas, panels.volume, level, muted, dpi);
-        // Curseur de volume au-dessus de son panneau.
+        // Curseur de volume, vertical au-dessus de son bouton. Il se déplie vers le haut en
+        // apparaissant en fondu, et se replie de même.
         if let Some(sl) = &panels.slider {
-            // Zone invisible mais « pleine » entre le panneau et le curseur : la souris peut passer
-            // de l'un à l'autre sans quitter le Dock (ce qui fermerait le curseur).
-            let bridge = RECT { left: sl.panel.left, top: sl.panel.top, right: sl.panel.right, bottom: panels.audio.bottom };
-            canvas.round_rect(bridge, 0, (0, 0, 0), 1);
-            plate(&mut canvas, sl.panel, s(16) as f32, &look);
-            if self.dock.hover_control == Some(Control::Mute) {
-                canvas.round_rect(sl.mute, (sl.mute.right - sl.mute.left) / 2, white, 40);
+            let shown = self.dock.slider_shown(Instant::now());
+            if panels.slider_live {
+                // Zone invisible mais « pleine » entre le bouton et le curseur : la souris peut passer
+                // de l'un à l'autre sans quitter le Dock (ce qui fermerait le curseur).
+                canvas.round_rect(RECT { top: sl.panel.top, ..panels.audio }, 0, (0, 0, 0), 1);
             }
-            draw_volume(&mut canvas, sl.mute, level, muted, dpi);
+            // Plaque : d'un carré posé sur le bouton jusqu'à toute sa hauteur.
+            let full = sl.panel;
+            let width = full.right - full.left;
+            let height = width + ((full.bottom - full.top - width) as f32 * shown).round() as i32;
+            let mut layer = Canvas::new(w, h);
+            plate(&mut layer, RECT { top: full.bottom - height, ..full }, s(16) as f32, &look);
+            // Contenu à sa place définitive, découvert à mesure que la plaque se déplie.
+            let mut content = Canvas::new(w, h);
+            if self.dock.hover_control == Some(Control::Mute) {
+                content.round_rect(sl.mute, (sl.mute.right - sl.mute.left) / 2, white, 40);
+            }
+            draw_volume(&mut content, sl.mute, level, muted, dpi);
             let track = sl.track;
-            let radius = (track.bottom - track.top) / 2;
-            canvas.round_rect(track, radius, white, 70);
-            let x = track.left + ((track.right - track.left) as f32 * level).round() as i32;
+            let radius = (track.right - track.left) / 2;
+            content.round_rect(track, radius, white, 70);
+            let y = track.bottom - ((track.bottom - track.top) as f32 * level).round() as i32;
             let fill = if muted { 120 } else { 240 };
-            if x > track.left {
-                canvas.round_rect(RECT { right: x.max(track.left + 2 * radius), ..track }, radius, white, fill);
+            if y < track.bottom {
+                content.round_rect(RECT { top: y.min(track.bottom - 2 * radius), ..track }, radius, white, fill);
             }
             // Bouton rond, avec une ombre douce.
             let knob = s(16);
-            let cy = (track.top + track.bottom) / 2;
-            let knob_rect = RECT { left: x - knob / 2, top: cy - knob / 2, right: x + knob / 2, bottom: cy + knob / 2 };
-            canvas.round_rect(offset(inflate(knob_rect, s(1)), 0, s(1)), knob / 2 + s(1), (0, 0, 0), 70);
-            canvas.round_rect(knob_rect, knob / 2, white, 255);
+            let cx = (track.left + track.right) / 2;
+            let knob_rect = RECT { left: cx - knob / 2, top: y - knob / 2, right: cx + knob / 2, bottom: y + knob / 2 };
+            content.round_rect(offset(inflate(knob_rect, s(1)), 0, s(1)), knob / 2 + s(1), (0, 0, 0), 70);
+            content.round_rect(knob_rect, knob / 2, white, 255);
+            content.gdi(|dc| unsafe {
+                SetBkMode(dc, TRANSPARENT);
+                SelectObject(dc, self.font);
+                let text = if muted { "—".to_owned() } else { format!("{} %", (level * 100.0).round()) };
+                draw_text(dc, &text, sl.percent, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, TEXT, 0);
+            });
+            layer.overlay_inside(&content, 1.0);
+            canvas.overlay(&layer, shown.clamp(0.0, 1.0));
         }
         if let Some(x) = layout.separator {
             canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
@@ -471,25 +518,44 @@ impl App {
                 let mut rect = r;
                 DrawTextW(dc, &mut text, &mut rect, centered);
             }
-            // Pourcentage du curseur de volume.
-            if let Some(sl) = &panels.slider {
-                SelectObject(dc, self.font);
-                let text = if muted { "—".to_owned() } else { format!("{} %", (level * 100.0).round()) };
-                draw_text(dc, &text, sl.percent, centered, TEXT, 0);
-            }
         });
         canvas.present(self.dock.hwnd, POINT { x: window.left, y: window.top });
     }
 
     pub(super) fn dock_animating(&self) -> bool {
-        self.dock.model.animating()
+        self.dock.model.animating() || self.dock.slider_anim.is_some()
     }
 
     pub(super) fn dock_tick(&mut self, now: Instant) {
+        let mut redraw = false;
+        if let Some((start, _)) = self.dock.slider_anim {
+            let duration = if self.dock.slider_open { SLIDER_OPEN } else { SLIDER_CLOSE };
+            if anim::progress(start, duration, now) >= 1.0 {
+                // Fin de l'animation ; une fois refermé, le curseur disparaît et la fenêtre
+                // reprend sa hauteur.
+                self.dock.slider_anim = None;
+            }
+            redraw = true;
+        }
         if self.dock.model.animating() {
             self.dock.model.tick(now);
+            redraw = true;
+        }
+        if redraw {
             self.render_dock();
         }
+    }
+
+    /// Ouvre ou referme le curseur de volume, en douceur.
+    fn set_slider(&mut self, open: bool) {
+        if self.dock.slider_open == open {
+            return;
+        }
+        let now = Instant::now();
+        let from = self.dock.slider_shown(now).clamp(0.0, 1.0);
+        self.dock.slider_open = open;
+        self.dock.slider_anim = Some((now, from));
+        self.render_dock();
     }
 
     // --- Souris -----------------------------------------------------------------------
@@ -521,12 +587,11 @@ impl App {
                     self.dock.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
                 }
                 if self.dock.slider_drag {
-                    self.drag_volume(pt.x);
+                    self.drag_volume(pt.y);
                     return;
                 }
                 let hover = self.dock_hit(pt.x as f32, pt.y);
-                // Le Dock ne grossit que sous la souris, pas quand elle passe sur le lecteur ou
-                // l'horloge.
+                // Le Dock ne grossit que sous la souris, pas quand elle passe sur le volume.
                 self.dock.model.set_hover(hover.map(|_| pt.x as f32), hover);
                 self.dock.hover_control = self.dock_panels().control_at(pt);
                 self.render_dock();
@@ -535,11 +600,11 @@ impl App {
                 self.dock.tracking = false;
                 self.dock.model.set_hover(None, None);
                 self.dock.hover_control = None;
+                self.render_dock();
                 // La souris quitte le Dock : le curseur de volume se referme (sauf en plein glisser).
                 if !self.dock.slider_drag {
-                    self.dock.slider_open = false;
+                    self.set_slider(false);
                 }
-                self.render_dock();
             }
             WM_LBUTTONDOWN => {
                 if self.dock_panels().control_at(pt) == Some(Control::Slider) {
@@ -548,7 +613,7 @@ impl App {
                         // Garde la souris même si elle sort de la piste en glissant.
                         SetCapture(self.dock.hwnd);
                     }
-                    self.drag_volume(pt.x);
+                    self.drag_volume(pt.y);
                 }
             }
             WM_LBUTTONUP if self.dock.slider_drag => {
@@ -560,9 +625,8 @@ impl App {
             WM_LBUTTONUP => match self.dock_panels().control_at(pt) {
                 // Clic sur l'icône du volume : ouvre ou ferme le curseur.
                 Some(Control::Volume) => {
-                    self.dock.slider_open = !self.dock.slider_open;
                     self.dock.volume = volume::get();
-                    self.render_dock();
+                    self.set_slider(!self.dock.slider_open);
                 }
                 Some(Control::Mute) => {
                     volume::toggle_mute();
@@ -572,10 +636,7 @@ impl App {
                 Some(Control::Slider) => {}
                 // Ailleurs : le curseur se referme, et le clic fait son effet habituel.
                 control => {
-                    if self.dock.slider_open {
-                        self.dock.slider_open = false;
-                        self.render_dock();
-                    }
+                    self.set_slider(false);
                     self.dock_control_click(control, pt);
                 }
             },
@@ -601,9 +662,9 @@ impl App {
     }
 
     /// Règle le volume d'après la position de la souris sur la piste du curseur.
-    fn drag_volume(&mut self, x: i32) {
+    fn drag_volume(&mut self, y: i32) {
         let Some(slider) = self.dock_panels().slider else { return };
-        volume::set(slider.level_at(x));
+        volume::set(slider.level_at(y));
         self.dock.volume = volume::get();
         self.render_dock();
     }

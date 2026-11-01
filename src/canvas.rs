@@ -385,6 +385,15 @@ impl Canvas {
         }
     }
 
+    /// Pose `layer` (de même taille) par-dessus, avec l'opacité `alpha`.
+    pub fn overlay(&mut self, layer: &Canvas, alpha: f32) {
+        for (dst, &src) in self.px.iter_mut().zip(&layer.px) {
+            if src >> 24 != 0 {
+                *dst = over(scale(src, alpha), *dst);
+            }
+        }
+    }
+
     /// Pose `layer` (de même taille) par-dessus avec l'opacité `alpha`, mais seulement là où le
     /// canevas est déjà peint : le calque est découpé à la forme de ce qu'il recouvre.
     pub fn overlay_inside(&mut self, layer: &Canvas, alpha: f32) {
