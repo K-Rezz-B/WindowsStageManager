@@ -36,11 +36,13 @@ mod corners;
 mod dockbar;
 mod launcherui;
 mod notch;
+mod pin;
 
 use corners::Corners;
 use dockbar::{DockUi, DOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 use notch::{NotchUi, NOTCH};
+use pin::{Pin, HOTKEY_PIN};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
@@ -96,6 +98,8 @@ pub fn restore_hidden() {
             win::show(h, SW_SHOWNOACTIVATE);
         }
     }
+    // La page accrochée à l'encoche, si elle était garée hors de l'écran.
+    pin::restore_parked();
     // Et la barre des tâches, si on l'avait passée en masquage automatique pour le Dock.
     taskbar::restore();
 }
@@ -179,6 +183,8 @@ struct App {
     launcher: LauncherUi,
     /// L'encoche en haut de l'écran, qui s'ouvre sur le lecteur.
     notch: NotchUi,
+    /// Page accrochée à l'encoche, qu'elle montre en direct.
+    pin: Pin,
     /// Coins arrondis de l'écran.
     corners: Corners,
     /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
@@ -233,6 +239,7 @@ impl App {
             dock: DockUi::new(dock),
             launcher: LauncherUi::new(launcher),
             notch: NotchUi::new(notch),
+            pin: Pin::new(),
             corners,
             window_drag: None,
             drop_target: false,
@@ -248,7 +255,11 @@ impl App {
     }
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        if self.handle_dock_message(msg, wp, lp) || self.handle_launcher_message(msg, wp) || self.handle_notch_message(msg, wp) {
+        if self.handle_dock_message(msg, wp, lp)
+            || self.handle_launcher_message(msg, wp)
+            || self.handle_notch_message(msg, wp)
+            || self.handle_pin_message(msg, wp)
+        {
             return Some(LRESULT(0));
         }
         match msg {
@@ -294,6 +305,7 @@ impl App {
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
                 self.place_appbar();
                 self.place_notch();
+                self.pin_displays_changed();
                 if self.enabled {
                     self.corners.show(self.monitor);
                 }
@@ -345,6 +357,7 @@ impl App {
         let t = self.model.init(&windows, Some(wid_of(foreground)));
         self.apply(t, false);
         self.refresh();
+        self.enable_pin();
         unsafe {
             SetTimer(self.hwnd, TIMER_RESCAN, 1500, None);
         }
@@ -365,6 +378,7 @@ impl App {
         // Termine l'animation (et replace les fenêtres détachées) avant de tout restaurer.
         self.finish_switch();
         self.slide_start = None;
+        self.disable_pin();
         restore_hidden();
         self.model = Model::default();
         self.pending_minimize.clear();
@@ -387,7 +401,8 @@ impl App {
 
     /// Clé d'application d'une fenêtre, ou `None` si on ne doit pas la gérer.
     fn app_key(&mut self, h: HWND) -> Option<String> {
-        if !win::is_app_window(h) {
+        // La page accrochée à l'encoche vit à part, garée hors de l'écran.
+        if !win::is_app_window(h) || self.is_pin_window(h) {
             return None;
         }
         let owner = win::pid(h);
@@ -411,6 +426,9 @@ impl App {
         if event == EVENT_SYSTEM_FOREGROUND {
             // Une fenêtre « toujours au premier plan » a pu passer devant les coins.
             self.corners.raise();
+        }
+        if self.pin_event(event, h) {
+            return;
         }
         let w = wid_of(h);
         let guarded = Instant::now() < self.guard_until;
@@ -1386,7 +1404,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let is_launcher = hwnd.0 as isize == LAUNCHER.load(Ordering::Relaxed);
     let is_notch = hwnd.0 as isize == NOTCH.load(Ordering::Relaxed);
     match msg {
-        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP if is_notch => {
+        WM_RBUTTONUP if is_notch => {
+            notch::notch_menu(hwnd);
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP if is_notch => {
             with_app(|app| app.notch_mouse(msg, lp));
             return LRESULT(0);
         }
@@ -1606,6 +1628,7 @@ pub fn run() -> Result<()> {
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S' as u32);
         let _ = RegisterHotKey(hwnd, HOTKEY_DETACH, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D' as u32);
         let _ = RegisterHotKey(hwnd, HOTKEY_LAUNCHER, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
+        let _ = RegisterHotKey(hwnd, HOTKEY_PIN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'P' as u32);
         with_app(|app| {
             app.add_tray();
             app.enable();

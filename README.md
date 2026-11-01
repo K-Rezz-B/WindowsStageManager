@@ -29,6 +29,21 @@ cargo run --release
   titre, artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Il suit le
   morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…). Elle se
   referme quand la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.
+- **Page accrochée à l'encoche** (un graphique TradingView, par exemple) : **Ctrl + Alt + P**
+  sur une fenêtre de navigateur accroche la page affichée (adresse lue dans la barre
+  d'adresse, ou à défaut copiée dans le presse-papiers) ; clic droit sur l'encoche →
+  « Accrocher la page active » fait de même. La page s'ouvre dans une fenêtre Chrome à part,
+  avec son propre profil (`%LOCALAPPDATA%\StageManager\Chrome` : on s'y connecte une fois),
+  qui ne rejoint aucune scène. Elle est garée hors de l'écran plutôt que réduite, et Chrome y
+  est lancé sans sa détection des fenêtres cachées : la page continue de se dessiner.
+  L'encoche fermée affiche son titre ; pour TradingView, le symbole, le cours et la variation
+  du jour (en vert ou en rouge). Ouverte, elle montre la page en direct, sous le lecteur.
+  Un clic sur l'encoche amène la page à l'écran, au premier plan ; elle retourne au garage au
+  clic suivant ou dès qu'une autre fenêtre passe devant (la réduire la gare aussi). Sa taille
+  règle le zoom de l'aperçu. Fermée, elle se rouvre d'un clic sur l'encoche, et au démarrage
+  du Stage Manager. Ctrl + Alt + P sur la page elle-même (ou clic droit → « Décrocher la
+  page ») la ferme et la décroche. L'adresse est enregistrée dans
+  `%APPDATA%\StageManager\notch.txt`.
 - **Coins de l'écran arrondis**, comme sur les Mac : un quart de cercle noir dans chaque coin
   (20 pixels à 100 %), par-dessus tout, que la souris traverse. Ils s'effacent devant un jeu ou
   une vidéo en plein écran, pour ne pas lui ajouter de latence.
@@ -120,6 +135,7 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
 | `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
 | `src/app/notch.rs` | Encoche en haut de l'écran : formes, animation, lecteur complet |
+| `src/app/pin.rs` | Page accrochée à l'encoche : fenêtre Chrome dédiée, garage hors écran, cours |
 | `src/app/corners.rs` | Coins arrondis de l'écran |
 | `src/volume.rs` | Volume de la sortie audio par défaut |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |

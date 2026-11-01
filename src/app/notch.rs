@@ -1,15 +1,20 @@
 //! L'encoche en haut de l'écran, comme celle des MacBook Pro : noire, collée au bord.
 //! Fermée, elle affiche l'heure ; pendant la lecture, elle s'élargit un peu et montre un petit
 //! symbole de lecture. Au survol, elle s'agrandit et montre le lecteur complet.
+//! Une page peut y être accrochée (voir `pin`) : fermée, l'encoche affiche alors son cours ;
+//! ouverte, la page elle-même, en direct.
 
 use super::{
     dockbar::{clock_text, text_width},
+    pin::parse_ticker,
     *,
 };
 use crate::{canvas::round_corners, media::filetime_now};
 
 const TIMER_NOTCH_HOVER: usize = 5;
 const TIMER_NOTCH_EQ: usize = 6;
+const MENU_PIN: usize = 30;
+const MENU_UNPIN: usize = 31;
 
 /// Temps de survol avant l'ouverture : passer en coup de vent en haut de l'écran (vers les
 /// onglets du navigateur…) ne l'ouvre pas.
@@ -22,6 +27,15 @@ const REST: Shape = Shape { w: 190.0, h: 32.0, radius: 10.0 };
 const LIVE: Shape = Shape { w: 220.0, h: 32.0, radius: 10.0 };
 const OPEN: Shape = Shape { w: 440.0, h: 186.0, radius: 30.0 };
 const EMPTY: Shape = Shape { w: 320.0, h: 84.0, radius: 24.0 };
+/// Aperçu de la page accrochée : sa largeur, ses hauteurs extrêmes, sa marge, et son haut
+/// quand il n'y a pas de lecteur au-dessus (sous la bande de l'encoche fermée).
+const CHART_W: f32 = 520.0;
+const CHART_H: (f32, f32) = (200.0, 420.0);
+const CHART_PAD: f32 = 16.0;
+const CHART_TOP: f32 = 40.0;
+/// Hausse et baisse du cours, aux couleurs d'Apple.
+const UP: COLORREF = rgb(48, 209, 88);
+const DOWN: COLORREF = rgb(255, 69, 58);
 /// Congés creux qui raccordent l'encoche au bord de l'écran.
 const SHOULDER: f32 = 6.0;
 /// Place autour de l'encoche pour son ombre et le léger dépassement du ressort.
@@ -88,6 +102,8 @@ pub(super) struct NotchUi {
     /// Horloge de l'égaliseur.
     epoch: Instant,
     art: Option<Cover>,
+    /// Miniature DWM de la page accrochée, montrée dans l'encoche ouverte.
+    thumb: Option<isize>,
     font_title: HFONT,
     font_artist: HFONT,
     font_small: HFONT,
@@ -112,6 +128,7 @@ impl NotchUi {
             start: None,
             epoch: Instant::now(),
             art: None,
+            thumb: None,
             font_title: HFONT::default(),
             font_artist: HFONT::default(),
             font_small: HFONT::default(),
@@ -216,6 +233,7 @@ impl App {
             let _ = KillTimer(self.hwnd, TIMER_NOTCH_HOVER);
             let _ = KillTimer(self.hwnd, TIMER_NOTCH_EQ);
         }
+        self.notch_drop_thumb();
     }
 
     /// Centre l'encoche en haut de l'écran principal, à la bonne échelle.
@@ -244,6 +262,9 @@ impl App {
     /// Une appli passe en plein écran (ou en sort) : l'encoche s'efface, et ne dessine plus rien.
     pub(super) fn notch_fullscreen(&mut self, fullscreen: bool) {
         self.notch.fullscreen = fullscreen;
+        if fullscreen {
+            self.notch_drop_thumb();
+        }
         unsafe {
             let _ = ShowWindow(self.notch.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
         }
@@ -259,17 +280,40 @@ impl App {
         }
     }
 
-    /// Choisit la forme de l'encoche d'après la musique et la souris, et l'y amène en douceur.
-    pub(super) fn notch_retarget(&mut self) {
+    /// Formes de l'encoche fermée et ouverte, d'après la musique et la page accrochée.
+    fn notch_shapes(&self) -> (Shape, Shape) {
         let media = self.now_playing.is_some();
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
-        let n = &mut self.notch;
-        let target = match (n.open, media, playing) {
-            (true, true, _) => OPEN,
-            (true, false, _) => EMPTY,
-            (false, _, true) => LIVE,
-            _ => REST,
+        let k = self.notch.dpi as f32 / 96.0;
+        let mut closed = if playing { LIVE } else { REST };
+        let ticker = self.ticker_width();
+        if ticker > 0 {
+            // L'heure à gauche, le cours à droite (avant le symbole de lecture). Arrondie, la
+            // largeur ne suit pas chaque petit mouvement du cours.
+            let (time, _) = clock_text();
+            let s = |v: i32| self.notch.s(v);
+            let play = if playing { s(20) } else { 0 };
+            let w = (s(16) + text_width(self.notch.font_time, &time) + s(18) + ticker + s(16) + play) as f32 / k;
+            closed.w = closed.w.max((w / 16.0).ceil() * 16.0);
+        }
+        let open = match self.pin_chart_size() {
+            Some((w, h)) => Shape {
+                w: (w + 2.0 * CHART_PAD).max(if media { OPEN.w } else { 0.0 }),
+                h: if media { OPEN.h } else { CHART_TOP } + h + CHART_PAD,
+                radius: OPEN.radius,
+            },
+            None if media => OPEN,
+            None => EMPTY,
         };
+        (closed, open)
+    }
+
+    /// Choisit la forme de l'encoche d'après la musique et la souris, et l'y amène en douceur.
+    pub(super) fn notch_retarget(&mut self) {
+        let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
+        let (closed, open) = self.notch_shapes();
+        let n = &mut self.notch;
+        let target = if n.open { open } else { closed };
         if target != n.target {
             let now = Instant::now();
             n.from = n.shape(now);
@@ -327,7 +371,8 @@ impl App {
         let shape = n.shape(now);
         let (r, size) = n.frame(shape);
         let np = self.now_playing.as_ref();
-        let full = if np.is_some() { OPEN } else { EMPTY };
+        let (_, full) = self.notch_shapes();
+        let pinned = self.pin.url.is_some();
         // 0 au repos, 1 ouverte.
         let opened = ((shape.h - REST.h) / (full.h - REST.h)).clamp(0.0, 1.0);
         let playing = np.is_some_and(|np| np.playing);
@@ -346,16 +391,19 @@ impl App {
         canvas.notch(r, shape.radius * k, SHOULDER * k, (0, 0, 0), 255);
 
         // Encoche fermée : l'heure au milieu. Pendant la lecture, l'encoche s'élargit, l'heure
-        // glisse à gauche et un petit symbole de lecture apparaît à droite.
+        // glisse à gauche et un petit symbole de lecture apparaît à droite. Le cours de la page
+        // accrochée prend place entre les deux.
         let closed = (1.0 - opened * 4.0).clamp(0.0, 1.0);
         if closed > 0.0 {
             let mut layer = Canvas::new(size.cx, size.cy);
             let band = s(REST.h as i32);
             let live = if playing { ((shape.w - REST.w) / (LIVE.w - REST.w)).clamp(0.0, 1.0) } else { 0.0 };
+            let ticker = self.ticker_parts();
             let (time, _) = clock_text();
             let tw = text_width(n.font_time, &time);
             let middle = (r.left + r.right - tw) / 2;
-            let x = middle + ((r.left + s(16) - middle) as f32 * live).round() as i32;
+            let slide = if ticker.is_empty() { live } else { 1.0 };
+            let x = middle + ((r.left + s(16) - middle) as f32 * slide).round() as i32;
             if live > 0.0 {
                 let (cx, cy) = ((r.right - s(20)) as f32, band as f32 / 2.0);
                 let (w, h) = (9.0 * k, 11.0 * k);
@@ -364,20 +412,33 @@ impl App {
                 layer.fill_convex(&round_corners(&triangle, 1.5 * k), accent, (255.0 * live) as u8);
             }
             let text = RECT { left: x, top: 0, right: x + tw + s(4), bottom: band };
+            // Le cours, calé à droite : symbole, prix, variation.
+            let right = r.right - s(16) - (s(20) as f32 * live).round() as i32;
+            let start = right - ticker.iter().map(|p| p.3).sum::<i32>() - s(6) * (ticker.len() as i32 - 1).max(0);
             layer.gdi(|dc| unsafe {
                 SetBkMode(dc, TRANSPARENT);
                 SelectObject(dc, n.font_time);
                 draw_text(dc, &time, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, TEXT, 0);
+                let mut left = start;
+                for (part, font, color, width) in &ticker {
+                    SelectObject(dc, *font);
+                    let rect = RECT { left, top: 0, right: left + width, bottom: band };
+                    draw_text(dc, part, rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, *color, 0);
+                    left += width + s(6);
+                }
             });
             canvas.overlay_inside(&layer, closed);
         }
 
         // Encoche ouverte : le lecteur complet, qui apparaît en fin d'ouverture.
         let content = ((opened - 0.7) / 0.3).clamp(0.0, 1.0);
+        let mut thumb = None;
         if content > 0.0 {
             let mut layer = Canvas::new(size.cx, size.cy);
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
             match np {
+                // Rien à lire : la page accrochée occupe toute l'encoche.
+                None if pinned => {}
                 None => {
                     let text = RECT { top: r.top + s(28), bottom: r.bottom - s(6), ..r };
                     layer.gdi(|dc| unsafe {
@@ -429,12 +490,107 @@ impl App {
                     });
                 }
             }
+            // La page accrochée, sous le lecteur. Sa miniature DWM se pose par-dessus une fois
+            // l'encoche dessinée ; fermée, la page laisse place à une invitation à la rouvrir.
+            if pinned {
+                let top = if np.is_some() { OPEN.h } else { CHART_TOP };
+                let pad = s(CHART_PAD as i32);
+                let area = RECT { left: r.left + pad, top: r.top + s(top as i32), right: r.right - pad, bottom: r.bottom - pad };
+                match self.pin_source() {
+                    Some(source) => {
+                        let dest = fit(area, anim::size(source));
+                        layer.round_rect(dest, s(6), (28, 28, 32), 255);
+                        thumb = Some((dest, source, (255.0 * content) as u8));
+                    }
+                    None => {
+                        layer.round_rect(area, s(14), (34, 34, 40), 255);
+                        let invite = format!("Cliquer pour ouvrir {}", self.pin.url.as_deref().map_or("la page", host));
+                        layer.gdi(|dc| unsafe {
+                            SetBkMode(dc, TRANSPARENT);
+                            SelectObject(dc, n.font_artist);
+                            draw_text(dc, &invite, area, centered | DT_END_ELLIPSIS, TEXT_DIM, 0);
+                        });
+                    }
+                }
+            }
             canvas.overlay_inside(&layer, content);
         }
 
         let pos = POINT { x: n.anchor.x - size.cx / 2, y: n.anchor.y };
         canvas.present(n.hwnd, pos);
         self.notch.window = RECT { left: pos.x, top: pos.y, right: pos.x + size.cx, bottom: pos.y + size.cy };
+        self.place_notch_thumb(thumb);
+    }
+
+    // --- Page accrochée -----------------------------------------------------------------
+
+    /// Taille de l'aperçu de la page accrochée, en pixels à 100 %, aux proportions de sa fenêtre.
+    fn pin_chart_size(&self) -> Option<(f32, f32)> {
+        self.pin.url.as_ref()?;
+        let (w, h) = self.pin_source().map_or((16.0, 9.0), |r| ((r.right - r.left) as f32, (r.bottom - r.top) as f32));
+        Some((CHART_W, (CHART_W * h / w).clamp(CHART_H.0, CHART_H.1)))
+    }
+
+    /// Le cours affiché dans l'encoche fermée, en morceaux : texte, police, couleur, largeur.
+    /// TradingView l'écrit dans son titre ; pour une autre page, le titre tout court.
+    fn ticker_parts(&self) -> Vec<(String, HFONT, COLORREF, i32)> {
+        let n = &self.notch;
+        let title = self.pin.title.trim();
+        if self.pin.url.is_none() || title.is_empty() {
+            return Vec::new();
+        }
+        let part = |text: &str, font: HFONT, color: COLORREF| (text.to_owned(), font, color, text_width(font, text));
+        match parse_ticker(title) {
+            Some(t) => {
+                let mut parts = vec![part(&t.symbol, n.font_time, TEXT), part(&t.price, n.font_artist, TEXT)];
+                if let Some((change, up)) = &t.change {
+                    parts.push(part(change, n.font_artist, if *up { UP } else { DOWN }));
+                }
+                parts
+            }
+            None => {
+                let mut whole = part(title, n.font_artist, TEXT_DIM);
+                whole.3 = whole.3.min(n.s(200));
+                vec![whole]
+            }
+        }
+    }
+
+    fn ticker_width(&self) -> i32 {
+        let parts = self.ticker_parts();
+        parts.iter().map(|p| p.3).sum::<i32>() + self.notch.s(6) * (parts.len() as i32 - 1).max(0)
+    }
+
+    /// Pose (ou retire) la miniature de la page accrochée : où, quelle partie de la fenêtre,
+    /// avec quelle opacité.
+    fn place_notch_thumb(&mut self, thumb: Option<(RECT, RECT, u8)>) {
+        let (Some((dest, source, opacity)), Some(page)) = (thumb, self.pin.hwnd) else {
+            self.notch_drop_thumb();
+            return;
+        };
+        if self.notch.thumb.is_none() {
+            self.notch.thumb = unsafe { DwmRegisterThumbnail(self.notch.hwnd, page) }.ok();
+        }
+        let Some(thumb) = self.notch.thumb else { return };
+        let props = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+            rcDestination: dest,
+            rcSource: source,
+            opacity,
+            fVisible: true.into(),
+            fSourceClientAreaOnly: false.into(),
+        };
+        unsafe {
+            let _ = DwmUpdateThumbnailProperties(thumb, &props);
+        }
+    }
+
+    pub(super) fn notch_drop_thumb(&mut self) {
+        if let Some(thumb) = self.notch.thumb.take() {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(thumb);
+            }
+        }
     }
 
     // --- Souris -----------------------------------------------------------------------
@@ -496,12 +652,42 @@ impl App {
                 }
                 Some(Control::Previous) => self.media.previous(),
                 Some(Control::Next) => self.media.next(),
+                // Ailleurs, un clic montre la page accrochée (ou la regare) : l'encoche se
+                // referme pour ne pas la masquer.
+                None if self.pin.url.is_some() => {
+                    self.set_notch_open(false);
+                    self.pin_toggle();
+                }
                 // Un clic sur l'encoche fermée l'ouvre sans attendre.
                 None => self.set_notch_open(true),
             },
             _ => {}
         }
     }
+}
+
+/// Clic droit sur l'encoche : accrocher la page de la fenêtre active, ou la décrocher.
+pub(super) unsafe fn notch_menu(hwnd: HWND) {
+    // Le menu prend le premier plan : on retient la fenêtre qu'on regardait.
+    let foreground = GetForegroundWindow();
+    let Some(pinned) = with_app(|app| app.pin.url.is_some()) else { return };
+    let items = if pinned {
+        [(MENU_UNPIN, w!("Décrocher la page"))]
+    } else {
+        [(MENU_PIN, w!("Accrocher la page active\tCtrl+Alt+P"))]
+    };
+    match popup(hwnd, &items, &[]) {
+        MENU_PIN => with_app(|app| app.pin_window(foreground)),
+        MENU_UNPIN => with_app(App::unpin),
+        _ => None,
+    };
+}
+
+/// Nom du site d'une adresse : « tradingview.com ».
+fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    host.strip_prefix("www.").unwrap_or(host)
 }
 
 fn quad(r: RECT) -> [(f32, f32); 4] {
@@ -613,5 +799,11 @@ mod tests {
         assert!(r > 200 && g < 60 && b < 60, "{r} {g} {b}");
         let black = Image { w: 4, h: 4, px: vec![0xFF_00_00_00; 16] };
         assert_eq!(accent(&black), (235, 235, 240), "une pochette noire donne du blanc");
+    }
+
+    #[test]
+    fn nom_du_site() {
+        assert_eq!(host("https://www.tradingview.com/chart/abc/?symbol=BTC"), "tradingview.com");
+        assert_eq!(host("http://example.org"), "example.org");
     }
 }
