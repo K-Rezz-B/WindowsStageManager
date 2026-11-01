@@ -26,6 +26,12 @@ cargo run --release
   Deezer…). Il n'apparaît que lorsqu'un média est ouvert.
   Boutons précédent / lecture-pause / suivant, et barre de progression quand le lecteur
   donne la durée du morceau.
+- **Encoche** en haut de l'écran, au milieu, comme celle des MacBook Pro : noire, collée au
+  bord, raccordée à lui par deux petits congés. Pendant la lecture, elle s'élargit : pochette à
+  gauche, égaliseur animé à droite (de la couleur de la pochette). Au survol (ou au clic), elle
+  s'agrandit d'un mouvement de ressort et montre le lecteur complet : grande pochette, titre,
+  artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Elle se referme quand
+  la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.
 - **Horloge** collée à droite du Dock : l'heure et la date ; un clic ouvre le calendrier et
   les notifications de Windows. À sa gauche, le **volume** : un clic ouvre un curseur au-dessus
   de l'horloge (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
@@ -114,6 +120,7 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/wallpaper.rs` | Fond d'écran derrière le Dock, flouté, pour la teinte des panneaux (fil à part) |
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
 | `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
+| `src/app/notch.rs` | Encoche en haut de l'écran : formes, animation, lecteur complet |
 | `src/volume.rs` | Volume de la sortie audio par défaut |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |
@@ -129,7 +136,9 @@ comme la barre des tâches), `ShowWindowAsync` (une appli figée ne bloque pas l
 
 - Les fenêtres lancées en administrateur ne sont pas gérées (Windows l'interdit), sauf si
   Stage Manager est lui-même lancé en administrateur.
-- La barre n'apparaît que sur l'écran principal.
+- La barre et l'encoche n'apparaissent que sur l'écran principal.
+- L'encoche recouvre le milieu du haut de l'écran (environ 190 × 32 pixels à 100 %) : un clic
+  à cet endroit l'ouvre au lieu d'atteindre la fenêtre en dessous (onglet, barre de titre).
 - Les bureaux virtuels ne sont pas encore pris en compte.
 - Les cartes de la barre sont des instantanés pris quand la fenêtre a quitté l'écran (les
   miniatures DWM, elles, ne peuvent pas être inclinées) : elles ne suivent pas les changements

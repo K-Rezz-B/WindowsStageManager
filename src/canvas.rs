@@ -9,6 +9,7 @@ use windows::Win32::{
 };
 
 /// Petite image en BGRA, alpha prémultiplié (instantané d'une fenêtre).
+#[derive(Clone)]
 pub struct Image {
     pub w: i32,
     pub h: i32,
@@ -350,6 +351,49 @@ impl Canvas {
             }
         }
     }
+
+    /// Encoche des MacBook Pro, collée au haut de `r` : coins du bas arrondis (`radius`) et, en
+    /// haut, deux congés creux (`shoulder`) qui la raccordent en douceur au bord de l'écran.
+    pub fn notch(&mut self, r: RECT, radius: f32, shoulder: f32, rgb: (u8, u8, u8), alpha: u8) {
+        let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+        let rad = radius.min((rr - l) / 2.0).min(b - t).max(0.0);
+        // Corps : rectangle prolongé vers le haut, pour que seuls les coins du bas soient arrondis.
+        let top = t - rad - 1.0;
+        let (cx, cy) = ((l + rr) / 2.0, (top + b) / 2.0);
+        let (hx, hy) = ((rr - l) / 2.0, (b - top) / 2.0);
+        let x0 = (l - shoulder).floor() as i32;
+        let x1 = (rr + shoulder).ceil() as i32;
+        for y in r.top.max(0)..r.bottom.min(self.h) {
+            for x in x0.max(0)..x1.min(self.w) {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let (qx, qy) = ((px - cx).abs() - (hx - rad), (py - cy).abs() - (hy - rad));
+                let sd = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - rad;
+                let mut cover = (0.5 - sd).clamp(0.0, 1.0);
+                // Congés : ce qui reste hors d'un cercle tangent au bord de l'écran et au flanc.
+                let sy = t + shoulder;
+                for sx in [l - shoulder, rr + shoulder] {
+                    let beside = if sx < l { px >= sx && px <= l + 0.5 } else { px <= sx && px >= rr - 0.5 };
+                    if shoulder > 0.0 && beside && py <= sy {
+                        cover = cover.max(((px - sx).hypot(py - sy) - shoulder + 0.5).clamp(0.0, 1.0));
+                    }
+                }
+                if cover > 0.0 {
+                    let i = (y * self.w + x) as usize;
+                    self.px[i] = over(premul(rgb, (alpha as f32 * cover).round() as u8), self.px[i]);
+                }
+            }
+        }
+    }
+
+    /// Pose `layer` (de même taille) par-dessus avec l'opacité `alpha`, mais seulement là où le
+    /// canevas est déjà peint : le calque est découpé à la forme de ce qu'il recouvre.
+    pub fn overlay_inside(&mut self, layer: &Canvas, alpha: f32) {
+        for (dst, &src) in self.px.iter_mut().zip(&layer.px) {
+            if src >> 24 != 0 {
+                *dst = over(scale(src, alpha * (*dst >> 24) as f32 / 255.0), *dst);
+            }
+        }
+    }
 }
 
 /// Arrondit les coins d'un polygone convexe : chaque sommet devient une petite courbe de
@@ -569,6 +613,20 @@ mod tests {
         let mut c = Canvas::new(10, 10);
         c.round_rect(RECT { left: 0, top: 0, right: 10, bottom: 10 }, 0, (255, 255, 255), 90);
         assert_eq!(c.px[55] >> 24, 90);
+    }
+
+    #[test]
+    fn encoche_avec_congés() {
+        let mut c = Canvas::new(40, 20);
+        c.notch(RECT { left: 10, top: 0, right: 30, bottom: 16 }, 6.0, 4.0, (0, 0, 0), 255);
+        let alpha = |x: i32, y: i32| c.px[(y * 40 + x) as usize] >> 24;
+        assert_eq!(alpha(20, 8), 255, "le corps est plein");
+        assert_eq!(alpha(10, 0), 255, "le coin du haut reste carré");
+        assert_eq!(alpha(10, 15), 0, "le coin du bas est arrondi");
+        assert_eq!(alpha(9, 0), 255, "le congé prolonge le haut vers la gauche");
+        assert_eq!(alpha(30, 0), 255, "et vers la droite");
+        assert_eq!(alpha(7, 3), 0, "il se creuse en descendant");
+        assert_eq!(alpha(9, 8), 0, "rien sous le congé");
     }
 
     #[test]

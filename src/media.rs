@@ -66,9 +66,15 @@ impl NowPlaying {
 
     /// Avancement du morceau entre 0 et 1, à l'instant `now` (FILETIME).
     pub fn progress(&self, now: i64) -> Option<f64> {
+        let (position, duration) = self.position(now)?;
+        Some(position / duration)
+    }
+
+    /// Position et durée du morceau en secondes, à l'instant `now` (FILETIME).
+    pub fn position(&self, now: i64) -> Option<(f64, f64)> {
         let t = self.timeline?;
         let elapsed = if self.playing { (now - t.updated).max(0) as f64 / 1e7 } else { 0.0 };
-        Some(((t.position + elapsed) / t.duration).clamp(0.0, 1.0))
+        Some(((t.position + elapsed).clamp(0.0, t.duration), t.duration))
     }
 }
 

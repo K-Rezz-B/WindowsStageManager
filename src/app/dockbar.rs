@@ -828,7 +828,7 @@ pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
 
 /// Icône pleine du bouton, comme dans les lecteurs d'Apple : deux barres arrondies pendant la
 /// lecture (pour mettre en pause), un triangle aux coins arrondis sinon.
-fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
+pub(super) fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
     let k = dpi as f32 / 96.0;
     let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
     let white = (255, 255, 255);
@@ -848,7 +848,7 @@ fn draw_play_pause(canvas: &mut Canvas, button: RECT, playing: bool, dpi: i32) {
 }
 
 /// Icône « précédent » ou « suivant » : deux triangles accolés.
-fn draw_skip(canvas: &mut Canvas, button: RECT, forward: bool, alpha: u8, dpi: i32) {
+pub(super) fn draw_skip(canvas: &mut Canvas, button: RECT, forward: bool, alpha: u8, dpi: i32) {
     let k = dpi as f32 / 96.0;
     let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
     let (w, h) = (8.0 * k, 10.0 * k);

@@ -34,9 +34,11 @@ use crate::{
 
 mod dockbar;
 mod launcherui;
+mod notch;
 
 use dockbar::{DockUi, DOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
+use notch::{NotchUi, NOTCH};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
@@ -175,6 +177,8 @@ struct App {
     dock: DockUi,
     /// Le lanceur façon Spotlight (Alt + Espace).
     launcher: LauncherUi,
+    /// L'encoche en haut de l'écran, qui s'ouvre sur le lecteur.
+    notch: NotchUi,
     /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
     /// la sort de sa scène.
     window_drag: Option<WindowDrag>,
@@ -193,7 +197,7 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND) -> Self {
+    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND, notch: HWND) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
@@ -228,6 +232,7 @@ impl App {
             drag_source: None,
             dock: DockUi::new(dock),
             launcher: LauncherUi::new(launcher),
+            notch: NotchUi::new(notch),
             window_drag: None,
             drop_target: false,
             pending_placements: Vec::new(),
@@ -242,15 +247,16 @@ impl App {
     }
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        if self.handle_dock_message(msg, wp, lp) || self.handle_launcher_message(msg, wp) {
+        if self.handle_dock_message(msg, wp, lp) || self.handle_launcher_message(msg, wp) || self.handle_notch_message(msg, wp) {
             return Some(LRESULT(0));
         }
         match msg {
             WM_WINEVENT => self.on_event(wp.0 as u32, HWND(lp.0 as _)),
             WM_MEDIA => {
-                // Le lecteur est collé à gauche du Dock.
+                // Le lecteur est collé à gauche du Dock, et dans l'encoche.
                 self.now_playing = self.media.now_playing();
                 self.render_dock();
+                self.notch_retarget();
             }
             WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => self.reload_dock_backdrop(),
             WM_TIMER if wp.0 == TIMER_RESCAN => self.rescan(),
@@ -272,13 +278,20 @@ impl App {
             }
             WM_APPBAR => match wp.0 as u32 {
                 ABN_POSCHANGED => self.place_appbar(),
-                ABN_FULLSCREENAPP if self.enabled => unsafe {
-                    let cmd = if lp.0 != 0 && win::fullscreen_app_in_front() { SW_HIDE } else { SW_SHOWNOACTIVATE };
-                    let _ = ShowWindow(self.hwnd, cmd);
-                },
+                ABN_FULLSCREENAPP if self.enabled => {
+                    let fullscreen = lp.0 != 0 && win::fullscreen_app_in_front();
+                    unsafe {
+                        let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+                    }
+                    // L'encoche n'est pas une barre réservée : elle suit la barre latérale.
+                    self.notch_fullscreen(fullscreen);
+                }
                 _ => {}
             },
-            WM_DISPLAYCHANGE | WM_DPICHANGED => self.place_appbar(),
+            WM_DISPLAYCHANGE | WM_DPICHANGED => {
+                self.place_appbar();
+                self.place_notch();
+            }
             WM_ENDSESSION if wp.0 != 0 => restore_hidden(),
             WM_CLOSE => {}
             m if m == self.taskbar_created => {
@@ -311,6 +324,7 @@ impl App {
         self.enabled = true;
         self.register_appbar();
         self.enable_dock();
+        self.enable_notch();
         self.preload_launcher();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -358,6 +372,7 @@ impl App {
         }
         self.remove_appbar();
         self.disable_dock();
+        self.disable_notch();
     }
 
     // --- Scènes ---------------------------------------------------------------------
@@ -716,7 +731,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.switch.is_some() || self.slide_start.is_some() || self.dock_animating()
+        self.switch.is_some() || self.slide_start.is_some() || self.dock_animating() || self.notch_animating()
     }
 
     /// Une image d'animation, appelée à chaque rafraîchissement de l'écran.
@@ -755,6 +770,7 @@ impl App {
             self.render();
         }
         self.dock_tick(now);
+        self.notch_tick(now);
     }
 
     /// Fin du trajet : les vraies fenêtres reprennent la place de leurs miniatures.
@@ -1374,7 +1390,12 @@ unsafe extern "system" fn win_event(
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let is_dock = hwnd.0 as isize == DOCK.load(Ordering::Relaxed);
     let is_launcher = hwnd.0 as isize == LAUNCHER.load(Ordering::Relaxed);
+    let is_notch = hwnd.0 as isize == NOTCH.load(Ordering::Relaxed);
     match msg {
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP if is_notch => {
+            with_app(|app| app.notch_mouse(msg, lp));
+            return LRESULT(0);
+        }
         // Le lanceur, lui, prend le premier plan : il lui faut le clavier.
         WM_CHAR | WM_KEYDOWN | WM_ACTIVATE | WM_MOUSEMOVE | WM_LBUTTONUP if is_launcher => {
             with_app(|app| app.launcher_input(msg, wp, lp));
@@ -1560,7 +1581,27 @@ pub fn run() -> Result<()> {
             None,
         )?;
         LAUNCHER.store(launcher.0 as isize, Ordering::Relaxed);
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher)));
+        let notch_class = w!("StageManagerNotch");
+        let notch_wc = WNDCLASSW { lpszClassName: notch_class, ..wc };
+        if RegisterClassW(&notch_wc) == 0 {
+            return Err(Error::from_win32());
+        }
+        let notch = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            notch_class,
+            w!("Encoche"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+        NOTCH.store(notch.0 as isize, Ordering::Relaxed);
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher, notch)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [
