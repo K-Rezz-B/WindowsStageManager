@@ -1,4 +1,5 @@
-//! Les écrans : chacun a sa barre des scènes, son overlay pour les animations et son encoche.
+//! Les écrans : chacun a sa barre des scènes, sa barre d'applis, son overlay pour les animations
+//! et son encoche.
 //! Ils suivent les branchements et débranchements, et chacun s'efface devant une appli plein
 //! écran qui le couvre.
 
@@ -6,6 +7,7 @@ use super::*;
 
 pub(super) const BAR_CLASS: PCWSTR = w!("StageManagerBar");
 pub(super) const NOTCH_CLASS: PCWSTR = w!("StageManagerNotch");
+pub(super) const APPS_CLASS: PCWSTR = w!("StageManagerApps");
 
 /// Un écran tel que Windows le décrit.
 struct Monitor {
@@ -65,9 +67,13 @@ pub(super) struct Screen {
     pub notch_band: Option<RECT>,
     /// La barre est calée contre l'encoche (sinon centrée en haut de l'écran).
     pub bar_anchored: bool,
+    /// La barre d'applis de cet écran, à gauche de l'encoche, et sa position à l'écran.
+    pub apps: HWND,
+    pub apps_rect: RECT,
     /// Largeur de la pastille au début et à la fin de son animation.
     pub pill_from: i32,
     pub pill_to: i32,
+    /// Police des étiquettes de la barre d'applis, à l'échelle de l'écran.
     pub font: HFONT,
     pub cards: Vec<Card>,
     /// Carte de la scène qui revient à l'écran : elle s'efface pendant que ses fenêtres partent.
@@ -119,6 +125,7 @@ impl Screen {
         };
         let hwnd = popup(BAR_CLASS, w!("Stage Manager"))?;
         let notch = popup(NOTCH_CLASS, w!("Encoche"))?;
+        let apps = popup(APPS_CLASS, w!("Applis"))?;
         let overlay = anim::create_overlay(instance)?;
         Ok(Self {
             id,
@@ -133,9 +140,12 @@ impl Screen {
             appbar: None,
             notch_band: None,
             bar_anchored: false,
+            apps,
+            apps_rect: RECT::default(),
             pill_from: 0,
             pill_to: 0,
-            font: HFONT::default(),
+            // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
+            font: make_font("Inter", 12, 400, m.dpi),
             cards: Vec::new(),
             departing: None,
             layout_key: Vec::new(),
@@ -160,6 +170,7 @@ impl Screen {
     unsafe fn destroy(self) {
         let _ = DestroyWindow(self.hwnd);
         let _ = DestroyWindow(self.notch.hwnd);
+        let _ = DestroyWindow(self.apps);
         let _ = DestroyWindow(self.overlay);
         if !self.font.is_invalid() {
             let _ = DeleteObject(self.font);
@@ -174,6 +185,10 @@ impl App {
 
     pub(super) fn bar_index(&self, hwnd: HWND) -> Option<usize> {
         self.screens.iter().position(|s| s.hwnd == hwnd)
+    }
+
+    pub(super) fn apps_index(&self, hwnd: HWND) -> Option<usize> {
+        self.screens.iter().position(|s| s.apps == hwnd)
     }
 
     pub(super) fn notch_index(&self, hwnd: HWND) -> Option<usize> {
@@ -219,6 +234,12 @@ impl App {
         for sc in &mut self.screens {
             let Some(m) = monitors.iter().find(|m| m.device == sc.device) else { continue };
             let moved = sc.rect != m.rect || sc.dpi != m.dpi;
+            if sc.dpi != m.dpi {
+                unsafe {
+                    let _ = DeleteObject(sc.font);
+                    sc.font = make_font("Inter", 12, 400, m.dpi);
+                }
+            }
             sc.handle = m.handle;
             sc.rect = m.rect;
             sc.dpi = m.dpi;
@@ -240,6 +261,7 @@ impl App {
             if self.features.notch {
                 self.enable_notch_on(s);
             }
+            self.place_apps(s);
         }
         if self.features.corners {
             self.corners.show(self.monitor);
@@ -289,6 +311,7 @@ impl App {
                 let _ = ShowWindow(self.screens[s].hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
             }
         }
+        self.place_apps(s);
         // L'encoche suit la barre de son écran (sa bande reste réservée). La vignette
         // de la fenêtre épinglée aussi, si elle est dans son coin.
         self.notch_fullscreen(s, fullscreen);

@@ -1,23 +1,16 @@
-//! Le Dock façon macOS : applis épinglées puis ouvertes, séparateur, corbeille ; grossissement
-//! en vague autour de la souris et rebond au lancement. Ce module ne contient que le modèle et la
-//! géométrie (testables) ; la fenêtre et le dessin sont dans `app.rs`.
+//! Les applis de la barre d'applis : épinglées puis ouvertes, puis la corbeille. Ce module ne
+//! contient que le modèle (testable) ; la fenêtre et le dessin sont dans `app/dockbar.rs`.
 
 use std::{
-    f32::consts::PI,
     path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
 
-use windows::Win32::Foundation::RECT;
-
 use crate::{canvas::Image, shell};
 
-/// Durée de l'apparition / disparition du grossissement.
-const MAGNIFY_TIME: f32 = 0.16;
 /// Le rebond s'arrête quand l'appli a ouvert une fenêtre, ou au bout de ce délai.
 const BOUNCE_LIMIT: Duration = Duration::from_secs(8);
-const BOUNCE_PERIOD: f32 = 0.55;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -75,66 +68,8 @@ impl Item {
     }
 }
 
-/// Dimensions du Dock, en pixels, pour une échelle d'affichage donnée.
-pub struct Metrics {
-    pub icon: f32,
-    pub max: f32,
-    pub pad: f32,
-    pub gap: f32,
-    /// Place prise par le séparateur (espace compris).
-    pub sep: f32,
-    pub radius: f32,
-    /// Distance à la souris sur laquelle les icônes grossissent.
-    pub reach: f32,
-    pub body_h: f32,
-    /// Écart entre le bas de la fenêtre et le bas du Dock.
-    pub bottom: f32,
-    pub bounce: f32,
-    /// Hauteur de la fenêtre (place pour les icônes grossies et l'étiquette).
-    pub height: i32,
-    /// Hauteur réservée en bas de l'écran : les fenêtres agrandies s'arrêtent au-dessus.
-    pub reserve: i32,
-}
-
-impl Metrics {
-    pub fn new(dpi: i32) -> Self {
-        let s = dpi as f32 / 96.0;
-        let (icon, max, pad) = (48.0 * s, 84.0 * s, 5.0 * s);
-        let body_h = icon + 2.0 * pad;
-        // La fenêtre s'arrête 3 px au-dessus du bas de l'écran : on y laisse la souris réveiller
-        // la barre des tâches masquée.
-        let bottom = (6.0 * s - 3.0).max(1.0);
-        Self {
-            icon,
-            max,
-            pad,
-            gap: 6.0 * s,
-            sep: 18.0 * s,
-            radius: 20.0 * s,
-            reach: icon * 2.6,
-            body_h,
-            bottom,
-            bounce: 22.0 * s,
-            height: (max + pad + bottom + 52.0 * s).ceil() as i32,
-            reserve: (6.0 * s + body_h + 6.0 * s).ceil() as i32,
-        }
-    }
-}
-
-pub struct Layout {
-    pub body: RECT,
-    pub icons: Vec<RECT>,
-    /// Abscisse du séparateur avant la corbeille.
-    pub separator: Option<i32>,
-}
-
 pub struct Dock {
     pub items: Vec<Item>,
-    pub hover: Option<usize>,
-    /// Abscisse de la souris dans la fenêtre du Dock, quand elle le survole.
-    pub cursor: Option<f32>,
-    mag: f32,
-    last_tick: Instant,
 }
 
 impl Dock {
@@ -142,7 +77,7 @@ impl Dock {
     pub fn new(pins: &[String]) -> Self {
         let mut items: Vec<Item> = pins.iter().map(|p| Item::new(Kind::App, p, true)).collect();
         items.push(Item::new(Kind::Trash, shell::RECYCLE_BIN, true));
-        Self { items, hover: None, cursor: None, mag: 0.0, last_tick: Instant::now() }
+        Self { items }
     }
 
     pub fn pins(&self) -> Vec<String> {
@@ -175,9 +110,6 @@ impl Dock {
             }
         }
         self.merge_duplicates();
-        if self.hover.is_some_and(|h| h >= self.items.len()) {
-            self.hover = None;
-        }
         added
     }
 
@@ -220,7 +152,6 @@ impl Dock {
         item.pinned = !item.pinned;
         if !item.pinned && !item.running {
             self.items.remove(index);
-            self.hover = None;
         } else if item.pinned {
             // Les épinglées passent avant les applis simplement ouvertes.
             let item = self.items.remove(index);
@@ -229,93 +160,9 @@ impl Dock {
         }
     }
 
-    pub fn set_hover(&mut self, cursor: Option<f32>, hover: Option<usize>) {
-        self.cursor = cursor;
-        self.hover = hover;
-    }
-
-    /// Avance le grossissement d'une image ; renvoie vrai si quelque chose bouge encore.
-    pub fn tick(&mut self, now: Instant) -> bool {
-        let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
-        self.last_tick = now;
-        let target = if self.cursor.is_some() { 1.0 } else { 0.0 };
-        let step = dt / MAGNIFY_TIME;
-        self.mag = if self.mag < target { (self.mag + step).min(target) } else { (self.mag - step).max(target) };
-        self.animating()
-    }
-
+    /// Une appli lancée attend sa fenêtre : son icône sautille.
     pub fn animating(&self) -> bool {
-        let target = if self.cursor.is_some() { 1.0 } else { 0.0 };
-        self.mag != target || self.items.iter().any(|i| i.launched.is_some())
-    }
-
-    /// Largeur du Dock au repos.
-    pub fn base_width(&self, m: &Metrics) -> f32 {
-        let n = self.items.len() as f32;
-        let sep = if self.trash_index() > 0 { m.sep } else { 0.0 };
-        2.0 * m.pad + n * m.icon + (n - 1.0).max(0.0) * m.gap + sep
-    }
-
-    /// Largeur de fenêtre : de quoi contenir le Dock grossi et les étiquettes aux extrémités.
-    pub fn window_width(&self, m: &Metrics) -> i32 {
-        (self.base_width(m) + 4.0 * (m.max - m.icon) + 2.0 * m.icon * 2.4).ceil() as i32
-    }
-
-    pub fn layout(&self, m: &Metrics, win_w: i32, win_h: i32, now: Instant) -> Layout {
-        let trash = self.trash_index();
-        let base_w = self.base_width(m);
-        let base_left = (win_w as f32 - base_w) / 2.0;
-        // Centres des icônes au repos : c'est sur eux qu'on mesure la distance à la souris.
-        let mut x = base_left + m.pad;
-        let sizes: Vec<f32> = (0..self.items.len())
-            .map(|i| {
-                if i == trash && i > 0 {
-                    x += m.sep;
-                }
-                let center = x + m.icon / 2.0;
-                x += m.icon + m.gap;
-                let wave = match self.cursor {
-                    Some(c) if (c - center).abs() < m.reach => ((PI * (c - center) / m.reach).cos() + 1.0) / 2.0,
-                    _ => 0.0,
-                };
-                m.icon + (m.max - m.icon) * wave * self.mag
-            })
-            .collect();
-        let width = base_w + sizes.iter().map(|s| s - m.icon).sum::<f32>();
-        let left = (win_w as f32 - width) / 2.0;
-        let body_bottom = win_h as f32 - m.bottom;
-        let body = RECT {
-            left: left.round() as i32,
-            top: (body_bottom - m.body_h).round() as i32,
-            right: (left + width).round() as i32,
-            bottom: body_bottom.round() as i32,
-        };
-        let mut x = left + m.pad;
-        let mut separator = None;
-        let icons = sizes
-            .iter()
-            .enumerate()
-            .map(|(i, &size)| {
-                if i == trash && i > 0 {
-                    separator = Some((x + m.sep / 2.0 - m.gap / 2.0).round() as i32);
-                    x += m.sep;
-                }
-                let lift = self.items[i].launched.map_or(0.0, |t| {
-                    let t = now.duration_since(t).as_secs_f32();
-                    (PI * t / BOUNCE_PERIOD).sin().abs() * m.bounce
-                });
-                let bottom = body_bottom - m.pad - lift;
-                let rect = RECT {
-                    left: x.round() as i32,
-                    top: (bottom - size).round() as i32,
-                    right: (x + size).round() as i32,
-                    bottom: bottom.round() as i32,
-                };
-                x += size + m.gap;
-                rect
-            })
-            .collect();
-        Layout { body, icons, separator }
+        self.items.iter().any(|i| i.launched.is_some())
     }
 }
 
@@ -396,25 +243,5 @@ mod tests {
         assert_eq!(d.pins().len(), 3);
         d.toggle_pin(0);
         assert_eq!(d.items.len(), 3, "Discord, fermée et désépinglée, disparaît");
-    }
-
-    #[test]
-    fn le_grossissement_suit_la_souris() {
-        let mut d = dock();
-        let m = Metrics::new(96);
-        let now = Instant::now();
-        let w = d.window_width(&m);
-        let rest = d.layout(&m, w, m.height, now);
-        let size = |r: &RECT| r.right - r.left;
-        assert!(rest.icons.iter().all(|r| size(r) == m.icon as i32));
-        // Souris sur la première icône, grossissement complet.
-        let first = &rest.icons[0];
-        d.set_hover(Some((first.left + first.right) as f32 / 2.0), Some(0));
-        d.mag = 1.0;
-        let big = d.layout(&m, w, m.height, now);
-        assert_eq!(size(&big.icons[0]), m.max as i32);
-        assert!(size(&big.icons[1]) > m.icon as i32 && size(&big.icons[1]) < m.max as i32);
-        assert!(big.body.right - big.body.left > rest.body.right - rest.body.left, "le Dock s'élargit");
-        assert!(big.separator.is_some());
     }
 }

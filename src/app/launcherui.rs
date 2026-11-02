@@ -150,7 +150,7 @@ impl App {
         self.launcher.load_apps();
     }
 
-    fn open_launcher(&mut self) {
+    pub(super) fn open_launcher(&mut self) {
         let mon = self.monitor;
         let l = &mut self.launcher;
         unsafe {

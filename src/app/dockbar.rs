@@ -1,59 +1,68 @@
-//! Le Dock à l'écran : sa fenêtre, sa place réservée en bas de l'écran, son dessin, ses clics.
+//! La barre d'applis : une pastille noire en haut de chaque écran, à gauche de l'encoche (les
+//! scènes sont à droite). Elle remplace le Dock : le lanceur, les applis épinglées et ouvertes,
+//! la corbeille et le volume, sans prendre de place à l'écran. La barre des tâches de Windows
+//! reste masquée tant qu'elle est en service.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    f32::consts::{FRAC_1_SQRT_2, PI},
+};
 
 use super::*;
 use crate::{
     canvas::round_corners,
-    dock::{self, Dock, Kind, Metrics},
+    dock::{self, Dock, Kind},
     shell, volume,
 };
 
-pub(super) const WM_DOCKBAR: u32 = WM_APP + 6;
 pub(super) const WM_DOCK_LOADED: u32 = WM_APP + 7;
-pub(super) const WM_DOCK_WALLPAPER: u32 = WM_APP + 8;
 
 pub(super) const TIMER_CLOCK: usize = 3;
 
-/// Largeur du panneau du volume (à droite du Dock) et son écart avec le Dock, en pixels à 100 %.
-const VOLUME_WIDTH: i32 = 54;
-const PANEL_GAP: i32 = 10;
-/// Hauteur du curseur de volume, vertical au-dessus de son bouton (pixels à 100 %).
-const SLIDER_HEIGHT: i32 = 210;
+/// Applis au plus dans la pastille (les suivantes n'y tiennent pas).
+const MAX_APPS: usize = 20;
+/// Écart entre les applis et la corbeille, séparateur compris (pixels à 100 %).
+const SEP: i32 = 21;
+/// Place à gauche de la pastille pour l'étiquette de la première icône, et hauteur de
+/// l'étiquette, sous la pastille.
+const SIDE: i32 = 80;
+const LABEL_GAP: i32 = 8;
+const LABEL_H: i32 = 26;
+/// Curseur de volume, vertical sous son bouton : largeur, hauteur, écart avec la pastille.
+const SLIDER_W: i32 = 44;
+const SLIDER_HEIGHT: i32 = 190;
+const PANEL_GAP: i32 = 8;
 /// Ouverture (avec un léger rebond) et fermeture du curseur.
 const SLIDER_OPEN: Duration = Duration::from_millis(320);
 const SLIDER_CLOSE: Duration = Duration::from_millis(180);
+/// Une appli qu'on vient de lancer sautille sous la pastille jusqu'à l'ouverture de sa fenêtre.
+const BOUNCE: i32 = 3;
+const BOUNCE_PERIOD: f32 = 0.55;
 
 const MENU_DOCK_OPEN: usize = 20;
 const MENU_DOCK_PIN: usize = 21;
 const MENU_DOCK_QUIT: usize = 22;
 const MENU_TRASH_EMPTY: usize = 23;
 
-pub(super) static DOCK: AtomicIsize = AtomicIsize::new(0);
-
 pub(super) struct DockUi {
-    pub hwnd: HWND,
     pub model: Dock,
-    /// Bande réservée en bas de l'écran (les fenêtres agrandies s'arrêtent au-dessus).
-    reserved: Option<RECT>,
-    /// Position de la fenêtre du Dock à l'écran.
-    window: RECT,
-    dpi: i32,
+    /// La barre d'applis est en service.
+    pub enabled: bool,
     loader: shell::IconLoader,
     requested: HashSet<String>,
-    /// Fond d'écran flouté derrière le Dock (toute la largeur de l'écran).
-    backdrop: Option<Rc<Image>>,
-    backdrop_rect: RECT,
-    backdrop_loaded: Arc<Mutex<Option<Image>>>,
-    tracking: bool,
     trash_full: bool,
-    /// Bouton du panneau du volume sous la souris.
-    hover_control: Option<Control>,
+    /// Écran dont la barre est sous la souris : lui seul montre le survol et le curseur de volume.
+    active: Option<ScreenId>,
+    tracking: bool,
+    /// Élément sous la souris, celui d'avant (il reprend sa taille) et le début du grossissement.
+    hover: Option<Part>,
+    hover_prev: Option<Part>,
+    hover_start: Option<Instant>,
     /// Heure et date, pour redessiner l'heure de l'encoche au changement de minute.
     clock: (String, String),
     /// Volume (entre 0 et 1) et son coupé, relus chaque seconde.
     volume: Option<(f32, bool)>,
-    /// Le curseur de volume est ouvert au-dessus de son panneau.
+    /// Le curseur de volume est ouvert sous son bouton.
     slider_open: bool,
     /// Animation d'ouverture ou de fermeture du curseur : début, et ouverture de départ (0 à 1).
     slider_anim: Option<(Instant, f32)>,
@@ -61,9 +70,12 @@ pub(super) struct DockUi {
     slider_drag: bool,
 }
 
-/// Les boutons du panneau du volume.
-#[derive(Clone, Copy, PartialEq)]
-enum Control {
+/// Les éléments de la barre.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Part {
+    Launcher,
+    /// Appli ou corbeille (rang dans le modèle).
+    Item(usize),
     Volume,
     /// Haut-parleur du curseur de volume : coupe ou rétablit le son.
     Mute,
@@ -71,19 +83,19 @@ enum Control {
     Slider,
 }
 
-/// Panneau collé à droite du Dock : le volume (le lecteur et l'heure sont dans l'encoche).
-struct Panels {
-    audio: RECT,
-    /// Icône du volume, au milieu du panneau.
+/// Emplacement des éléments, en coordonnées de la fenêtre de la barre.
+struct Layout {
+    size: SIZE,
+    pill: RECT,
+    launcher: Option<RECT>,
+    /// (rang dans le modèle, case) des applis affichées et de la corbeille.
+    items: Vec<(usize, RECT)>,
+    separator: Option<i32>,
     volume: RECT,
-    /// Curseur de volume au-dessus du panneau, quand il est affiché (ou en train de s'ouvrir ou
-    /// de se fermer).
     slider: Option<SliderLayout>,
-    /// Le curseur répond à la souris (pas pendant qu'il se referme).
-    slider_live: bool,
 }
 
-/// Curseur vertical : le pourcentage en haut, la piste, le haut-parleur en bas.
+/// Curseur vertical : le haut-parleur en haut, la piste, le pourcentage en bas.
 struct SliderLayout {
     panel: RECT,
     mute: RECT,
@@ -100,36 +112,52 @@ impl SliderLayout {
     }
 }
 
-impl Panels {
-    fn control_at(&self, pt: POINT) -> Option<Control> {
-        if let Some(s) = self.slider.as_ref().filter(|_| self.slider_live) {
+impl Layout {
+    /// Élément sous `pt`. Les cases couvrent toute la hauteur de la pastille et la moitié des
+    /// écarts : la souris ne « tombe » pas entre deux icônes.
+    fn part_at(&self, pt: POINT, slider_live: bool, half_gap: i32) -> Option<Part> {
+        if let Some(s) = self.slider.as_ref().filter(|_| slider_live) {
             if contains(s.mute, pt) {
-                return Some(Control::Mute);
+                return Some(Part::Mute);
             }
             if contains(s.hit, pt) {
-                return Some(Control::Slider);
+                return Some(Part::Slider);
             }
         }
-        contains(self.volume, pt).then_some(Control::Volume)
+        let cell = |r: RECT| RECT { left: r.left - half_gap, top: self.pill.top, right: r.right + half_gap, bottom: self.pill.bottom };
+        if self.launcher.is_some_and(|r| contains(cell(r), pt)) {
+            return Some(Part::Launcher);
+        }
+        if let Some(&(i, _)) = self.items.iter().find(|(_, r)| contains(cell(*r), pt)) {
+            return Some(Part::Item(i));
+        }
+        contains(cell(self.volume), pt).then_some(Part::Volume)
+    }
+
+    fn rect_of(&self, part: Part) -> Option<RECT> {
+        match part {
+            Part::Launcher => self.launcher,
+            Part::Item(i) => self.items.iter().find(|(j, _)| *j == i).map(|(_, r)| *r),
+            Part::Volume => Some(self.volume),
+            Part::Mute | Part::Slider => None,
+        }
     }
 }
 
 impl DockUi {
+    /// `hwnd` : la fenêtre principale, qui reçoit les icônes chargées.
     pub fn new(hwnd: HWND) -> Self {
         Self {
-            hwnd,
             model: Dock::new(&dock::load_pins()),
-            reserved: None,
-            window: RECT::default(),
-            dpi: 96,
+            enabled: false,
             loader: shell::IconLoader::start(hwnd, WM_DOCK_LOADED),
             requested: HashSet::new(),
-            backdrop: None,
-            backdrop_rect: RECT::default(),
-            backdrop_loaded: Arc::new(Mutex::new(None)),
-            tracking: false,
             trash_full: false,
-            hover_control: None,
+            active: None,
+            tracking: false,
+            hover: None,
+            hover_prev: None,
+            hover_start: None,
             slider_open: false,
             slider_anim: None,
             slider_drag: false,
@@ -160,38 +188,35 @@ impl DockUi {
     fn slider_visible(&self) -> bool {
         self.slider_open || self.slider_anim.is_some()
     }
+
+    /// Grossissement d'un élément au survol (0 au repos, 1 grossi), avec un petit rebond.
+    fn grown(&self, part: Part, now: Instant) -> f64 {
+        let e = self.hover_start.map_or(1.0, |start| anim::spring(anim::progress(start, HOVER_ANIM, now)));
+        if self.hover == Some(part) {
+            e
+        } else if self.hover_prev == Some(part) {
+            1.0 - e
+        } else {
+            0.0
+        }
+    }
 }
 
 impl App {
-    pub(super) fn handle_dock_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
+    pub(super) fn handle_dock_message(&mut self, msg: u32, wp: WPARAM, _lp: LPARAM) -> bool {
         match msg {
-            WM_DOCKBAR => match wp.0 as u32 {
-                ABN_POSCHANGED => self.place_dock(),
-                ABN_FULLSCREENAPP if self.dock.reserved.is_some() => unsafe {
-                    let cmd = if lp.0 != 0 && win::fullscreen_app_in_front() { SW_HIDE } else { SW_SHOWNOACTIVATE };
-                    let _ = ShowWindow(self.dock.hwnd, cmd);
-                },
-                _ => {}
-            },
             WM_DOCK_LOADED => self.on_dock_loaded(),
             WM_TIMER if wp.0 == TIMER_CLOCK => {
                 // Chaque seconde : le volume (il a pu changer au clavier) et l'heure de l'encoche.
                 let volume = volume::get();
                 if volume != self.dock.volume {
                     self.dock.volume = volume;
-                    self.render_dock();
+                    self.render_all_apps();
                 }
                 let clock = clock_text();
                 if clock != self.dock.clock {
                     self.dock.clock = clock;
                     self.render_notches();
-                }
-            }
-            WM_DOCK_WALLPAPER => {
-                let loaded = self.dock.backdrop_loaded.lock().ok().and_then(|mut l| l.take());
-                if let Some(image) = loaded {
-                    self.dock.backdrop = Some(Rc::new(image));
-                    self.render_dock();
                 }
             }
             _ => return false,
@@ -203,93 +228,49 @@ impl App {
 
     pub(super) fn enable_dock(&mut self) {
         taskbar::autohide();
-        let mut abd = APPBARDATA {
-            cbSize: size_of::<APPBARDATA>() as u32,
-            hWnd: self.dock.hwnd,
-            uCallbackMessage: WM_DOCKBAR,
-            ..Default::default()
-        };
-        unsafe { SHAppBarMessage(ABM_NEW, &mut abd) };
-        self.dock.reserved = Some(RECT::default());
+        self.dock.enabled = true;
         let paths: Vec<String> = self.dock.model.items.iter().map(|i| i.path.clone()).collect();
         for path in paths {
             self.dock.request(&path);
         }
         self.update_running();
-        self.place_dock();
-        // L'horloge (TIMER_CLOCK) est lancée par `apply_features` : l'encoche s'en sert aussi.
-        unsafe {
-            let _ = ShowWindow(self.dock.hwnd, SW_SHOWNOACTIVATE);
+        // Les scènes se calent face à la barre d'applis, même sans encoche.
+        for s in 0..self.screens.len() {
+            self.place_appbar(s);
+            self.place_apps(s);
         }
     }
 
     pub(super) fn disable_dock(&mut self) {
-        unsafe {
-            let _ = ShowWindow(self.dock.hwnd, SW_HIDE);
-        }
-        if self.dock.reserved.take().is_some() {
-            let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.dock.hwnd, ..Default::default() };
-            unsafe { SHAppBarMessage(ABM_REMOVE, &mut abd) };
+        self.dock.enabled = false;
+        self.dock.slider_open = false;
+        self.dock.slider_anim = None;
+        self.dock.hover = None;
+        self.dock.active = None;
+        for s in 0..self.screens.len() {
+            self.place_apps(s);
+            self.place_appbar(s);
         }
         taskbar::restore();
     }
 
-    /// L'explorateur a redémarré : il a oublié la place réservée au Dock.
-    pub(super) fn reregister_dock(&mut self) {
-        if self.dock.reserved.take().is_some() {
-            self.disable_dock();
-            self.enable_dock();
-        }
-    }
-
-    /// Réserve la bande du bas de l'écran principal, puis place la fenêtre du Dock.
-    fn place_dock(&mut self) {
-        let Some(current) = self.dock.reserved else { return };
-        let monitor = self.monitor;
+    /// Montre (ou cache) la barre d'applis d'un écran, et la redessine à sa place.
+    pub(super) fn place_apps(&mut self, s: usize) {
+        let sc = &self.screens[s];
+        let shown = self.dock.enabled && !sc.fullscreen;
         unsafe {
-            let handle = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let (mut dpi, mut dpi_y) = (96u32, 96u32);
-            let _ = GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
-            self.dock.dpi = dpi as i32;
+            let _ = ShowWindow(sc.apps, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
-        let m = Metrics::new(self.dock.dpi);
-        let mut abd = APPBARDATA {
-            cbSize: size_of::<APPBARDATA>() as u32,
-            hWnd: self.dock.hwnd,
-            uEdge: ABE_BOTTOM,
-            rc: monitor,
-            ..Default::default()
-        };
-        abd.rc.top = abd.rc.bottom - m.reserve;
-        unsafe {
-            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
-            abd.rc.top = abd.rc.bottom - m.reserve;
-            if abd.rc != current {
-                SHAppBarMessage(ABM_SETPOS, &mut abd);
-                self.dock.reserved = Some(abd.rc);
-            }
+        if shown {
+            self.render_apps(s);
         }
-        // Fond d'écran derrière toute la largeur du Dock (et de ses icônes grossies).
-        let strip = RECT { left: monitor.left, top: monitor.bottom - 3 - m.height, right: monitor.right, bottom: monitor.bottom - 3 };
-        if strip != self.dock.backdrop_rect {
-            self.dock.backdrop_rect = strip;
-            let blur = 10 * self.dock.dpi / 96;
-            wallpaper::load_async(strip, monitor, blur, self.dock.hwnd, WM_DOCK_WALLPAPER, Arc::clone(&self.dock.backdrop_loaded));
-        }
-        self.render_dock();
-    }
-
-    /// Le fond d'écran a changé.
-    pub(super) fn reload_dock_backdrop(&mut self) {
-        self.dock.backdrop_rect = RECT::default();
-        self.place_dock();
     }
 
     // --- Contenu ----------------------------------------------------------------------
 
-    /// Repère les applis ouvertes et met le Dock à jour.
+    /// Repère les applis ouvertes et met la barre à jour.
     pub(super) fn update_running(&mut self) {
-        if self.dock.reserved.is_none() {
+        if !self.dock.enabled {
             return;
         }
         let mut running: Vec<String> = Vec::new();
@@ -304,6 +285,13 @@ impl App {
         for path in added {
             self.dock.request(&path);
         }
+        // Des éléments ont pu partir : le survol ne doit pas pointer à côté.
+        let count = self.dock.model.items.len();
+        for part in [&mut self.dock.hover, &mut self.dock.hover_prev] {
+            if matches!(part, Some(Part::Item(i)) if *i >= count) {
+                *part = None;
+            }
+        }
         // La corbeille change d'icône quand elle se remplit ou se vide.
         let full = shell::recycle_bin_items() > 0;
         if full != self.dock.trash_full {
@@ -311,7 +299,7 @@ impl App {
             self.dock.requested.remove(shell::RECYCLE_BIN);
             self.dock.request(shell::RECYCLE_BIN);
         }
-        self.render_dock();
+        self.render_all_apps();
     }
 
     fn on_dock_loaded(&mut self) {
@@ -337,115 +325,186 @@ impl App {
             // On sait maintenant quel exécutable lance chaque raccourci : on revérifie qui tourne.
             self.update_running();
         } else {
-            self.render_dock();
+            self.render_all_apps();
         }
+    }
+
+    // --- Disposition --------------------------------------------------------------------
+
+    /// La pastille et ses éléments, de gauche à droite : le lanceur, les applis, la corbeille
+    /// et le volume, contre l'encoche.
+    fn apps_layout(&self, s: usize) -> Layout {
+        let px = |v: i32| self.px(s, v);
+        let (icon, gap) = (px(ICON), px(ICON_GAP));
+        let launcher = self.features.launcher;
+        let trash = self.dock.model.items.iter().position(|i| i.kind == Kind::Trash);
+        let apps: Vec<usize> =
+            self.dock.model.items.iter().enumerate().filter(|(_, i)| i.kind == Kind::App).map(|(i, _)| i).take(MAX_APPS).collect();
+        let before = launcher as usize + apps.len();
+        let slots = before as i32 + trash.is_some() as i32 + 1;
+        let separator = before > 0;
+        let pill_w = 2 * px(PILL_PAD) + slots * icon + (slots - 1) * gap + if separator { px(SEP) - gap } else { 0 };
+
+        let dropdown = if self.dock.slider_visible() { px(PANEL_GAP + SLIDER_HEIGHT) } else { px(LABEL_GAP + LABEL_H) };
+        let size = SIZE { cx: px(SIDE) + pill_w + px(PILL_SHOULDER) + px(2), cy: px(BAR_H) + dropdown + px(12) };
+        let right = size.cx - px(PILL_SHOULDER) - px(2);
+        let pill = RECT { left: right - pill_w, top: 0, right, bottom: px(BAR_H) };
+        let top = (pill.bottom - icon) / 2;
+        let mut x = pill.left + px(PILL_PAD);
+        let slot = |x: &mut i32| {
+            let r = RECT { left: *x, top, right: *x + icon, bottom: top + icon };
+            *x += icon + gap;
+            r
+        };
+        let launcher = launcher.then(|| slot(&mut x));
+        let mut items: Vec<(usize, RECT)> = apps.iter().map(|&i| (i, slot(&mut x))).collect();
+        let separator = separator.then(|| {
+            let at = x - gap + (px(SEP) - 1) / 2;
+            x += px(SEP) - gap;
+            at
+        });
+        if let Some(t) = trash {
+            items.push((t, slot(&mut x)));
+        }
+        let volume = slot(&mut x);
+
+        let slider = self.dock.slider_visible().then(|| {
+            let cx = (volume.left + volume.right) / 2;
+            let half = px(SLIDER_W) / 2;
+            let panel = RECT { left: cx - half, top: pill.bottom + px(PANEL_GAP), right: cx + half, bottom: pill.bottom + px(PANEL_GAP + SLIDER_HEIGHT) };
+            let mute = RECT { left: cx - px(15), top: panel.top + px(7), right: cx + px(15), bottom: panel.top + px(37) };
+            let percent = RECT { left: panel.left, top: panel.bottom - px(30), right: panel.right, bottom: panel.bottom - px(10) };
+            let track = RECT { left: cx - px(3), top: mute.bottom + px(14), right: cx + px(3), bottom: percent.top - px(12) };
+            let hit = RECT { left: panel.left, top: track.top - px(10), right: panel.right, bottom: track.bottom + px(10) };
+            SliderLayout { panel, mute, track, hit, percent }
+        });
+        Layout { size, pill, launcher, items, separator, volume, slider }
+    }
+
+    /// Position de la fenêtre de la barre d'applis : son bord droit à `NOTCH_GAP` de l'encoche
+    /// (ou du milieu de l'écran, sans encoche).
+    fn apps_window(&self, s: usize, size: SIZE) -> RECT {
+        let sc = &self.screens[s];
+        let half = self.notch_edge(s).unwrap_or(0);
+        let cx = (sc.rect.left + sc.rect.right) / 2;
+        let right = cx - half - self.px(s, NOTCH_GAP) + self.px(s, PILL_SHOULDER) + self.px(s, 2);
+        RECT { left: right - size.cx, top: sc.rect.top, right, bottom: sc.rect.top + size.cy }
     }
 
     // --- Dessin -----------------------------------------------------------------------
 
-    fn dock_window_rect(&self, m: &Metrics) -> RECT {
-        let mon = self.monitor;
-        // Place pour le panneau du volume, des deux côtés pour que le Dock reste centré.
-        let side = (VOLUME_WIDTH + PANEL_GAP) * self.dock.dpi / 96;
-        let w = self.dock.model.window_width(m) + 2 * side;
-        let left = (mon.left + mon.right - w) / 2;
-        let bottom = mon.bottom - 3;
-        // La fenêtre grandit vers le haut le temps que le curseur de volume est affiché (avec de
-        // la marge pour son rebond) ; le reste du temps, elle reste basse.
-        let extra = if self.dock.slider_visible() { (SLIDER_HEIGHT + PANEL_GAP + 30) * self.dock.dpi / 96 } else { 0 };
-        RECT { left, top: bottom - m.height - extra, right: left + w, bottom }
+    pub(super) fn render_all_apps(&mut self) {
+        for s in 0..self.screens.len() {
+            self.render_apps(s);
+        }
     }
 
-    /// Emplacement du panneau du volume, collé au bord droit du Dock (qui s'élargit au survol).
-    fn panels(&self, body: RECT) -> Panels {
-        let dpi = self.dock.dpi;
-        let s = move |v: i32| v * dpi / 96;
-        let gap = s(PANEL_GAP);
-        let (cx, cy) = (body.right + gap + s(VOLUME_WIDTH) / 2, (body.top + body.bottom) / 2);
-        let audio = RECT { left: body.right + gap, top: body.top, right: body.right + gap + s(VOLUME_WIDTH), bottom: body.bottom };
-        let vsize = s(34);
-        let volume = RECT { left: cx - vsize / 2, top: cy - vsize / 2, right: cx + vsize / 2, bottom: cy + vsize / 2 };
-        // Curseur de volume : colonne au-dessus du bouton, de la largeur de son panneau.
-        let slider = self.dock.slider_visible().then(|| {
-            let panel = RECT { left: audio.left, top: audio.top - gap - s(SLIDER_HEIGHT), right: audio.right, bottom: audio.top - gap };
-            let percent = RECT { left: panel.left, top: panel.top + s(10), right: panel.right, bottom: panel.top + s(30) };
-            let mute = RECT { left: cx - s(17), top: panel.bottom - s(42), right: cx + s(17), bottom: panel.bottom - s(8) };
-            let track = RECT { left: cx - s(3), top: percent.bottom + s(14), right: cx + s(3), bottom: mute.top - s(14) };
-            let hit = RECT { left: panel.left, top: track.top - s(10), right: panel.right, bottom: track.bottom + s(10) };
-            SliderLayout { panel, mute, track, hit, percent }
-        });
-        Panels { audio, volume, slider, slider_live: self.dock.slider_open }
-    }
-
-    /// Disposition actuelle du Dock et de ses panneaux, en coordonnées de sa fenêtre.
-    fn dock_panels(&self) -> Panels {
-        let m = Metrics::new(self.dock.dpi);
-        let (w, h) = (self.dock.window.right - self.dock.window.left, self.dock.window.bottom - self.dock.window.top);
-        self.panels(self.dock.model.layout(&m, w, h, Instant::now()).body)
-    }
-
-    pub(super) fn render_dock(&mut self) {
-        if self.dock.reserved.is_none() {
+    pub(super) fn render_apps(&mut self, s: usize) {
+        if !self.dock.enabled || self.screens[s].fullscreen {
             return;
         }
-        let m = Metrics::new(self.dock.dpi);
-        let dpi = self.dock.dpi;
-        let s = move |v: i32| v * dpi / 96;
-        // Le nom des applis, dans la police de la barre de l'écran principal.
-        let label_font = self.screens.first().map_or(HFONT::default(), |sc| sc.font);
-        let window = self.dock_window_rect(&m);
-        self.dock.window = window;
-        let (w, h) = (window.right - window.left, window.bottom - window.top);
-        let layout = self.dock.model.layout(&m, w, h, Instant::now());
-        let body = layout.body;
+        let now = Instant::now();
+        let layout = self.apps_layout(s);
+        let window = self.apps_window(s, layout.size);
+        self.screens[s].apps_rect = window;
+        let sc = &self.screens[s];
+        let dpi = sc.dpi;
+        let px = move |v: i32| v * dpi / 96;
         let white = (255, 255, 255);
-
+        let active = self.dock.active == Some(sc.id);
+        let (w, h) = (layout.size.cx, layout.size.cy);
         let mut canvas = Canvas::new(w, h);
-        if self.dock.model.cursor.is_some() {
-            // Zone invisible mais « pleine » au-dessus du Dock : la souris ne quitte pas la
-            // fenêtre en passant entre deux icônes grossies.
-            let lift = (m.max - m.icon) as i32 + s(12);
-            canvas.round_rect(RECT { left: body.left - s(6), top: body.top - lift, right: body.right + s(6), bottom: h }, 0, (0, 0, 0), 1);
+
+        // Rentrée dans le bord de l'écran pendant que l'encoche est ouverte, comme les scènes.
+        let shown = self.bar_shown(s, now);
+        if shown <= 0.0 {
+            canvas.present(sc.apps, POINT { x: window.left, y: window.top });
+            return;
         }
-        let radius = m.radius;
-        // Style macOS d'avant Tahoe : gris foncé presque plein, fin liseré clair.
-        let look = Material { tint: (38, 38, 42), opacity: 0.84, border: 0.14 };
-        let origin = (window.left - self.dock.backdrop_rect.left, window.top - self.dock.backdrop_rect.top);
-        // Panneau avec son ombre : le Dock, le volume et son curseur.
-        let plate = |canvas: &mut Canvas, r: RECT, radius: f32, look: &Material| {
-            canvas.round_rect(offset(inflate(r, s(1)), 0, s(3)), radius as i32 + s(1), (0, 0, 0), 45);
-            canvas.material(r, radius, self.dock.backdrop.as_deref(), origin, look);
+        let lift = ((1.0 - shown) * px(BAR_H + 4) as f64).round() as i32;
+        let up = |r: RECT| offset(r, 0, -lift);
+        let mut pill = Canvas::new(w, h);
+        pill.notch(up(layout.pill), px(PILL_RADIUS) as f32, px(PILL_SHOULDER) as f32, (0, 0, 0), 255);
+
+        // Une icône, grossie au survol (vers le bas : le haut de la pastille colle au bord).
+        let grow = |part: Part, r: RECT| -> [(f32, f32); 4] {
+            let scale = if active { 1.0 + HOVER_SCALE * self.dock.grown(part, now) } else { 1.0 };
+            let half = (r.right - r.left) as f64 * scale / 2.0;
+            let (cx, cy) = ((r.left + r.right) as f64 / 2.0, (r.top + r.bottom) as f64 / 2.0);
+            let (l, t, rr, b) = ((cx - half) as f32, (cy - half) as f32, (cx + half) as f32, (cy + half) as f32);
+            [(l, t), (rr, t), (rr, b), (l, b)]
         };
-        plate(&mut canvas, body, radius, &look);
-        let panels = self.panels(body);
-        plate(&mut canvas, panels.audio, radius, &look);
-        if self.dock.hover_control == Some(Control::Volume) {
-            let v = panels.volume;
-            canvas.round_rect(v, (v.right - v.left) / 2, white, 40);
+        let bounds = |q: [(f32, f32); 4]| RECT { left: q[0].0 as i32, top: q[0].1 as i32, right: q[2].0 as i32, bottom: q[2].1 as i32 };
+
+        if let Some(r) = layout.launcher {
+            draw_magnifier(&mut pill, bounds(grow(Part::Launcher, up(r))));
+        }
+        for &(i, r) in &layout.items {
+            let item = &self.dock.model.items[i];
+            let bob = item.launched.map_or(0, |t| {
+                let t = now.duration_since(t).as_secs_f32();
+                ((PI * t / BOUNCE_PERIOD).sin().abs() * px(BOUNCE) as f32).round() as i32
+            });
+            let quad = grow(Part::Item(i), offset(up(r), 0, -bob));
+            match &item.icon {
+                Some(icon) => pill.draw_quad(icon, quad, 255, 0),
+                None => pill.round_rect(inflate(bounds(quad), -px(2)), px(5), (90, 90, 100), 220),
+            }
+            if item.running {
+                // Point sous l'icône : l'appli est ouverte.
+                let cx = (r.left + r.right) / 2;
+                let dot = up(RECT { left: cx - px(2), top: layout.pill.bottom - px(5), right: cx + px(2), bottom: layout.pill.bottom - px(1) });
+                pill.round_rect(dot, px(2), white, 220);
+            }
+        }
+        if let Some(x) = layout.separator {
+            let sep = up(RECT { left: x, top: layout.pill.top + px(9), right: x + px(1).max(1), bottom: layout.pill.bottom - px(9) });
+            pill.round_rect(sep, 0, white, 70);
         }
         let (level, muted) = self.dock.volume.unwrap_or((0.0, false));
-        draw_volume(&mut canvas, panels.volume, level, muted, dpi);
-        // Curseur de volume, vertical au-dessus de son bouton. Il se déplie vers le haut en
-        // apparaissant en fondu, et se replie de même.
-        if let Some(sl) = &panels.slider {
-            let shown = self.dock.slider_shown(Instant::now());
-            if panels.slider_live {
+        draw_volume(&mut pill, bounds(grow(Part::Volume, up(layout.volume))), level, muted);
+        canvas.overlay(&pill, shown as f32);
+
+        if active && shown >= 1.0 {
+            self.draw_apps_extras(&mut canvas, &layout, s, now);
+        }
+        canvas.present(sc.apps, POINT { x: window.left, y: window.top });
+    }
+
+    /// Sous la pastille : le curseur de volume, ou l'étiquette de l'élément survolé.
+    fn draw_apps_extras(&self, canvas: &mut Canvas, layout: &Layout, s: usize, now: Instant) {
+        let sc = &self.screens[s];
+        let dpi = sc.dpi;
+        let px = move |v: i32| v * dpi / 96;
+        let (w, h) = (layout.size.cx, layout.size.cy);
+        let white = (255, 255, 255);
+        let font = sc.font;
+        let (level, muted) = self.dock.volume.unwrap_or((0.0, false));
+        let look = Material { tint: (30, 30, 32), opacity: 0.96, border: 0.14 };
+
+        // Curseur de volume, vertical sous son bouton. Il se déplie vers le bas en apparaissant en
+        // fondu, et se replie de même.
+        if let Some(sl) = &layout.slider {
+            let shown = self.dock.slider_shown(now);
+            if self.dock.slider_open {
                 // Zone invisible mais « pleine » entre le bouton et le curseur : la souris peut passer
-                // de l'un à l'autre sans quitter le Dock (ce qui fermerait le curseur).
-                canvas.round_rect(RECT { top: sl.panel.top, ..panels.audio }, 0, (0, 0, 0), 1);
+                // de l'un à l'autre sans quitter la barre (ce qui fermerait le curseur).
+                canvas.round_rect(RECT { top: layout.pill.bottom - px(2), bottom: sl.panel.top + px(2), ..sl.panel }, 0, (0, 0, 0), 1);
             }
-            // Plaque : d'un carré posé sur le bouton jusqu'à toute sa hauteur.
+            // Plaque : d'un carré sous le bouton jusqu'à toute sa hauteur.
             let full = sl.panel;
             let width = full.right - full.left;
             let height = width + ((full.bottom - full.top - width) as f32 * shown).round() as i32;
+            let plate = RECT { bottom: full.top + height, ..full };
             let mut layer = Canvas::new(w, h);
-            plate(&mut layer, RECT { top: full.bottom - height, ..full }, s(16) as f32, &look);
+            layer.round_rect(offset(inflate(plate, px(1)), 0, px(3)), px(15), (0, 0, 0), 45);
+            layer.material(plate, px(14) as f32, None, (0, 0), &look);
             // Contenu à sa place définitive, découvert à mesure que la plaque se déplie.
             let mut content = Canvas::new(w, h);
-            if self.dock.hover_control == Some(Control::Mute) {
+            if self.dock.hover == Some(Part::Mute) {
                 content.round_rect(sl.mute, (sl.mute.right - sl.mute.left) / 2, white, 40);
             }
-            draw_volume(&mut content, sl.mute, level, muted, dpi);
+            draw_volume(&mut content, inflate(sl.mute, -px(5)), level, muted);
             let track = sl.track;
             let radius = (track.right - track.left) / 2;
             content.round_rect(track, radius, white, 70);
@@ -455,94 +514,79 @@ impl App {
                 content.round_rect(RECT { top: y.min(track.bottom - 2 * radius), ..track }, radius, white, fill);
             }
             // Bouton rond, avec une ombre douce.
-            let knob = s(16);
+            let knob = px(16);
             let cx = (track.left + track.right) / 2;
             let knob_rect = RECT { left: cx - knob / 2, top: y - knob / 2, right: cx + knob / 2, bottom: y + knob / 2 };
-            content.round_rect(offset(inflate(knob_rect, s(1)), 0, s(1)), knob / 2 + s(1), (0, 0, 0), 70);
+            content.round_rect(offset(inflate(knob_rect, px(1)), 0, px(1)), knob / 2 + px(1), (0, 0, 0), 70);
             content.round_rect(knob_rect, knob / 2, white, 255);
             content.gdi(|dc| unsafe {
                 SetBkMode(dc, TRANSPARENT);
-                SelectObject(dc, label_font);
+                SelectObject(dc, font);
                 let text = if muted { "—".to_owned() } else { format!("{} %", (level * 100.0).round()) };
                 draw_text(dc, &text, sl.percent, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, TEXT, 0);
             });
             layer.overlay_inside(&content, 1.0);
             canvas.overlay(&layer, shown.clamp(0.0, 1.0));
+            return;
         }
-        if let Some(x) = layout.separator {
-            canvas.round_rect(RECT { left: x, top: body.top + s(12), right: x + s(1).max(1), bottom: body.bottom - s(12) }, 0, white, 90);
-        }
-        let flat = |r: RECT| {
-            let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-            [(l, t), (rr, t), (rr, b), (l, b)]
-        };
-        for (item, rect) in self.dock.model.items.iter().zip(&layout.icons) {
-            match &item.icon {
-                Some(icon) => canvas.draw_quad(icon, flat(*rect), 255, 0),
-                None => canvas.round_rect(inflate(*rect, -s(3)), s(12), (90, 90, 100), 200),
-            }
-            if item.running {
-                // Point sous l'icône : l'appli est ouverte.
-                let cx = (rect.left + rect.right) / 2;
-                let dot = RECT { left: cx - s(2), top: body.bottom - s(6), right: cx + s(2), bottom: body.bottom - s(2) };
-                canvas.round_rect(dot, s(2), white, 220);
-            }
-        }
-        // Étiquette au-dessus de l'icône survolée, ou du volume.
+
+        // Étiquette sous l'élément survolé.
         let volume_label = match self.dock.volume {
             Some((_, true)) => "Son coupé".to_owned(),
             Some((level, false)) => format!("Volume {} %", (level * 100.0).round()),
             None => "Aucune sortie audio".to_owned(),
         };
-        let label = match self.dock.hover_control {
-            Some(Control::Volume) if !self.dock.slider_open => Some((volume_label.as_str(), panels.volume)),
-            _ => self.dock.model.hover.and_then(|i| Some((self.dock.model.items.get(i)?.name.as_str(), *layout.icons.get(i)?))),
+        let Some(part) = self.dock.hover else { return };
+        let name = match part {
+            Part::Launcher => "Rechercher",
+            Part::Volume => volume_label.as_str(),
+            Part::Item(i) => match self.dock.model.items.get(i) {
+                Some(item) => item.name.as_str(),
+                None => return,
+            },
+            Part::Mute | Part::Slider => return,
         };
-        let label_box = label.map(|(name, rect)| {
-            let width = text_width(label_font, name) + s(22);
-            let cx = (rect.left + rect.right) / 2;
-            let bottom = rect.top - s(10);
-            let r = RECT { left: cx - width / 2, top: bottom - s(26), right: cx + width / 2, bottom };
-            offset(r, (s(4) - r.left).max(0) - (r.right - (w - s(4))).max(0), 0)
-        });
-        if let Some(r) = label_box {
-            canvas.round_rect(r, s(8), (28, 28, 32), 225);
-        }
+        let Some(rect) = layout.rect_of(part) else { return };
+        let width = text_width(font, name) + px(22);
+        let cx = (rect.left + rect.right) / 2;
+        let top = layout.pill.bottom + px(LABEL_GAP);
+        let r = RECT { left: cx - width / 2, top, right: cx + width / 2, bottom: top + px(LABEL_H) };
+        let r = offset(r, (px(4) - r.left).max(0) - (r.right - (w - px(4))).max(0), 0);
+        canvas.round_rect(r, px(8), (28, 28, 32), 230);
         canvas.gdi(|dc| unsafe {
             SetBkMode(dc, TRANSPARENT);
-            let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-            if let (Some((name, _)), Some(r)) = (label, label_box) {
-                SelectObject(dc, label_font);
-                SetTextColor(dc, TEXT);
-                let mut text: Vec<u16> = name.encode_utf16().collect();
-                let mut rect = r;
-                DrawTextW(dc, &mut text, &mut rect, centered);
-            }
+            SelectObject(dc, font);
+            draw_text(dc, name, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, TEXT, 0);
         });
-        canvas.present(self.dock.hwnd, POINT { x: window.left, y: window.top });
     }
 
     pub(super) fn dock_animating(&self) -> bool {
-        self.dock.model.animating() || self.dock.slider_anim.is_some()
+        self.dock.enabled && (self.dock.model.animating() || self.dock.slider_anim.is_some() || self.dock.hover_start.is_some())
     }
 
     pub(super) fn dock_tick(&mut self, now: Instant) {
-        let mut redraw = false;
+        if !self.dock.enabled {
+            return;
+        }
+        let mut redraw = self.dock.model.animating();
         if let Some((start, _)) = self.dock.slider_anim {
             let duration = if self.dock.slider_open { SLIDER_OPEN } else { SLIDER_CLOSE };
             if anim::progress(start, duration, now) >= 1.0 {
-                // Fin de l'animation ; une fois refermé, le curseur disparaît et la fenêtre
-                // reprend sa hauteur.
+                // Fin de l'animation ; une fois refermé, le curseur disparaît.
                 self.dock.slider_anim = None;
             }
             redraw = true;
         }
-        if self.dock.model.animating() {
-            self.dock.model.tick(now);
+        if let Some(start) = self.dock.hover_start {
+            if anim::progress(start, HOVER_ANIM, now) >= 1.0 {
+                self.dock.hover_start = None;
+            }
             redraw = true;
         }
+        // La pastille rentre ou sort du bord avec celle des scènes.
+        redraw |= self.screens.iter().any(|sc| sc.veil_start.is_some());
         if redraw {
-            self.render_dock();
+            self.render_all_apps();
         }
     }
 
@@ -555,65 +599,70 @@ impl App {
         let from = self.dock.slider_shown(now).clamp(0.0, 1.0);
         self.dock.slider_open = open;
         self.dock.slider_anim = Some((now, from));
-        self.render_dock();
+        self.render_all_apps();
     }
 
     // --- Souris -----------------------------------------------------------------------
 
-    /// Icône sous l'abscisse `x` (coordonnées de la fenêtre du Dock).
-    fn dock_hit(&self, x: f32, y: i32) -> Option<usize> {
-        let m = Metrics::new(self.dock.dpi);
-        let (w, h) = (self.dock.window.right - self.dock.window.left, self.dock.window.bottom - self.dock.window.top);
-        let layout = self.dock.model.layout(&m, w, h, Instant::now());
-        let top = layout.icons.iter().map(|r| r.top).min().unwrap_or(layout.body.top);
-        if y < top - (m.gap as i32) || x < layout.body.left as f32 || x > layout.body.right as f32 {
-            return None;
-        }
-        let half_gap = m.gap / 2.0;
-        layout.icons.iter().position(|r| x >= r.left as f32 - half_gap && x < r.right as f32 + half_gap)
+    fn apps_part(&self, s: usize, pt: POINT) -> Option<Part> {
+        let layout = self.apps_layout(s);
+        layout.part_at(pt, self.dock.slider_open, self.px(s, ICON_GAP) / 2)
     }
 
-    pub(super) fn dock_mouse(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) {
+    fn set_apps_hover(&mut self, hover: Option<Part>) {
+        if self.dock.hover != hover {
+            self.dock.hover_prev = self.dock.hover;
+            self.dock.hover = hover;
+            self.dock.hover_start = Some(Instant::now());
+        }
+    }
+
+    /// Souris sur la barre d'applis de la fenêtre `hwnd`.
+    pub(super) fn dock_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
+        let Some(s) = self.apps_index(hwnd) else { return };
         let pt = point(lp);
+        let id = self.screens[s].id;
         match msg {
             WM_MOUSEMOVE => {
+                if self.dock.active != Some(id) {
+                    // La souris passe d'un écran à l'autre : le curseur de volume reste où il était.
+                    let previous = self.dock.active.replace(id).and_then(|p| self.screen_index(p));
+                    self.dock.tracking = false;
+                    self.dock.slider_open = false;
+                    self.dock.slider_anim = None;
+                    if let Some(p) = previous {
+                        self.render_apps(p);
+                    }
+                }
                 if !self.dock.tracking {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: self.dock.hwnd,
-                        dwHoverTime: 0,
-                    };
+                    let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
                     self.dock.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
                 }
                 if self.dock.slider_drag {
-                    self.drag_volume(pt.y);
+                    self.drag_volume(s, pt.y);
                     return;
                 }
-                let hover = self.dock_hit(pt.x as f32, pt.y);
-                // Le Dock ne grossit que sous la souris, pas quand elle passe sur le volume.
-                self.dock.model.set_hover(hover.map(|_| pt.x as f32), hover);
-                self.dock.hover_control = self.dock_panels().control_at(pt);
-                self.render_dock();
+                let part = self.apps_part(s, pt);
+                self.set_apps_hover(part);
+                self.render_apps(s);
             }
             WM_MOUSELEAVE => {
                 self.dock.tracking = false;
-                self.dock.model.set_hover(None, None);
-                self.dock.hover_control = None;
-                self.render_dock();
-                // La souris quitte le Dock : le curseur de volume se referme (sauf en plein glisser).
+                self.set_apps_hover(None);
+                // La souris quitte la barre : le curseur de volume se referme (sauf en plein glisser).
                 if !self.dock.slider_drag {
                     self.set_slider(false);
                 }
+                self.render_apps(s);
             }
             WM_LBUTTONDOWN => {
-                if self.dock_panels().control_at(pt) == Some(Control::Slider) {
+                if self.apps_part(s, pt) == Some(Part::Slider) {
                     self.dock.slider_drag = true;
                     unsafe {
                         // Garde la souris même si elle sort de la piste en glissant.
-                        SetCapture(self.dock.hwnd);
+                        SetCapture(hwnd);
                     }
-                    self.drag_volume(pt.y);
+                    self.drag_volume(s, pt.y);
                 }
             }
             WM_LBUTTONUP if self.dock.slider_drag => {
@@ -622,39 +671,46 @@ impl App {
                     let _ = ReleaseCapture();
                 }
             }
-            WM_LBUTTONUP => match self.dock_panels().control_at(pt) {
+            WM_LBUTTONUP => match self.apps_part(s, pt) {
                 // Clic sur l'icône du volume : ouvre ou ferme le curseur.
-                Some(Control::Volume) => {
+                Some(Part::Volume) => {
                     self.dock.volume = volume::get();
                     self.set_slider(!self.dock.slider_open);
                 }
-                Some(Control::Mute) => {
+                Some(Part::Mute) => {
                     volume::toggle_mute();
                     self.dock.volume = volume::get();
-                    self.render_dock();
+                    self.render_apps(s);
                 }
-                Some(Control::Slider) => {}
+                Some(Part::Slider) => {}
                 // Ailleurs : le curseur se referme, et le clic fait son effet habituel.
-                control => {
+                Some(Part::Launcher) => {
                     self.set_slider(false);
-                    self.dock_control_click(control, pt);
+                    self.open_launcher();
                 }
+                Some(Part::Item(i)) => {
+                    self.set_slider(false);
+                    self.dock_click(i);
+                }
+                None => self.set_slider(false),
             },
             WM_MOUSEWHEEL => {
                 // La molette au-dessus du volume (ou du curseur) le règle, par pas de 2 %.
                 // (Pour cette molette, Windows donne la position à l'écran.)
-                let win = self.dock.window;
+                let win = self.screens[s].apps_rect;
                 let local = POINT { x: pt.x - win.left, y: pt.y - win.top };
-                let panels = self.dock_panels();
-                if contains(panels.audio, local) || panels.slider.as_ref().is_some_and(|s| contains(s.panel, local)) {
+                let layout = self.apps_layout(s);
+                let over = matches!(layout.part_at(local, true, self.px(s, ICON_GAP) / 2), Some(Part::Volume | Part::Mute | Part::Slider))
+                    || layout.slider.as_ref().is_some_and(|sl| contains(sl.panel, local));
+                if over {
                     let notches = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
                     let (level, _) = volume::get().unwrap_or((0.0, false));
                     volume::set(level + notches * 0.02);
                     self.dock.volume = volume::get();
                     if !self.dock.slider_open {
-                        self.dock.hover_control = Some(Control::Volume);
+                        self.set_apps_hover(Some(Part::Volume));
                     }
-                    self.render_dock();
+                    self.render_apps(s);
                 }
             }
             _ => {}
@@ -662,20 +718,11 @@ impl App {
     }
 
     /// Règle le volume d'après la position de la souris sur la piste du curseur.
-    fn drag_volume(&mut self, y: i32) {
-        let Some(slider) = self.dock_panels().slider else { return };
+    fn drag_volume(&mut self, s: usize, y: i32) {
+        let Some(slider) = self.apps_layout(s).slider else { return };
         volume::set(slider.level_at(y));
         self.dock.volume = volume::get();
-        self.render_dock();
-    }
-
-    /// Clic sur une icône du Dock (les boutons du volume sont gérés par `dock_mouse`).
-    fn dock_control_click(&mut self, control: Option<Control>, pt: POINT) {
-        if control.is_none() {
-            if let Some(index) = self.dock_hit(pt.x as f32, pt.y) {
-                self.dock_click(index);
-            }
-        }
+        self.render_apps(s);
     }
 
     fn dock_click(&mut self, index: usize) {
@@ -685,7 +732,7 @@ impl App {
             Kind::App if item.running => self.show_app(index),
             Kind::App => {
                 shell::open(&item.path);
-                // L'icône rebondit jusqu'à l'ouverture d'une fenêtre de l'appli.
+                // L'icône sautille jusqu'à l'ouverture d'une fenêtre de l'appli.
                 if let Some(item) = self.dock.model.items.get_mut(index) {
                     item.launched = Some(Instant::now());
                 }
@@ -693,7 +740,7 @@ impl App {
         }
     }
 
-    /// Fenêtres ouvertes de l'appli d'un élément du Dock.
+    /// Fenêtres ouvertes de l'appli d'un élément de la barre.
     fn app_windows(&mut self, index: usize) -> Vec<HWND> {
         let mut windows = Vec::new();
         for h in win::top_level_windows() {
@@ -738,15 +785,37 @@ impl App {
 
     fn toggle_pin(&mut self, index: usize) {
         self.dock.model.toggle_pin(index);
+        self.dock.hover = None;
+        self.dock.hover_prev = None;
         dock::save_pins(&self.dock.model.pins());
-        self.render_dock();
+        self.render_all_apps();
     }
 }
 
-/// Menu du clic droit sur une icône du Dock (ouvert hors de `with_app` : il a sa propre boucle).
-pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
+/// Barre d'applis d'un écran.
+pub(super) unsafe extern "system" fn apps_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        // Le menu a sa propre boucle de messages : on l'ouvre hors de `with_app`.
+        WM_RBUTTONUP => {
+            dock_menu(hwnd, point(lp));
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEWHEEL => {
+            with_app(|app| app.dock_mouse(hwnd, msg, wp, lp));
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Menu du clic droit sur une appli ou la corbeille (ouvert hors de `with_app` : il a sa
+/// propre boucle).
+unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
     let Some(Some((index, kind, running, pinned))) = with_app(|app| {
-        let index = app.dock_hit(pt.x as f32, pt.y)?;
+        let s = app.apps_index(hwnd)?;
+        let Some(Part::Item(index)) = app.apps_part(s, pt) else { return None };
         let item = app.dock.model.items.get(index)?;
         Some((index, item.kind, item.running, item.pinned))
     }) else {
@@ -761,7 +830,7 @@ pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
         }
         Kind::App => {
             items.push((MENU_DOCK_OPEN, if running { w!("Afficher") } else { w!("Ouvrir") }));
-            items.push((MENU_DOCK_PIN, w!("Garder dans le Dock")));
+            items.push((MENU_DOCK_PIN, w!("Garder dans la barre")));
             if pinned {
                 checked.push(MENU_DOCK_PIN);
             }
@@ -786,9 +855,26 @@ pub(super) unsafe fn dock_menu(hwnd: HWND, pt: POINT) {
     }
 }
 
+/// Loupe du lanceur : un anneau et son manche, en blanc.
+fn draw_magnifier(canvas: &mut Canvas, r: RECT) {
+    // Dessinée pour une case de 20 px ; elle suit la taille de la case (grossie au survol).
+    let k = (r.right - r.left) as f32 / 20.0;
+    let (cx, cy) = ((r.left + r.right) as f32 / 2.0 - 1.5 * k, (r.top + r.bottom) as f32 / 2.0 - 1.5 * k);
+    let white = (255, 255, 255);
+    // Anneau : un arc ouvert sur tout le tour.
+    canvas.arc((cx, cy), 5.5 * k, PI + 0.1, 1.8 * k, white, 255);
+    // Manche, en diagonale vers le bas à droite.
+    let (d, t) = (5.5 * k + 0.6 * k, 1.1 * k);
+    let (x0, y0) = (cx + d * FRAC_1_SQRT_2, cy + d * FRAC_1_SQRT_2);
+    let (x1, y1) = (x0 + 4.5 * k * FRAC_1_SQRT_2, y0 + 4.5 * k * FRAC_1_SQRT_2);
+    let (nx, ny) = (t * FRAC_1_SQRT_2, -t * FRAC_1_SQRT_2);
+    canvas.fill_convex(&[(x0 + nx, y0 + ny), (x1 + nx, y1 + ny), (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)], white, 255);
+}
+
 /// Haut-parleur avec une à trois ondes selon le volume, ou une croix si le son est coupé.
-fn draw_volume(canvas: &mut Canvas, button: RECT, level: f32, muted: bool, dpi: i32) {
-    let k = dpi as f32 / 96.0;
+fn draw_volume(canvas: &mut Canvas, button: RECT, level: f32, muted: bool) {
+    // Dessiné pour une case de 20 px ; il suit la taille de la case (grossie au survol).
+    let k = (button.right - button.left).min(button.bottom - button.top) as f32 / 20.0 * 0.9;
     let (cx, cy) = ((button.left + button.right) as f32 / 2.0, (button.top + button.bottom) as f32 / 2.0);
     let white = (255, 255, 255);
     let x0 = cx - 9.0 * k;

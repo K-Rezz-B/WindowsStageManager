@@ -35,7 +35,7 @@ impl Feature {
     pub fn label(self) -> &'static str {
         match self {
             Feature::Scenes => "Stage Manager",
-            Feature::Dock => "Dock",
+            Feature::Dock => "Barre d'applis",
             Feature::Notch => "Encoche",
             Feature::Pin => "Page accrochée à l'encoche",
             Feature::Float => "Fenêtres épinglées",
@@ -46,8 +46,8 @@ impl Feature {
 
     pub fn description(self) -> &'static str {
         match self {
-            Feature::Scenes => "Les fenêtres rangées en scènes dans la barre de gauche · Ctrl+Alt+S",
-            Feature::Dock => "Applis et volume en bas de l'écran, à la place de la barre des tâches",
+            Feature::Scenes => "Les fenêtres rangées en scènes, à droite de l'encoche · Ctrl+Alt+S",
+            Feature::Dock => "Applis, corbeille, volume et lanceur à gauche de l'encoche, à la place du Dock et de la barre des tâches",
             Feature::Notch => "L'heure et le lecteur de musique en haut de l'écran",
             Feature::Pin => "Une page web en direct dans l'encoche · Ctrl+Alt+P",
             Feature::Float => "Glisser une fenêtre sur l'encoche la garde au premier plan",

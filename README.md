@@ -2,7 +2,7 @@
 
 Une reproduction du Stage Manager de macOS pour Windows 11, écrite en Rust.
 
-Une petite pastille noire en haut de chaque écran, collée à gauche de l'encoche, montre les autres
+Une petite pastille noire en haut de chaque écran, collée à droite de l'encoche, montre les autres
 « scènes » par leur seule icône : ni nom, ni aperçu. La scène active reste seule à l'écran ; les
 autres sont réduites.
 
@@ -92,28 +92,28 @@ cargo run --release
 - **Coins de l'écran arrondis**, comme sur les Mac : un quart de cercle noir dans chaque coin
   (20 pixels à 100 %), par-dessus tout, que la souris traverse. Ils s'effacent devant un jeu ou
   une vidéo en plein écran, pour ne pas lui ajouter de latence.
-- **Volume** dans un petit panneau collé à droite du Dock : un clic ouvre un curseur
-  au-dessus (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette
-  le règle aussi, le pourcentage s'affiche au survol.
 - **Lanceur façon Spotlight** : **Alt + Espace** ouvre une barre de recherche ; tapez
   quelques lettres (accents et majuscules ignorés), ↑ ↓ pour choisir, Entrée pour lancer,
   Échap pour fermer. Il trouve toutes les applis installées, y compris celles du Store.
-- Le Dock, ses panneaux et le lanceur suivent le style de macOS d'avant Tahoe (mode sombre) :
-  panneaux gris foncé presque pleins, à peine teintés par le fond flouté, avec un fin liseré.
-- **Dock** en bas de l'écran, comme sur macOS : applis épinglées (reprises au départ de la
-  barre des tâches), applis ouvertes à la suite, puis la corbeille. Les icônes grossissent en
-  vague sous la souris, le nom de l'appli s'affiche au-dessus, un point marque les applis
-  ouvertes. Clic : lance l'appli (l'icône rebondit) ou affiche sa scène. Clic droit : garder
-  dans le Dock, quitter ; vider la corbeille. Les applis épinglées sont enregistrées dans
-  `%APPDATA%\StageManager\dock.txt`. La barre des tâches de Windows passe en masquage
-  automatique (remise comme avant en quittant) : poussez la souris tout en bas de l'écran
-  pour retrouver l'horloge et les icônes de notification.
+- Le lanceur et les panneaux suivent le style de macOS d'avant Tahoe (mode sombre) :
+  panneaux gris foncé presque pleins, avec un fin liseré.
+- **Barre d'applis** en haut de chaque écran, collée à gauche de l'encoche, à la place du
+  Dock (elle ne prend aucune place à l'écran) : une loupe qui ouvre le lanceur, les applis
+  épinglées (reprises au départ de la barre des tâches), les applis ouvertes à la suite, puis
+  la corbeille et le volume. L'icône survolée grossit et son nom s'affiche dessous, un point
+  marque les applis ouvertes. Clic : lance l'appli (l'icône sautille) ou affiche sa scène.
+  Clic droit : garder dans la barre, quitter ; vider la corbeille. Les applis épinglées sont
+  enregistrées dans `%APPDATA%\StageManager\dock.txt`. Le volume : un clic ouvre un curseur
+  dessous (glisser pour régler, clic sur son haut-parleur pour couper le son), la molette le
+  règle aussi. La barre des tâches de Windows passe en masquage automatique (remise comme
+  avant en quittant) : poussez la souris tout en bas de l'écran pour retrouver l'horloge et
+  les icônes de notification.
 - **Réglages** : chaque fonctionnalité s'active ou se désactive avec son interrupteur, à la
-  manière de macOS — le Stage Manager (les scènes et leur barre), le Dock, l'encoche, la page
+  manière de macOS — le Stage Manager (les scènes et leur barre), la barre d'applis, l'encoche, la page
   accrochée et les fenêtres épinglées (grisées sans l'encoche), le lanceur, les coins arrondis —
   ainsi que le lancement au démarrage de Windows. Le changement est immédiat : sans les
   scènes, toutes les fenêtres
-  sont restaurées ; sans le Dock, la barre des tâches de Windows revient ; sans le lanceur,
+  sont restaurées ; sans la barre d'applis, la barre des tâches de Windows revient ; sans le lanceur,
   Alt + Espace retrouve son rôle habituel. Les réglages s'ouvrent d'un clic sur l'icône de
   notification, par le clic droit sur l'encoche, ou en relançant l'application. Ils sont
   enregistrés dans `%APPDATA%\StageManager\settings.txt` (tout est activé par défaut).
@@ -192,15 +192,14 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/stages.rs` | Modèle des scènes (une scène active par écran), sans Win32, couvert par des tests (`cargo test`) |
 | `src/win.rs` | Utilitaires Win32 : filtrage des fenêtres, processus, icônes, premier plan |
 | `src/app.rs` | Barre d'icônes des scènes près de l'encoche, miniatures DWM, icône de notification, événements |
-| `src/app/screens.rs` | Écrans : une barre, un overlay et une encoche par écran, branchements, plein écran |
+| `src/app/screens.rs` | Écrans : une barre des scènes, une barre d'applis, un overlay et une encoche par écran, branchements, plein écran |
 | `src/anim.rs` | Animations : fenêtre transparente, trajectoires, courbes d'accélération |
 | `src/canvas.rs` | Dessin avec transparence par pixel pour la barre, projection en perspective |
-| `src/dock.rs` | Modèle du Dock : éléments, épinglage, grossissement, rebond (testé) |
-| `src/app/dockbar.rs` | Fenêtre du Dock : place réservée, dessin, clics, menu |
+| `src/dock.rs` | Modèle de la barre d'applis : éléments, épinglage, applis ouvertes (testé) |
+| `src/app/dockbar.rs` | Barre d'applis : dessin, survol, volume, clics, menu |
 | `src/shell.rs` | Raccourcis épinglés, grandes icônes, noms d'applis, lancement, corbeille |
 | `src/taskbar.rs` | Masquage automatique de la barre des tâches, et sa remise en état |
 | `src/snapbar.rs` | Barre d'ancrage de Windows 11 coupée, et sa remise en état |
-| `src/wallpaper.rs` | Fond d'écran derrière le Dock, flouté, pour la teinte des panneaux (fil à part) |
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
 | `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
 | `src/app/notch.rs` | Encoche en haut de chaque écran : formes, animation, lecteur complet |
@@ -224,7 +223,7 @@ Briques Windows utilisées : `SetWinEventHook` (focus, réduction, fermeture),
 
 - Les fenêtres lancées en administrateur ne sont pas gérées (Windows l'interdit), sauf si
   Stage Manager est lui-même lancé en administrateur.
-- Le Dock, le lanceur et les coins arrondis n'apparaissent que sur l'écran principal.
+- Le lanceur et les coins arrondis n'apparaissent que sur l'écran principal.
 - L'encoche recouvre le milieu du haut de l'écran (environ 190 × 32 pixels à 100 %) : un clic
   à cet endroit l'ouvre au lieu d'atteindre la fenêtre en dessous (onglet, barre de titre).
 - Les bureaux virtuels ne sont pas encore pris en compte.

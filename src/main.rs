@@ -13,7 +13,6 @@ mod snapbar;
 mod settings;
 mod taskbar;
 mod volume;
-mod wallpaper;
 mod stages;
 mod win;
 

@@ -81,13 +81,8 @@ pub fn is_app_window(h: HWND) -> bool {
     !is_cloaked(h) && !title(h).trim().is_empty() && !IGNORED_CLASSES.contains(&class_name(h).as_str())
 }
 
-/// Une vraie appli plein écran (jeu, vidéo…) est-elle au premier plan ? Windows prévient aussi
-/// quand c'est le bureau qui prend le premier plan (il couvre tout l'écran) : on l'écarte.
-pub fn fullscreen_app_in_front() -> bool {
-    fullscreen_monitor().is_some()
-}
-
-/// Écran couvert par l'appli plein écran au premier plan, s'il y en a une.
+/// Écran couvert par l'appli plein écran au premier plan, s'il y en a une. Windows prévient
+/// aussi quand c'est le bureau qui prend le premier plan (il couvre tout l'écran) : on l'écarte.
 pub fn fullscreen_monitor() -> Option<HMONITOR> {
     unsafe {
         let h = GetForegroundWindow();

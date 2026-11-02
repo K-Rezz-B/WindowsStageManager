@@ -29,7 +29,7 @@ use crate::{
     canvas::{Canvas, Image, Material},
     media::{Media, NowPlaying},
     settings::{self, Feature, Features},
-    shell, taskbar, wallpaper,
+    shell, taskbar,
     stages::{Model, ScreenId, Transition, Wid},
     win::{self, hwnd_of, wid_of},
 };
@@ -45,19 +45,17 @@ mod settingsui;
 
 use corners::Corners;
 use float::Float;
-use dockbar::{DockUi, DOCK, TIMER_CLOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
+use dockbar::{apps_proc, DockUi, TIMER_CLOCK, WM_DOCK_LOADED};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 use notch::NotchUi;
 use pin::{Pin, HOTKEY_PIN};
-use screens::{Screen, BAR_CLASS, NOTCH_CLASS};
+use screens::{Screen, APPS_CLASS, BAR_CLASS, NOTCH_CLASS};
 use settingsui::{SettingsUi, SETTINGS, WM_SHOW_SETTINGS};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
 const WM_APPBAR: u32 = WM_APP + 3;
 const WM_MEDIA: u32 = WM_APP + 4;
-/// Envoyé avec WM_SETTINGCHANGE quand le fond d'écran change.
-const SPI_SETDESKWALLPAPER: usize = 0x0014;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_RESCAN: usize = 1;
 const TIMER_WINDOW_DRAG: usize = 2;
@@ -72,8 +70,8 @@ const MENU_MERGE: usize = 4;
 const MENU_AUTOSTART: usize = 5;
 const MENU_SPLIT: usize = 6;
 
-/// Barre des scènes : une petite pastille noire d'icônes collée en haut de l'écran, à gauche de
-/// l'encoche. Mesures en pixels à 100 %.
+/// Barre des scènes : une petite pastille noire d'icônes collée en haut de l'écran, à droite de
+/// l'encoche (la barre d'applis est à gauche). Mesures en pixels à 100 %.
 const BAR_H: i32 = 32;
 const ICON: i32 = 20;
 const ICON_GAP: i32 = 10;
@@ -253,7 +251,7 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, dock: HWND, launcher: HWND, settings: HWND, corners: Corners) -> Self {
+    fn new(hwnd: HWND, launcher: HWND, settings: HWND, corners: Corners) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
@@ -272,7 +270,7 @@ impl App {
             monitor: RECT::default(),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             anim_duration: Duration::from_millis(anim_ms),
-            dock: DockUi::new(dock),
+            dock: DockUi::new(hwnd),
             launcher: LauncherUi::new(launcher),
             pin: Pin::new(),
             float: Float::new(),
@@ -299,7 +297,6 @@ impl App {
                 self.now_playing = self.media.now_playing();
                 self.notch_retarget();
             }
-            WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => self.reload_dock_backdrop(),
             WM_TIMER if wp.0 == TIMER_RESCAN => self.rescan(),
             WM_TIMER if wp.0 == TIMER_WINDOW_DRAG => {
                 let target = self.window_drop_target();
@@ -332,7 +329,6 @@ impl App {
                         self.reserve_notch_band(s);
                     }
                 }
-                self.reregister_dock();
             }
             _ => return None,
         }
@@ -1188,19 +1184,19 @@ impl App {
         self.screens[s].appbar = None;
     }
 
-    /// Place la barre en haut de son écran : collée à gauche de l'encoche, ou centrée quand il
-    /// n'y en a pas. Elle ne réserve aucune place : les fenêtres passent dessous.
+    /// Place la barre en haut de son écran : collée à droite de l'encoche (ou du milieu de
+    /// l'écran, face à la barre d'applis), ou centrée quand elle est seule.
     fn place_appbar(&mut self, s: usize) {
         let Some(current) = self.screens[s].appbar else { return };
-        let edge = self.notch_edge(s);
+        let edge = self.notch_edge(s).or(self.dock.enabled.then_some(0));
         let sc = &mut self.screens[s];
         let dpi = sc.dpi;
         let px = move |v: i32| v * dpi / 96;
         let (w, h) = (px(BAR_WIN_W), px(BAR_WIN_H));
         let cx = (sc.rect.left + sc.rect.right) / 2;
-        // Voir `pill_rect` : le bord droit de la pastille est à `NOTCH_GAP` de l'encoche.
+        // Voir `pill_rect` : le bord gauche de la pastille est à `NOTCH_GAP` de l'encoche.
         let left = match edge {
-            Some(half) => cx - half - px(NOTCH_GAP) - w + px(PILL_SHOULDER) + px(2),
+            Some(half) => cx + half + px(NOTCH_GAP) - px(PILL_SHOULDER) - px(2),
             None => cx - w / 2,
         };
         let r = RECT { left, top: sc.rect.top, right: left + w, bottom: sc.rect.top + h };
@@ -1212,14 +1208,6 @@ impl App {
             sc.appbar = Some(r);
             unsafe {
                 let _ = SetWindowPos(sc.hwnd, HWND_TOPMOST, r.left, r.top, w, h, SWP_NOACTIVATE);
-                if size(r) != size(current) {
-                    // L'échelle a changé. Le Dock se sert aussi de cette police pour ses libellés.
-                    if !sc.font.is_invalid() {
-                        let _ = DeleteObject(sc.font);
-                    }
-                    // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
-                    sc.font = make_font("Inter", 12, 400, dpi);
-                }
             }
         }
         self.refresh(s);
@@ -1239,6 +1227,7 @@ impl App {
             sc.veil_start = Some(now);
         }
         self.place_appbar(s);
+        self.place_apps(s);
     }
 
     /// Part visible de la pastille : 0 rentrée dans le bord de l'écran, 1 sortie.
@@ -1271,22 +1260,22 @@ impl App {
         sc.pill_from + ((sc.pill_to - sc.pill_from) as f64 * e).round() as i32
     }
 
-    /// La pastille, large de `width`, dans la fenêtre de la barre : calée à droite contre
+    /// La pastille, large de `width`, dans la fenêtre de la barre : calée à gauche contre
     /// l'encoche, ou centrée.
     fn pill_rect(&self, s: usize, width: i32) -> RECT {
         let sc = &self.screens[s];
         let w = sc.appbar.map_or(0, |b| b.right - b.left);
-        let right = if sc.bar_anchored { w - self.px(s, PILL_SHOULDER) - self.px(s, 2) } else { (w + width) / 2 };
-        RECT { left: right - width, top: 0, right, bottom: self.px(s, BAR_H) }
+        let left = if sc.bar_anchored { self.px(s, PILL_SHOULDER) + self.px(s, 2) } else { (w - width) / 2 };
+        RECT { left, top: 0, right: left + width, bottom: self.px(s, BAR_H) }
     }
 
     /// Emplacement de la `i`-ième icône sur `n` : la scène la plus récente près de l'encoche.
     fn icon_slot(&self, s: usize, i: usize, n: usize) -> RECT {
         let pill = self.pill_rect(s, self.pill_width(s, n.max(1)));
         let (icon, gap) = (self.px(s, ICON), self.px(s, ICON_GAP));
-        let right = pill.right - self.px(s, PILL_PAD) - i as i32 * (icon + gap);
+        let left = pill.left + self.px(s, PILL_PAD) + i as i32 * (icon + gap);
         let top = (pill.bottom - icon) / 2;
-        RECT { left: right - icon, top, right, bottom: top + icon }
+        RECT { left, top, right: left + icon, bottom: top + icon }
     }
 
     fn add_tray(&self) {
@@ -1755,7 +1744,6 @@ unsafe extern "system" fn win_event(
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let is_dock = hwnd.0 as isize == DOCK.load(Ordering::Relaxed);
     let is_launcher = hwnd.0 as isize == LAUNCHER.load(Ordering::Relaxed);
     if hwnd.0 as isize == SETTINGS.load(Ordering::Relaxed) {
         // Une vraie fenêtre, qui prend le premier plan comme les autres.
@@ -1776,14 +1764,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEACTIVATE if is_launcher => return LRESULT(MA_ACTIVATE as isize),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => return LRESULT(1),
-        WM_RBUTTONUP if is_dock => {
-            dockbar::dock_menu(hwnd, point(lp));
-            return LRESULT(0);
-        }
-        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEWHEEL if is_dock => {
-            with_app(|app| app.dock_mouse(msg, wp, lp));
-            return LRESULT(0);
-        }
         // Les menus ont leur propre boucle de messages : on les ouvre hors de `with_app`.
         WM_TRAY => {
             let mouse = (lp.0 & 0xFFFF) as u32;
@@ -1801,7 +1781,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Some(None) => DefWindowProcW(hwnd, msg, wp, lp),
         None => {
             // Occupé : on remet l'événement à plus tard plutôt que de le perdre.
-            if [WM_WINEVENT, WM_MEDIA, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
+            if [WM_WINEVENT, WM_MEDIA, WM_DOCK_LOADED, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
                 .contains(&msg)
             {
                 let _ = PostMessageW(hwnd, msg, wp, lp);
@@ -1964,34 +1944,16 @@ pub fn run() -> Result<()> {
             None,
         )?;
         MAIN.store(hwnd.0 as isize, Ordering::Relaxed);
-        // Les barres des scènes et les encoches : une de chaque par écran (voir `screens`).
-        let procs: [(PCWSTR, WNDPROC); 2] = [(BAR_CLASS, Some(bar_proc)), (NOTCH_CLASS, Some(notch_proc))];
+        // Les barres des scènes, les barres d'applis et les encoches : une de chaque par écran
+        // (voir `screens`).
+        let procs: [(PCWSTR, WNDPROC); 3] =
+            [(BAR_CLASS, Some(bar_proc)), (APPS_CLASS, Some(apps_proc)), (NOTCH_CLASS, Some(notch_proc))];
         for (name, proc) in procs {
             let screen_wc = WNDCLASSW { lpszClassName: name, lpfnWndProc: proc, ..wc };
             if RegisterClassW(&screen_wc) == 0 {
                 return Err(Error::from_win32());
             }
         }
-        let dock_class = w!("StageManagerDock");
-        let dock_wc = WNDCLASSW { lpszClassName: dock_class, ..wc };
-        if RegisterClassW(&dock_wc) == 0 {
-            return Err(Error::from_win32());
-        }
-        let dock = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            dock_class,
-            w!("Dock"),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            instance,
-            None,
-        )?;
-        DOCK.store(dock.0 as isize, Ordering::Relaxed);
         let launcher_class = w!("StageManagerLauncher");
         let launcher_wc = WNDCLASSW { lpszClassName: launcher_class, ..wc };
         if RegisterClassW(&launcher_wc) == 0 {
@@ -2034,7 +1996,7 @@ pub fn run() -> Result<()> {
         )?;
         SETTINGS.store(settings.0 as isize, Ordering::Relaxed);
         let corners = Corners::create(instance)?;
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, dock, launcher, settings, corners)));
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, launcher, settings, corners)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [
