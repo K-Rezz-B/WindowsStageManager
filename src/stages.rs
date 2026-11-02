@@ -281,6 +281,28 @@ impl Model {
         Transition { minimize: vec![w], restore: Vec::new(), focus }
     }
 
+    /// L'utilisateur a réduit une fenêtre de la scène active : elle rejoint la barre de son
+    /// écran, en tête. Seule dans sa scène, c'est toute la scène qui y passe et l'écran reste
+    /// sans scène active ; sinon elle en sort pour former sa propre scène. La fenêtre est déjà
+    /// réduite : il n'y a rien à faire subir aux autres.
+    pub fn shelve(&mut self, w: Wid) -> bool {
+        if !self.in_active_stage(w) {
+            return false;
+        }
+        let Some(i) = self.stage_of(w).and_then(|id| self.index(id)) else {
+            return false;
+        };
+        let (id, screen) = (self.stages[i].id, self.stages[i].screen);
+        if self.stages[i].windows.len() == 1 {
+            self.active.remove(&screen);
+            self.touch(id);
+        } else {
+            self.stages[i].windows.retain(|x| *x != w);
+            self.push_stage(screen, vec![w]);
+        }
+        true
+    }
+
     /// Éclate une scène de la barre en une scène par fenêtre, à la même place dans la barre.
     pub fn split(&mut self, id: u64) -> bool {
         let Some(i) = self.index(id).filter(|&i| self.active(self.stages[i].screen) != Some(id)) else {
@@ -454,6 +476,24 @@ mod tests {
         // La dernière fenêtre d'une scène ne se détache pas.
         assert!(m.detach(3).is_empty());
         assert!(!m.can_detach(3));
+    }
+
+    #[test]
+    fn une_fenetre_reduite_rejoint_la_barre() {
+        let (mut m, _) = model();
+        let edge = m.stage_of(1).unwrap();
+        m.activate(edge, Some(1));
+        // Avec une autre fenêtre dans sa scène : elle en sort, en tête de barre.
+        assert!(m.shelve(1));
+        assert_eq!(active_windows(&m, 0), vec![3]);
+        assert_eq!(sidebar(&m, 0)[0], vec![1]);
+        // Seule dans sa scène : toute la scène passe dans la barre, l'écran reste vide.
+        assert!(m.shelve(3));
+        assert_eq!(m.active(0), None);
+        assert_eq!(sidebar(&m, 0)[0], vec![3]);
+        assert_eq!(m.sidebar(0).len(), 4);
+        // Déjà dans la barre : rien ne change.
+        assert!(!m.shelve(4));
     }
 
     #[test]

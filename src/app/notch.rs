@@ -27,6 +27,16 @@ const REST: Shape = Shape { w: 190.0, h: 32.0, radius: 10.0 };
 const LIVE: Shape = Shape { w: 220.0, h: 32.0, radius: 10.0 };
 const OPEN: Shape = Shape { w: 440.0, h: 186.0, radius: 30.0 };
 const EMPTY: Shape = Shape { w: 320.0, h: 84.0, radius: 24.0 };
+/// Zone de dépôt, quand on fait glisser une fenêtre vers le haut de l'écran : elle invite à la
+/// lâcher, puis grandit quand la fenêtre est dessus.
+const DROP: Shape = Shape { w: 300.0, h: 62.0, radius: 22.0 };
+const DROP_HOT: Shape = Shape { w: 340.0, h: 84.0, radius: 26.0 };
+/// Distance au haut de l'écran (à 100 %) à partir de laquelle l'encoche invite à déposer la
+/// fenêtre, et marge autour de la zone de dépôt.
+const DROP_APPROACH: f32 = 220.0;
+const DROP_MARGIN: f32 = 24.0;
+/// Bleu de macOS, pour la zone de dépôt.
+const ACCENT: (u8, u8, u8) = (10, 132, 255);
 /// Aperçu de la page accrochée : sa largeur, ses hauteurs extrêmes, sa marge, et son haut
 /// quand il n'y a pas de lecteur au-dessus (sous la bande de l'encoche fermée).
 const CHART_W: f32 = 520.0;
@@ -53,6 +63,15 @@ impl Shape {
         let l = |a: f32, b: f32| a + (b - a) * t;
         Shape { w: l(self.w, to.w), h: l(self.h, to.h), radius: l(self.radius, to.radius) }
     }
+}
+
+/// État de la zone de dépôt : on approche une fenêtre, elle est au-dessus, ou elle vient
+/// d'être lâchée (épinglée ou désépinglée). `unpin` : la fenêtre est déjà épinglée.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum DropZone {
+    Near { unpin: bool },
+    Hot { unpin: bool },
+    Done { pinned: bool },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -102,6 +121,8 @@ pub(super) struct NotchUi {
     art: Option<Cover>,
     /// Miniature DWM de la page accrochée, montrée dans l'encoche ouverte.
     thumb: Option<isize>,
+    /// Zone de dépôt pendant qu'on fait glisser une fenêtre (voir `float`).
+    pub drop: Option<DropZone>,
     font_title: HFONT,
     font_artist: HFONT,
     font_small: HFONT,
@@ -127,6 +148,7 @@ impl NotchUi {
             epoch: Instant::now(),
             art: None,
             thumb: None,
+            drop: None,
             font_title: HFONT::default(),
             font_artist: HFONT::default(),
             font_small: HFONT::default(),
@@ -233,6 +255,7 @@ impl App {
             let n = &mut self.screens[s].notch;
             n.shown = false;
             n.open = false;
+            n.drop = None;
             n.hover = false;
             n.hover_control = None;
             n.start = None;
@@ -244,7 +267,25 @@ impl App {
                 let _ = KillTimer(n.hwnd, TIMER_NOTCH_EQ);
             }
             self.drop_notch_thumb(s);
+            self.follow_notch(s);
         }
+    }
+
+    /// Demi-largeur de l'encoche fermée, congés compris, en pixels : la barre des scènes se
+    /// cale à côté. Au moins celle de la lecture, pour ne pas sauter à chaque pause.
+    pub(super) fn notch_edge(&self, s: usize) -> Option<i32> {
+        let n = &self.screens[s].notch;
+        if !n.shown {
+            return None;
+        }
+        let (closed, _) = self.notch_shapes(s);
+        Some(((closed.w.max(LIVE.w) / 2.0 + SHOULDER) * n.dpi as f32 / 96.0).round() as i32)
+    }
+
+    /// L'encoche est ouverte (lecteur, page accrochée) : elle déborde sur la barre des scènes.
+    pub(super) fn notch_open(&self, s: usize) -> bool {
+        let n = &self.screens[s].notch;
+        n.shown && !n.fullscreen && (n.open || n.drop.is_some())
     }
 
     /// Centre l'encoche en haut de son écran, à la bonne échelle.
@@ -336,7 +377,12 @@ impl App {
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
         let (closed, open) = self.notch_shapes(s);
         let n = &mut self.screens[s].notch;
-        let target = if n.open { open } else { closed };
+        let target = match n.drop {
+            Some(DropZone::Near { .. }) => DROP,
+            Some(_) => DROP_HOT,
+            None if n.open => open,
+            None => closed,
+        };
         if target != n.target {
             let now = Instant::now();
             n.from = n.shape(now);
@@ -352,6 +398,8 @@ impl App {
             }
         }
         self.render_notch(s);
+        // La barre des scènes se cale contre l'encoche, et s'efface quand elle s'ouvre.
+        self.follow_notch(s);
     }
 
     pub(super) fn notch_animating(&self) -> bool {
@@ -421,6 +469,15 @@ impl App {
             canvas.round_rect(offset(inflate(r, px(1)), 0, px(3)), radius + px(1), (0, 0, 0), (60.0 * opened) as u8);
         }
         canvas.notch(r, shape.radius * k, SHOULDER * k, (0, 0, 0), 255);
+        if let Some(drop) = n.drop {
+            // On fait glisser une fenêtre : l'encoche devient une zone de dépôt.
+            draw_drop(&mut canvas, r, drop, n.font_title, k, t);
+            let pos = POINT { x: n.anchor.x - size.cx / 2, y: n.anchor.y };
+            canvas.present(n.hwnd, pos);
+            self.screens[s].notch.window = RECT { left: pos.x, top: pos.y, right: pos.x + size.cx, bottom: pos.y + size.cy };
+            self.place_notch_thumb(s, None);
+            return;
+        }
 
         // Encoche fermée : l'heure au milieu. Pendant la lecture, l'encoche s'élargit, l'heure
         // glisse à gauche et un petit symbole de lecture apparaît à droite. Le cours de la page
@@ -565,29 +622,13 @@ impl App {
         Some((CHART_W, (CHART_W * h / w).clamp(CHART_H.0, CHART_H.1)))
     }
 
-    /// Le cours affiché dans l'encoche fermée, en morceaux : texte, police, couleur, largeur.
-    /// TradingView l'écrit dans son titre ; pour une autre page, le titre tout court.
+    /// Le cours affiché dans l'encoche fermée, en morceaux (voir `title_parts`).
     fn ticker_parts(&self, s: usize) -> Vec<(String, HFONT, COLORREF, i32)> {
-        let n = &self.screens[s].notch;
-        let title = self.pin.title.trim();
-        if !self.pin_shown() || title.is_empty() {
+        if !self.pin_shown() {
             return Vec::new();
         }
-        let part = |text: &str, font: HFONT, color: COLORREF| (text.to_owned(), font, color, text_width(font, text));
-        match parse_ticker(title) {
-            Some(t) => {
-                let mut parts = vec![part(&t.symbol, n.font_time, TEXT), part(&t.price, n.font_artist, TEXT)];
-                if let Some((change, up)) = &t.change {
-                    parts.push(part(change, n.font_artist, if *up { UP } else { DOWN }));
-                }
-                parts
-            }
-            None => {
-                let mut whole = part(title, n.font_artist, TEXT_DIM);
-                whole.3 = whole.3.min(n.s(200));
-                vec![whole]
-            }
-        }
+        let n = &self.screens[s].notch;
+        title_parts(&self.pin.title, n.font_time, n.font_artist, n.s(200))
     }
 
     fn ticker_width(&self, s: usize) -> i32 {
@@ -633,6 +674,50 @@ impl App {
                 let _ = DwmUnregisterThumbnail(thumb);
             }
         }
+    }
+
+    /// Repasse les encoches devant les autres fenêtres « toujours au premier plan » (la page
+    /// épinglée).
+    pub(super) fn raise_notches(&self) {
+        for sc in self.screens.iter().filter(|sc| sc.notch.shown && !sc.notch.fullscreen) {
+            unsafe {
+                let _ = SetWindowPos(sc.notch.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
+
+    // --- Zone de dépôt ------------------------------------------------------------------
+
+    /// Montre (ou retire) la zone de dépôt dans une encoche, qui y prend sa forme d'un mouvement
+    /// de ressort.
+    pub(super) fn set_notch_drop(&mut self, s: usize, drop: Option<DropZone>) {
+        let n = &mut self.screens[s].notch;
+        if !n.shown {
+            return;
+        }
+        if n.drop != drop {
+            n.drop = drop;
+            self.retarget_notch(s);
+        } else if matches!(drop, Some(DropZone::Near { .. })) && n.start.is_none() {
+            // La punaise sautille pour inviter à lâcher la fenêtre.
+            self.render_notch(s);
+        }
+    }
+
+    /// Encoche vers laquelle on fait glisser une fenêtre (souris en `pt`), et si la fenêtre est
+    /// au-dessus de sa zone de dépôt.
+    pub(super) fn notch_drop_zone(&self, pt: POINT) -> Option<(usize, bool)> {
+        let s = self.screens.iter().position(|sc| contains(sc.rect, pt))?;
+        let sc = &self.screens[s];
+        if !sc.notch.shown || sc.notch.fullscreen {
+            return None;
+        }
+        let k = sc.dpi as f32 / 96.0;
+        let (dx, dy) = ((pt.x - sc.notch.anchor.x).abs() as f32 / k, (pt.y - sc.rect.top) as f32 / k);
+        if dy > DROP_APPROACH {
+            return None;
+        }
+        Some((s, dy <= DROP_HOT.h + DROP_MARGIN && dx <= DROP_HOT.w / 2.0 + DROP_MARGIN))
     }
 
     // --- Souris -----------------------------------------------------------------------
@@ -698,11 +783,12 @@ impl App {
                 }
                 Some(Control::Previous) => self.media.previous(),
                 Some(Control::Next) => self.media.next(),
-                // Ailleurs, un clic montre la page accrochée (ou la regare) : l'encoche se
-                // referme pour ne pas la masquer.
+                // Ailleurs, un clic montre la page accrochée sur cet écran (ou la regare) :
+                // l'encoche se referme pour ne pas la masquer.
                 None if self.pin_shown() => {
                     self.set_notch_open(s, false);
-                    self.pin_toggle();
+                    let screen = self.screens[s].id;
+                    self.pin_toggle(screen);
                 }
                 // Un clic sur l'encoche fermée l'ouvre sans attendre.
                 None => self.set_notch_open(s, true),
@@ -736,8 +822,80 @@ pub(super) unsafe fn notch_menu(hwnd: HWND) {
     };
 }
 
+/// Titre de la page accrochée en morceaux (texte, police, couleur, largeur) : le cours chez
+/// TradingView, qui l'écrit dans son titre (symbole, prix, variation en vert ou en rouge) ;
+/// pour une autre page, le titre tout court, limité à `max` pixels.
+pub(super) fn title_parts(title: &str, bold: HFONT, regular: HFONT, max: i32) -> Vec<(String, HFONT, COLORREF, i32)> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Vec::new();
+    }
+    let part = |text: &str, font: HFONT, color: COLORREF| (text.to_owned(), font, color, text_width(font, text));
+    match parse_ticker(title) {
+        Some(t) => {
+            let mut parts = vec![part(&t.symbol, bold, TEXT), part(&t.price, regular, TEXT)];
+            if let Some((change, up)) = &t.change {
+                parts.push(part(change, regular, if *up { UP } else { DOWN }));
+            }
+            parts
+        }
+        None => {
+            let mut whole = part(title, regular, TEXT_DIM);
+            whole.3 = whole.3.min(max);
+            vec![whole]
+        }
+    }
+}
+
+/// Zone de dépôt : une punaise et une invitation à lâcher la fenêtre, sur fond bleu quand elle
+/// est au-dessus.
+fn draw_drop(canvas: &mut Canvas, r: RECT, drop: DropZone, font: HFONT, k: f32, t: f32) {
+    let (text, hot) = match drop {
+        DropZone::Near { unpin: false } => ("Déposer ici pour épingler", false),
+        DropZone::Near { unpin: true } => ("Déposer ici pour désépingler", false),
+        DropZone::Hot { unpin: false } => ("Lâcher pour épingler", true),
+        DropZone::Hot { unpin: true } => ("Lâcher pour désépingler", true),
+        DropZone::Done { pinned: true } => ("Épinglée au premier plan", true),
+        DropZone::Done { pinned: false } => ("Désépinglée", true),
+    };
+    let px = |v: f32| (v * k).round() as i32;
+    if hot {
+        let glow = RECT { left: r.left + px(6.0), top: r.top + px(6.0), right: r.right - px(6.0), bottom: r.bottom - px(6.0) };
+        canvas.round_rect(glow, px(20.0), ACCENT, 90);
+    }
+    let (icon, gap) = (px(16.0), px(10.0));
+    let left = (r.left + r.right - icon - gap - text_width(font, text)) / 2;
+    // Un peu sous le milieu : le haut de l'encoche reste la bande sombre de l'appareil photo.
+    let cy = (r.top + r.bottom) as f32 / 2.0 + 3.0 * k;
+    let bob = if hot { 0.0 } else { -3.0 * k * (t * 6.0).sin().abs() };
+    let color = if hot { (255, 255, 255) } else { (100, 170, 255) };
+    draw_pin_icon(canvas, (left as f32 + icon as f32 / 2.0, cy + bob), k, color);
+    let text_rect = RECT { left: left + icon + gap, top: (cy - 10.0 * k) as i32, right: r.right, bottom: (cy + 10.0 * k) as i32 };
+    canvas.gdi(|dc| unsafe {
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, font);
+        draw_text(dc, text, text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, if hot { TEXT } else { TEXT_DIM }, 0);
+    });
+}
+
+/// Punaise, penchée : tête, corps qui s'évase, collerette, pointe.
+fn draw_pin_icon(canvas: &mut Canvas, (cx, cy): (f32, f32), k: f32, color: (u8, u8, u8)) {
+    let (sin, cos) = 0.6f32.sin_cos();
+    let p = |x: f32, y: f32| (cx + (x * cos - y * sin) * k, cy + (x * sin + y * cos) * k);
+    let parts: [&[(f32, f32)]; 4] = [
+        &[(-3.5, -9.0), (3.5, -9.0), (3.5, -6.5), (-3.5, -6.5)],
+        &[(-2.5, -6.5), (2.5, -6.5), (3.5, 0.5), (-3.5, 0.5)],
+        &[(-6.0, 0.5), (6.0, 0.5), (6.0, 2.5), (-6.0, 2.5)],
+        &[(-0.9, 2.5), (0.9, 2.5), (0.0, 9.5)],
+    ];
+    for part in parts {
+        let points: Vec<(f32, f32)> = part.iter().map(|&(x, y)| p(x, y)).collect();
+        canvas.fill_convex(&points, color, 255);
+    }
+}
+
 /// Nom du site d'une adresse : « tradingview.com ».
-fn host(url: &str) -> &str {
+pub(super) fn host(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     host.strip_prefix("www.").unwrap_or(host)

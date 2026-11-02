@@ -29,13 +29,14 @@ use crate::{
     canvas::{Canvas, Image, Material},
     media::{Media, NowPlaying},
     settings::{self, Feature, Features},
-    snapshot, taskbar, wallpaper,
+    shell, taskbar, wallpaper,
     stages::{Model, ScreenId, Transition, Wid},
     win::{self, hwnd_of, wid_of},
 };
 
 mod corners;
 mod dockbar;
+mod float;
 mod launcherui;
 mod notch;
 mod pin;
@@ -43,6 +44,7 @@ mod screens;
 mod settingsui;
 
 use corners::Corners;
+use float::Float;
 use dockbar::{DockUi, DOCK, TIMER_CLOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 use notch::NotchUi;
@@ -70,17 +72,38 @@ const MENU_MERGE: usize = 4;
 const MENU_AUTOSTART: usize = 5;
 const MENU_SPLIT: usize = 6;
 
-/// Largeur de la barre, en pixels à 100 %.
-const BAR_WIDTH: i32 = 200;
+/// Barre des scènes : une petite pastille noire d'icônes collée en haut de l'écran, à gauche de
+/// l'encoche. Mesures en pixels à 100 %.
+const BAR_H: i32 = 32;
+const ICON: i32 = 20;
+const ICON_GAP: i32 = 10;
+const PILL_PAD: i32 = 12;
+const PILL_RADIUS: i32 = 10;
+/// Congés creux qui raccordent la pastille au bord de l'écran, comme l'encoche.
+const PILL_SHOULDER: i32 = 6;
+/// Écart entre la pastille et l'encoche (congés compris).
+const NOTCH_GAP: i32 = 18;
+/// Nombre d'icônes au plus.
+const MAX_ICONS: i32 = 8;
+/// Taille de la fenêtre de la barre : la pastille la plus large, et un peu de marge.
+const BAR_WIN_W: i32 = MAX_ICONS * (ICON + ICON_GAP) - ICON_GAP + 2 * (PILL_PAD + PILL_SHOULDER) + 4;
+const BAR_WIN_H: i32 = BAR_H + 8;
+/// Grossissement de l'icône survolée, et durée de son ressort.
+const HOVER_SCALE: f64 = 0.35;
+const HOVER_ANIM: Duration = Duration::from_millis(280);
+/// La pastille rentre dans le bord de l'écran quand l'encoche s'ouvre par-dessus.
+const VEIL_ANIM: Duration = Duration::from_millis(260);
 /// Après un changement de scène, on ignore les événements parasites qu'il provoque.
 const SWITCH_GUARD: Duration = Duration::from_millis(500);
-/// Largeur des instantanés de fenêtres, en pixels (environ deux fois une carte, pour la netteté).
-const SNAPSHOT_WIDTH: i32 = 400;
 /// Durée par défaut des animations (modifiable avec STAGE_MANAGER_ANIM_MS, 0 pour les couper).
 const ANIM_MS: u64 = 650;
-/// Délai entre la restauration des vraies fenêtres et le retrait des miniatures animées :
-/// le temps qu'elles se redessinent et se remettent dans le bon ordre, cachées dessous.
-const SETTLE: Duration = Duration::from_millis(150);
+/// Une fois les vraies fenêtres revenues sous les miniatures animées : le temps qu'elles se
+/// redessinent, puis le fondu qui efface les miniatures par-dessus. Pas de coupure nette : une
+/// fenêtre qui n'a pas fini de se dessiner apparaît en douceur au lieu de clignoter.
+const SETTLE: Duration = Duration::from_millis(90);
+const SETTLE_FADE: Duration = Duration::from_millis(140);
+/// Au-delà, on n'attend plus une fenêtre qui tarde à revenir.
+const SETTLE_MAX: Duration = Duration::from_millis(600);
 
 const TEXT: COLORREF = rgb(245, 245, 248);
 const TEXT_DIM: COLORREF = rgb(200, 200, 208);
@@ -104,6 +127,8 @@ pub fn restore_hidden() {
     restore_minimized();
     // La page accrochée à l'encoche, si elle était garée hors de l'écran.
     pin::restore_parked();
+    // La fenêtre épinglée, si elle était réduite en vignette, et son « toujours au premier plan ».
+    float::restore();
     // Et la barre des tâches, si on l'avait passée en masquage automatique pour le Dock.
     taskbar::restore();
 }
@@ -142,15 +167,12 @@ fn screens_changed() {
 struct Card {
     stage: u64,
     window: Wid,
-    /// Fenêtres dessinées sur la carte (trois au plus), celle de devant en premier.
-    windows: Vec<Wid>,
-    /// Toute la carte (miniature + libellé).
+    /// Zone cliquable autour de l'icône (coordonnées de la barre).
     rect: RECT,
-    /// Zone réservée à la miniature.
+    /// L'icône elle-même : les fenêtres de la scène partent d'ici et y reviennent.
     thumb_box: RECT,
-    /// Emplacement de la miniature à plat (proportions de la fenêtre), avant l'inclinaison.
     dest: RECT,
-    icon: HICON,
+    icon: Rc<Image>,
     /// Écart avec la position précédente, résorbé par l'animation de glissement.
     slide: (i32, i32),
     /// Carte qu'on est en train de déplacer à la souris : elle quitte la barre.
@@ -189,9 +211,9 @@ struct App {
     /// Peut-on piloter les fenêtres de ce processus ? (pas s'il est admin et nous non)
     manageable: HashMap<u32, bool>,
     self_elevated: bool,
-    /// Image de chaque fenêtre au moment où elle a quitté l'écran (cartes inclinées).
-    snapshots: HashMap<Wid, Rc<Image>>,
-    icons: HashMap<Wid, HICON>,
+    /// Icône de chaque fenêtre de la barre, et celle de chaque appli (par chemin).
+    icons: HashMap<Wid, Rc<Image>>,
+    app_icons: HashMap<String, Rc<Image>>,
     media: Media,
     /// Morceau en cours, affiché dans les encoches.
     now_playing: Option<NowPlaying>,
@@ -209,6 +231,8 @@ struct App {
     launcher: LauncherUi,
     /// Page accrochée aux encoches, qu'elles montrent en direct.
     pin: Pin,
+    /// Fenêtre épinglée au premier plan, déposée sur une encoche.
+    float: Float,
     /// Coins arrondis de l'écran.
     corners: Corners,
     /// La fenêtre des réglages.
@@ -239,8 +263,8 @@ impl App {
             last_rects: HashMap::new(),
             manageable: HashMap::new(),
             self_elevated: win::is_elevated(None).unwrap_or(false),
-            snapshots: HashMap::new(),
             icons: HashMap::new(),
+            app_icons: HashMap::new(),
             media: Media::start(hwnd, WM_MEDIA),
             now_playing: None,
             screens: Vec::new(),
@@ -251,6 +275,7 @@ impl App {
             dock: DockUi::new(dock),
             launcher: LauncherUi::new(launcher),
             pin: Pin::new(),
+            float: Float::new(),
             corners,
             settings: SettingsUi::new(settings),
             window_drag: None,
@@ -262,6 +287,7 @@ impl App {
         if self.handle_dock_message(msg, wp, lp)
             || self.handle_launcher_message(msg, wp)
             || self.handle_pin_message(msg, wp)
+            || self.handle_float_message(msg, wp)
             || self.handle_settings_message(msg, wp)
         {
             return Some(LRESULT(0));
@@ -350,6 +376,11 @@ impl App {
             self.disable_pin(false);
         }
         self.features.pin = false;
+        // La fenêtre épinglée reprend sa place ; la barre d'ancrage de Windows reste coupée.
+        if self.features.active(Feature::Float) {
+            self.disable_float(false);
+        }
+        self.features.float = false;
         self.apply_features(Features::NONE);
         for s in 0..self.screens.len() {
             self.unregister_appbar(s);
@@ -388,6 +419,9 @@ impl App {
             self.set_hotkey(HOTKEY_PIN, false, MOD_CONTROL | MOD_ALT, 'P' as u32);
             self.disable_pin(true);
         }
+        if off(Feature::Float) {
+            self.disable_float(true);
+        }
         if off(Feature::Scenes) {
             self.disable_scenes();
         }
@@ -424,6 +458,9 @@ impl App {
         if on(Feature::Pin) {
             self.set_hotkey(HOTKEY_PIN, true, MOD_CONTROL | MOD_ALT, 'P' as u32);
             self.enable_pin();
+        }
+        if on(Feature::Float) {
+            self.enable_float();
         }
         // L'encoche change de forme avec la page accrochée.
         if off(Feature::Pin) || on(Feature::Pin) {
@@ -483,13 +520,14 @@ impl App {
         self.pending_minimize.clear();
         self.icons.clear();
         self.last_rects.clear();
-        self.snapshots.clear();
         for s in 0..self.screens.len() {
             let sc = &mut self.screens[s];
             sc.cards.clear();
             sc.departing = None;
             sc.layout_key.clear();
             sc.hover = None;
+            sc.pill_from = 0;
+            sc.pill_to = 0;
             unsafe {
                 let _ = ShowWindow(sc.hwnd, SW_HIDE);
             }
@@ -534,7 +572,7 @@ impl App {
             // Une fenêtre « toujours au premier plan » a pu passer devant les coins.
             self.corners.raise();
         }
-        if self.pin_event(event, h) {
+        if self.float_event(event, h) || self.pin_event(event, h) {
             return;
         }
         if !self.features.scenes {
@@ -571,10 +609,9 @@ impl App {
                 if self.pending_minimize.remove(&w) || !self.model.in_active_stage(w) {
                     return;
                 }
-                let Some(screen) = self.model.screen_of(w) else { return };
-                // Réduite par l'utilisateur : elle quitte sa scène, comme sur macOS.
-                self.forget(w);
-                self.show_next_stage(screen);
+                // Réduite par l'utilisateur : elle rejoint la barre, d'où un clic la ramène. Si
+                // c'était la dernière de la scène active, l'écran reste dégagé.
+                self.model.shelve(w);
             }
             EVENT_SYSTEM_MINIMIZEEND => {
                 let Some(screen) = self.model.screen_of(w) else { return };
@@ -590,8 +627,13 @@ impl App {
                 if win::is_alive(h) {
                     return;
                 }
+                // Seule la fermeture de la scène active fait venir la suivante : un écran
+                // dégagé exprès (tout réduit) le reste.
+                let was_active = self.model.in_active_stage(w);
                 self.forget(w);
-                self.show_next_stage(screen);
+                if was_active {
+                    self.show_next_stage(screen);
+                }
             }
             EVENT_SYSTEM_MOVESIZESTART => {
                 if !self.model.in_active_stage(w) {
@@ -673,7 +715,9 @@ impl App {
         // déplacements (taille inchangée). Une fenêtre agrandie reprend sa taille normale
         // dès qu'on la tire, ce n'est pas un redimensionnement.
         let resized = size(anim::window_rect(hwnd_of(drag.window))) != size(drag.rect);
-        if (resized && !drag.maximized) || !self.model.can_detach(drag.window) {
+        // Lâchée sur la zone de dépôt de l'encoche, elle est épinglée, pas sortie de sa scène.
+        let pinning = self.screens.iter().any(|sc| matches!(sc.notch.drop, Some(notch::DropZone::Hot { .. } | notch::DropZone::Done { .. })));
+        if pinning || (resized && !drag.maximized) || !self.model.can_detach(drag.window) {
             return None;
         }
         let screen = self.model.screen_of(drag.window)?;
@@ -710,7 +754,6 @@ impl App {
         self.pending_minimize.remove(&w);
         self.icons.remove(&w);
         self.last_rects.remove(&w);
-        self.snapshots.remove(&w);
         HIDDEN.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != w);
     }
 
@@ -798,19 +841,8 @@ impl App {
         self.hide(&t.minimize);
     }
 
-    /// Avant de réduire des fenêtres : leur photo pour la barre, et la liste à restaurer en
-    /// quittant.
+    /// Avant de réduire des fenêtres : la liste à restaurer en quittant.
     fn prepare(&mut self, t: &Transition) {
-        // Dernière occasion de photographier les fenêtres sortantes : réduites, elles ne se
-        // dessinent plus. Ces images servent aux cartes inclinées de la barre.
-        for &w in &t.minimize {
-            let h = hwnd_of(w);
-            if !win::is_minimized(h) {
-                if let Some(image) = snapshot::capture(h, SNAPSHOT_WIDTH) {
-                    self.snapshots.insert(w, Rc::new(image));
-                }
-            }
-        }
         let mut hidden = HIDDEN.lock().unwrap_or_else(|e| e.into_inner());
         hidden.retain(|w| !t.restore.contains(w) && t.focus != Some(*w));
         for &w in &t.minimize {
@@ -854,13 +886,13 @@ impl App {
         // jusqu'à ce que les miniatures l'aient rejointe.
         self.screens[s].arriving = t.minimize.first().and_then(|w| self.model.stage_of(*w));
         self.refresh(s);
-        let bar_w = bar.right - bar.left;
+        // Les fenêtres sortantes rapetissent jusqu'à l'icône de leur scène.
         let target = {
             let sc = &self.screens[s];
             sc.arriving
                 .and_then(|id| sc.cards.iter().find(|c| c.stage == id))
                 .map(|c| bar_to_overlay(c.thumb_box))
-                .unwrap_or_else(|| bar_to_overlay(RECT { left: 0, top: 0, right: bar_w, bottom: bar_w * 5 / 8 }))
+                .unwrap_or_else(|| bar_to_overlay(self.icon_slot(s, 0, 1)))
         };
 
         // Fenêtres concernées, de l'avant vers l'arrière, avec leur position à l'écran.
@@ -911,7 +943,10 @@ impl App {
             anim::set_transitions(hwnd_of(w), false);
         }
         // Les miniatures doivent être à l'écran avant que les vraies fenêtres disparaissent.
-        self.show_overlay(s);
+        // Si la fenêtre à activer est déjà là (barre des tâches, Alt+Tab), les sortantes partent
+        // derrière elle au lieu de repasser une dernière fois par-dessus.
+        let front = t.focus.map(hwnd_of).filter(|h| !win::is_minimized(*h));
+        self.show_overlay_below(s, front);
         self.hide(&t.minimize);
         self.screens[s].switch = Some(Switch {
             start: now,
@@ -921,11 +956,17 @@ impl App {
             focus: t.focus,
             quiet,
             landed: None,
+            settled: None,
         });
         true
     }
 
     fn show_overlay(&self, s: usize) {
+        self.show_overlay_below(s, None);
+    }
+
+    /// Montre l'overlay des animations au premier plan, ou juste sous la fenêtre `front`.
+    fn show_overlay_below(&self, s: usize, front: Option<HWND>) {
         let sc = &self.screens[s];
         let mon = sc.rect;
         unsafe {
@@ -933,7 +974,7 @@ impl App {
             // et demande à la barre de se cacher.
             let _ = SetWindowPos(
                 sc.overlay,
-                HWND_TOPMOST,
+                front.unwrap_or(HWND_TOPMOST),
                 mon.left,
                 mon.top,
                 mon.right - mon.left,
@@ -951,7 +992,9 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.screens.iter().any(|sc| sc.switch.is_some() || sc.slide_start.is_some())
+        self.screens
+            .iter()
+            .any(|sc| sc.switch.is_some() || sc.slide_start.is_some() || sc.hover_start.is_some() || sc.veil_start.is_some())
             || self.dock_animating()
             || self.notch_animating()
     }
@@ -970,12 +1013,19 @@ impl App {
         let duration = self.anim_duration;
         let sc = &mut self.screens[s];
         // La barre se redessine tant que ses cartes bougent ou s'enchaînent en fondu.
-        let mut redraw = sc.slide_start.is_some();
+        let mut redraw = sc.slide_start.is_some() || sc.hover_start.is_some() || sc.veil_start.is_some();
         if sc.slide_start.is_some_and(|start| anim::progress(start, duration, now) >= 1.0) {
             sc.slide_start = None;
         }
+        // Le grossissement de l'icône survolée, et la pastille qui rentre ou sort du bord.
+        if sc.hover_start.is_some_and(|start| anim::progress(start, HOVER_ANIM, now) >= 1.0) {
+            sc.hover_start = None;
+        }
+        if sc.veil_start.is_some_and(|start| anim::progress(start, VEIL_ANIM, now) >= 1.0) {
+            sc.veil_start = None;
+        }
         let (mut land, mut finish) = (false, false);
-        if let Some(switch) = &sc.switch {
+        if let Some(switch) = &mut sc.switch {
             match switch.landed {
                 None => {
                     let p = anim::progress(switch.start, switch.duration, now);
@@ -993,7 +1043,25 @@ impl App {
                     redraw |= sc.arriving.is_some() || sc.departing.is_some();
                     land = p >= 1.0;
                 }
-                Some(landed) => finish = now.duration_since(landed) >= SETTLE,
+                Some(landed) => {
+                    // Windows restaure les fenêtres en différé : on attend qu'elles soient
+                    // vraiment revenues sous leurs miniatures.
+                    if switch.settled.is_none() {
+                        let back = switch.restore.iter().chain(&switch.focus).all(|&w| !win::is_minimized(hwnd_of(w)));
+                        if back || now.duration_since(landed) >= SETTLE_MAX {
+                            switch.settled = Some(now);
+                        }
+                    }
+                    // Puis les miniatures s'effacent en fondu sur les vraies fenêtres.
+                    if let Some(fade) = switch.settled.map(|t| t + SETTLE).filter(|t| now >= *t) {
+                        let p = anim::progress(fade, SETTLE_FADE, now);
+                        let opacity = ((1.0 - anim::ease_out(p)) * 255.0) as u8;
+                        for f in switch.flights.iter().filter(|f| f.fade_in) {
+                            anim::place_thumb(f.thumb, f.to, true, opacity);
+                        }
+                        finish = p >= 1.0;
+                    }
+                }
             }
         }
         if land {
@@ -1011,7 +1079,8 @@ impl App {
     fn land(&mut self, s: usize, now: Instant) {
         let Some(switch) = self.screens[s].switch.as_mut().filter(|sw| sw.landed.is_none()) else { return };
         switch.landed = Some(now);
-        let restore = std::mem::take(&mut switch.restore);
+        // Gardées : on surveille leur retour avant d'effacer les miniatures.
+        let restore = switch.restore.clone();
         let focus = switch.focus;
         self.reveal(&restore, focus);
         self.screens[s].departing = None;
@@ -1072,7 +1141,7 @@ impl App {
         }
     }
 
-    // --- Barres latérales -----------------------------------------------------------
+    // --- Barre des scènes -----------------------------------------------------------
 
     /// Inscrit la barre d'un écran auprès de Windows, sans réserver de place : elle apprend
     /// ainsi qu'une appli passe en plein écran, ce qui sert aussi aux encoches et aux coins.
@@ -1092,7 +1161,7 @@ impl App {
         unsafe { SHAppBarMessage(ABM_REMOVE, &mut abd) };
     }
 
-    /// Réserve le bord gauche de l'écran pour sa barre des scènes.
+    /// Met en place la barre des scènes d'un écran.
     fn reserve_bar(&mut self, s: usize) {
         if self.screens[s].appbar.is_none() {
             self.screens[s].appbar = Some(RECT::default());
@@ -1100,47 +1169,110 @@ impl App {
         }
     }
 
-    /// Rend le bord gauche de l'écran, en restant inscrit pour le plein écran.
+    /// Retire la barre des scènes, en restant inscrit pour le plein écran.
     fn release_bar(&mut self, s: usize) {
-        if self.screens[s].appbar.is_some() {
-            self.unregister_appbar(s);
-            self.register_appbar(s);
+        self.screens[s].appbar = None;
+    }
+
+    /// Place la barre en haut de son écran : collée à gauche de l'encoche, ou centrée quand il
+    /// n'y en a pas. Elle ne réserve aucune place : les fenêtres passent dessous.
+    fn place_appbar(&mut self, s: usize) {
+        let Some(current) = self.screens[s].appbar else { return };
+        let edge = self.notch_edge(s);
+        let sc = &mut self.screens[s];
+        let dpi = sc.dpi;
+        let px = move |v: i32| v * dpi / 96;
+        let (w, h) = (px(BAR_WIN_W), px(BAR_WIN_H));
+        let cx = (sc.rect.left + sc.rect.right) / 2;
+        // Voir `pill_rect` : le bord droit de la pastille est à `NOTCH_GAP` de l'encoche.
+        let left = match edge {
+            Some(half) => cx - half - px(NOTCH_GAP) - w + px(PILL_SHOULDER) + px(2),
+            None => cx - w / 2,
+        };
+        let r = RECT { left, top: sc.rect.top, right: left + w, bottom: sc.rect.top + h };
+        if sc.bar_anchored != edge.is_some() {
+            sc.bar_anchored = edge.is_some();
+            sc.layout_key.clear();
+        }
+        if r != current {
+            sc.appbar = Some(r);
+            unsafe {
+                let _ = SetWindowPos(sc.hwnd, HWND_TOPMOST, r.left, r.top, w, h, SWP_NOACTIVATE);
+                if size(r) != size(current) {
+                    // L'échelle a changé. Le Dock se sert aussi de cette police pour ses libellés.
+                    if !sc.font.is_invalid() {
+                        let _ = DeleteObject(sc.font);
+                    }
+                    // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
+                    sc.font = make_font("Inter", 12, 400, dpi);
+                }
+            }
+        }
+        self.refresh(s);
+        self.render(s);
+    }
+
+    /// L'encoche a changé (largeur, ouverte ou fermée, activée ou non) : la barre la suit, et
+    /// rentre dans le bord de l'écran tant que l'encoche est ouverte par-dessus.
+    pub(super) fn follow_notch(&mut self, s: usize) {
+        let open = self.notch_open(s);
+        let now = Instant::now();
+        let shown = self.bar_shown(s, now);
+        let sc = &mut self.screens[s];
+        if sc.veiled != open {
+            sc.veiled = open;
+            sc.veil_from = shown;
+            sc.veil_start = Some(now);
+        }
+        self.place_appbar(s);
+    }
+
+    /// Part visible de la pastille : 0 rentrée dans le bord de l'écran, 1 sortie.
+    fn bar_shown(&self, s: usize, now: Instant) -> f64 {
+        let sc = &self.screens[s];
+        let target = if sc.veiled { 0.0 } else { 1.0 };
+        match sc.veil_start {
+            Some(start) => sc.veil_from + (target - sc.veil_from) * anim::ease_out(anim::progress(start, VEIL_ANIM, now)),
+            None => target,
         }
     }
 
-    /// Réserve une bande sur le bord gauche de l'écran, comme la barre des tâches : les
-    /// fenêtres maximisées s'arrêtent à côté.
-    fn place_appbar(&mut self, s: usize) {
-        let sc = &mut self.screens[s];
-        let Some(current) = sc.appbar else { return };
-        let width = BAR_WIDTH * sc.dpi / 96;
-        let mut abd = APPBARDATA {
-            cbSize: size_of::<APPBARDATA>() as u32,
-            hWnd: sc.hwnd,
-            uEdge: ABE_LEFT,
-            rc: sc.rect,
-            ..Default::default()
-        };
-        unsafe {
-            abd.rc.right = abd.rc.left + width;
-            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
-            abd.rc.right = abd.rc.left + width;
-            if abd.rc == current {
-                return;
-            }
-            SHAppBarMessage(ABM_SETPOS, &mut abd);
-            let r = abd.rc;
-            sc.appbar = Some(r);
-            let _ = SetWindowPos(sc.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+    fn px(&self, s: usize, v: i32) -> i32 {
+        v * self.screens[s].dpi / 96
+    }
 
-            if !sc.font.is_invalid() {
-                let _ = DeleteObject(sc.font);
-            }
-            // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
-            sc.font = make_font("Inter", 12, 400, sc.dpi);
+    /// Largeur de la pastille pour `n` icônes.
+    fn pill_width(&self, s: usize, n: usize) -> i32 {
+        if n == 0 {
+            return 0;
         }
-        sc.layout_key.clear();
-        self.refresh(s);
+        let n = n as i32;
+        n * self.px(s, ICON) + (n - 1) * self.px(s, ICON_GAP) + 2 * self.px(s, PILL_PAD)
+    }
+
+    /// Largeur de la pastille en ce moment : elle s'allonge et se resserre avec les icônes.
+    fn pill_shown_width(&self, s: usize, now: Instant) -> i32 {
+        let sc = &self.screens[s];
+        let e = anim::spring(self.slide_progress(s, now));
+        sc.pill_from + ((sc.pill_to - sc.pill_from) as f64 * e).round() as i32
+    }
+
+    /// La pastille, large de `width`, dans la fenêtre de la barre : calée à droite contre
+    /// l'encoche, ou centrée.
+    fn pill_rect(&self, s: usize, width: i32) -> RECT {
+        let sc = &self.screens[s];
+        let w = sc.appbar.map_or(0, |b| b.right - b.left);
+        let right = if sc.bar_anchored { w - self.px(s, PILL_SHOULDER) - self.px(s, 2) } else { (w + width) / 2 };
+        RECT { left: right - width, top: 0, right, bottom: self.px(s, BAR_H) }
+    }
+
+    /// Emplacement de la `i`-ième icône sur `n` : la scène la plus récente près de l'encoche.
+    fn icon_slot(&self, s: usize, i: usize, n: usize) -> RECT {
+        let pill = self.pill_rect(s, self.pill_width(s, n.max(1)));
+        let (icon, gap) = (self.px(s, ICON), self.px(s, ICON_GAP));
+        let right = pill.right - self.px(s, PILL_PAD) - i as i32 * (icon + gap);
+        let top = (pill.bottom - icon) / 2;
+        RECT { left: right - icon, top, right, bottom: top + icon }
     }
 
     fn add_tray(&self) {
@@ -1169,8 +1301,30 @@ impl App {
         }
     }
 
-    fn icon(&mut self, w: Wid) -> HICON {
-        *self.icons.entry(w).or_insert_with(|| win::icon(hwnd_of(w)))
+    /// Icône d'une fenêtre : la grande icône de son appli, sinon celle de la fenêtre.
+    fn icon(&mut self, w: Wid) -> Rc<Image> {
+        if let Some(icon) = self.icons.get(&w) {
+            return Rc::clone(icon);
+        }
+        let h = hwnd_of(w);
+        let path = win::process_path(win::app_pid(h));
+        let icon = match path.as_ref().and_then(|p| self.app_icons.get(p)) {
+            Some(icon) => Rc::clone(icon),
+            None => {
+                let mut image = path.as_deref().and_then(shell::big_icon).unwrap_or_else(|| hicon_image(win::icon(h), 64));
+                // Réduite d'avance : dessinée en tout petit, une image de 128 px scintillerait.
+                while image.w > 64 {
+                    image = image.half();
+                }
+                let icon = Rc::new(image);
+                if let Some(p) = path {
+                    self.app_icons.insert(p, Rc::clone(&icon));
+                }
+                icon
+            }
+        };
+        self.icons.insert(w, Rc::clone(&icon));
+        icon
     }
 
     fn refresh_all(&mut self) {
@@ -1185,65 +1339,51 @@ impl App {
         }
     }
 
-    /// Recalcule la disposition des cartes de la barre d'un écran.
+    /// Recalcule la place des icônes de la barre d'un écran.
     fn refresh(&mut self, s: usize) {
-        let (hwnd, dpi, screen) = {
-            let sc = &self.screens[s];
-            (sc.hwnd, sc.dpi, sc.id)
-        };
-        let mut rc = RECT::default();
-        unsafe {
-            let _ = GetClientRect(hwnd, &mut rc);
+        if self.screens[s].appbar.is_none() {
+            return;
         }
-        let px = move |v: i32| v * dpi / 96;
-        let margin = px(16);
-        let stack = px(10);
-        let width = (rc.right - 2 * margin).max(1);
-        let thumb_h = (width - stack) * 5 / 8;
-        let label_h = px(26);
-        let card_h = stack + thumb_h + label_h;
-
-        let limit = rc.bottom - margin;
-        let mut layout: LayoutKey = Vec::new();
-        let mut y = px(20);
-        for stage in self.model.sidebar(screen) {
-            if y + card_h > limit {
-                break;
-            }
-            let rect = RECT { left: margin, top: y, right: margin + width, bottom: y + card_h };
-            layout.push((stage.id, stage.windows[0], stage.windows.len(), rect));
-            y += card_h + px(18);
-        }
+        let screen = self.screens[s].id;
+        let stages: Vec<(u64, Wid)> =
+            self.model.sidebar(screen).iter().take(MAX_ICONS as usize).map(|st| (st.id, st.windows[0])).collect();
+        let n = stages.len();
+        let layout: LayoutKey =
+            stages.iter().enumerate().map(|(i, &(stage, window))| (stage, window, n, self.icon_slot(s, i, n))).collect();
         if layout == self.screens[s].layout_key {
             return;
         }
 
-        // Les cartes qui restent glissent depuis l'endroit où elles sont affichées en ce moment.
+        // Les icônes qui restent glissent depuis l'endroit où elles sont affichées en ce moment.
         let now = Instant::now();
         let previous: HashMap<u64, RECT> = self.screens[s]
             .cards
             .iter()
             .map(|c| {
                 let (dx, dy) = self.card_offset(s, c, now);
-                (c.stage, offset(c.rect, dx, dy))
+                (c.stage, offset(c.dest, dx, dy))
             })
             .collect();
         let arriving = self.screens[s].arriving;
+        let (half_gap, bar_h) = (self.px(s, ICON_GAP) / 2, self.px(s, BAR_H));
         let mut cards = Vec::new();
         let mut sliding = false;
-        for &(stage, window, _, rect) in &layout {
-            let thumb_box = RECT { left: rect.left, top: rect.top + stack, right: rect.right, bottom: rect.top + stack + thumb_h };
-            let windows: Vec<Wid> = self.model.stage(stage).map_or(vec![window], |s| s.windows.iter().take(3).copied().collect());
-            let dest = fit(thumb_box, self.window_size(window));
-            let slide = previous.get(&stage).map_or((0, 0), |r| (r.left - rect.left, r.top - rect.top));
-            // Une carte qui n'était pas affichée (et ne vient pas d'un trajet) apparaît en fondu.
+        for &(stage, window, _, slot) in &layout {
+            let slide = previous.get(&stage).map_or((0, 0), |r| (r.left - slot.left, r.top - slot.top));
+            // Une icône qui n'était pas affichée (et ne vient pas d'un trajet) surgit.
             let fade_in = !previous.contains_key(&stage) && arriving != Some(stage);
             sliding |= slide != (0, 0) || fade_in;
             let icon = self.icon(window);
-            cards.push(Card { stage, window, windows, rect, thumb_box, dest, icon, slide, hidden: false, fade_in });
+            let rect = RECT { left: slot.left - half_gap, top: 0, right: slot.right + half_gap, bottom: bar_h };
+            cards.push(Card { stage, window, rect, thumb_box: slot, dest: slot, icon, slide, hidden: false, fade_in });
         }
+        let pill_from = self.pill_shown_width(s, now);
+        let pill_to = self.pill_width(s, n);
+        sliding |= pill_from != pill_to;
         let sc = &mut self.screens[s];
         sc.cards = cards;
+        sc.pill_from = pill_from;
+        sc.pill_to = pill_to;
         sc.slide_start = sliding.then_some(now);
         sc.layout_key = layout;
         if sc.hover.is_some_and(|h| !sc.cards.iter().any(|c| c.stage == h)) {
@@ -1252,7 +1392,7 @@ impl App {
         self.render(s);
     }
 
-    /// Décalage d'affichage d'une carte pendant l'animation de glissement.
+    /// Décalage d'affichage d'une icône pendant l'animation de glissement.
     fn card_offset(&self, s: usize, card: &Card, now: Instant) -> (i32, i32) {
         let remaining = 1.0 - anim::spring(self.slide_progress(s, now));
         ((card.slide.0 as f64 * remaining) as i32, (card.slide.1 as f64 * remaining) as i32)
@@ -1262,16 +1402,13 @@ impl App {
         self.screens[s].slide_start.map_or(1.0, |start| anim::progress(start, self.anim_duration, now))
     }
 
-    /// Taille de la fenêtre telle qu'on la dessine : son instantané, sinon sa position mémorisée.
+    /// Taille de la fenêtre là où elle reviendra.
     fn window_size(&self, w: Wid) -> SIZE {
-        if let Some(img) = self.snapshots.get(&w) {
-            return SIZE { cx: img.w, cy: img.h };
-        }
         let rect = self.last_rects.get(&w).copied().unwrap_or_else(|| anim::restored_rect(hwnd_of(w)));
         size(rect)
     }
 
-    /// Opacité d'une carte : fondu d'apparition, fondu enchaîné avec les miniatures qui la
+    /// Opacité d'une icône : fondu d'apparition, fondu enchaîné avec les fenêtres qui la
     /// rejoignent, ou invisible pendant qu'on la déplace.
     fn card_alpha(&self, s: usize, card: &Card, now: Instant) -> u8 {
         let sc = &self.screens[s];
@@ -1286,6 +1423,28 @@ impl App {
             return anim::fade_in(self.slide_progress(s, now));
         }
         255
+    }
+
+    /// Taille d'une icône : elle grossit au survol (avec un petit rebond), surgit en arrivant
+    /// et s'enfonce sous le clic.
+    fn icon_scale(&self, s: usize, card: &Card, now: Instant) -> f64 {
+        let sc = &self.screens[s];
+        let e = sc.hover_start.map_or(1.0, |start| anim::spring(anim::progress(start, HOVER_ANIM, now)));
+        let grown = if sc.hover == Some(card.stage) {
+            e
+        } else if sc.hover_prev == Some(card.stage) {
+            1.0 - e
+        } else {
+            0.0
+        };
+        let mut scale = 1.0 + HOVER_SCALE * grown;
+        if card.fade_in {
+            scale *= 0.3 + 0.7 * anim::spring(self.slide_progress(s, now));
+        }
+        if sc.drag.as_ref().is_some_and(|d| d.stage == card.stage && d.ghost.is_none()) {
+            scale *= 0.85;
+        }
+        scale
     }
 
     fn hit(&self, s: usize, pt: POINT) -> Option<u64> {
@@ -1312,8 +1471,11 @@ impl App {
     }
 
     fn set_hover(&mut self, s: usize, hover: Option<u64>) {
-        if self.screens[s].hover != hover {
-            self.screens[s].hover = hover;
+        let sc = &mut self.screens[s];
+        if sc.hover != hover {
+            sc.hover_prev = sc.hover;
+            sc.hover = hover;
+            sc.hover_start = Some(Instant::now());
             self.render(s);
         }
     }
@@ -1330,13 +1492,16 @@ impl App {
         let Some(card) = sc.cards.iter().find(|c| !c.hidden && contains(c.rect, pt)) else { return };
         let mon = sc.rect;
         let (dx, dy) = self.card_offset(s, card, Instant::now());
-        let origin = offset(card.dest, dx + bar.left - mon.left, dy + bar.top - mon.top);
+        let icon = offset(card.dest, dx + bar.left - mon.left, dy + bar.top - mon.top);
+        let origin = fit(icon, self.window_size(card.window));
         let drag = Drag { stage: card.stage, window: card.window, start: pt, origin, ghost: None, rect: origin };
         self.screens[s].drag = Some(drag);
         unsafe {
             // Garde la souris même quand elle sort de la barre.
             SetCapture(self.screens[s].hwnd);
         }
+        // L'icône s'enfonce sous le clic.
+        self.render(s);
     }
 
     fn drag_to(&mut self, s: usize, pt: POINT) {
@@ -1350,14 +1515,14 @@ impl App {
             }
             self.begin_drag(s);
         }
-        let mon = self.screens[s].rect;
+        let (mon, bar_h) = (self.screens[s].rect, self.px(s, BAR_H));
         let Some(drag) = self.screens[s].drag.as_mut() else { return };
         let Some(ghost) = drag.ghost else { return };
         let to_overlay = |p: POINT| POINT { x: p.x + bar.left - mon.left, y: p.y + bar.top - mon.top };
         let (cursor, grab) = (to_overlay(pt), to_overlay(drag.start));
-        // La miniature grandit à mesure qu'elle s'éloigne de la barre.
-        let away = (cursor.x - (bar.right - mon.left)).max(0) as f64;
-        let scale = 1.0 + (away / 600.0).min(1.0) * 1.5;
+        // La fenêtre grandit à mesure qu'on l'éloigne de la barre.
+        let away = (cursor.y - (bar.top - mon.top + bar_h)).max(0) as f64;
+        let scale = 1.0 + (away / 300.0).min(1.0) * 9.0;
         let scaled = |v: i32| (v as f64 * scale) as i32;
         let o = drag.origin;
         let left = cursor.x - scaled(grab.x - o.left);
@@ -1374,7 +1539,7 @@ impl App {
         anim::place_thumb(ghost, drag.origin, true, 235);
         drag.ghost = Some(ghost);
         let stage = drag.stage;
-        // La carte quitte la barre pendant qu'on la déplace.
+        // L'icône quitte la barre pendant qu'on la déplace.
         self.set_card_hidden(s, stage, true);
         self.screens[s].hover = None;
         self.show_overlay(s);
@@ -1387,6 +1552,7 @@ impl App {
             let _ = ReleaseCapture();
         }
         let Some(ghost) = drag.ghost else {
+            self.render(s);
             // Simple clic : Maj ajoute la scène à la scène active.
             if self.hit(s, pt) == Some(drag.stage) {
                 let merge = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
@@ -1394,9 +1560,8 @@ impl App {
             }
             return;
         };
-        let bar_w = self.screens[s].appbar.map_or(0, |b| b.right - b.left);
-        if pt.x >= bar_w {
-            // Lâchée hors de la barre : la scène rejoint la scène active, en partant d'ici.
+        if pt.y >= self.px(s, BAR_H) {
+            // Lâchée sous la barre : la scène rejoint la scène active, en partant d'ici.
             self.screens[s].drag_source = Some(drag.rect);
             self.show_stage(drag.stage, true);
             self.screens[s].drag_source = None;
@@ -1418,7 +1583,7 @@ impl App {
         if self.screens[s].switch.is_none() {
             self.hide_overlay(s);
         }
-        // Lâchée sur la barre : la carte reprend sa place.
+        // Lâchée sur la barre : l'icône reprend sa place.
         self.set_card_hidden(s, stage, false);
     }
 
@@ -1429,116 +1594,65 @@ impl App {
         self.render(s);
     }
 
-    /// Redessine la barre d'un écran. Fond transparent : seuls les cartes, le survol et les
-    /// libellés sont visibles, posés directement sur le fond d'écran.
+    /// Redessine la barre d'un écran : une pastille noire et ses icônes, sans nom ni aperçu.
+    /// Autour, tout est transparent et laisse passer les clics.
     fn render(&self, s: usize) {
         let sc = &self.screens[s];
         let Some(bar) = sc.appbar else { return };
         let (w, h) = (bar.right - bar.left, bar.bottom - bar.top);
-        let dpi = sc.dpi;
-        let px = move |v: i32| v * dpi / 96;
-        let now = Instant::now();
-        // (carte, rectangle, miniature à plat, décalage vertical, opacité)
-        let mut cards: Vec<(&Card, RECT, RECT, i32, u8)> = sc
-            .cards
-            .iter()
-            .map(|c| {
-                let (dx, dy) = self.card_offset(s, c, now);
-                (c, offset(c.rect, dx, dy), offset(c.dest, dx, dy), dy, self.card_alpha(s, c, now))
-            })
-            .filter(|c| c.4 > 0)
-            .collect();
-        // La carte de la scène qui revient à l'écran s'efface pendant que ses fenêtres partent.
-        if let (Some(card), Some(switch)) = (&sc.departing, &sc.switch) {
-            let alpha = 255 - anim::fade_in(anim::progress(switch.start, switch.duration, now));
-            if alpha > 0 {
-                cards.push((card, card.rect, card.dest, 0, alpha));
-            }
+        if w <= 0 || h <= 0 {
+            return;
         }
+        let px = |v: i32| self.px(s, v);
+        let now = Instant::now();
+        let shown = self.bar_shown(s, now);
         let drop_target = self.drop_target == Some(sc.id);
+        let mut width = self.pill_shown_width(s, now);
+        if drop_target {
+            // Une fenêtre est traînée au-dessus : la pastille s'éclaire, même vide.
+            width = width.max(self.pill_width(s, 1));
+        }
 
         let mut canvas = Canvas::new(w, h);
-        // Alpha 1 et non 0 : invisible, mais la barre reste cliquable partout
-        // (Windows laisse passer les clics sur les pixels totalement transparents).
-        canvas.clear((0, 0, 0), 1);
-        let white = (255, 255, 255);
-        if drop_target {
-            // Une fenêtre est traînée au-dessus de la barre : la lâcher la sortira de sa scène.
-            canvas.round_rect(RECT { left: px(6), top: px(6), right: w - px(6), bottom: h - px(6) }, px(18), white, 56);
-        }
-        let solid = |r: u8, g: u8, b: u8| Image { w: 1, h: 1, px: vec![0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32] };
-        let (shadow, placeholder) = (solid(0, 0, 0), solid(58, 58, 66));
-        for &(card, rect, dest, _, alpha) in &cards {
-            let fade = |a: u8| (a as u32 * alpha as u32 / 255) as u8;
-            if sc.hover == Some(card.stage) {
-                canvas.round_rect(inflate(rect, px(8)), px(16), white, fade(46));
+        if shown > 0.0 && width > 0 {
+            // Rentrée, la pastille remonte dans le bord de l'écran.
+            let lift = ((1.0 - shown) * px(BAR_H + 4) as f64).round() as i32;
+            let pill = offset(self.pill_rect(s, width), 0, -lift);
+            let fill = if drop_target { (78, 78, 86) } else { (0, 0, 0) };
+            canvas.notch(pill, px(PILL_RADIUS) as f32, px(PILL_SHOULDER) as f32, fill, 255);
+
+            // (icône, décalage, opacité)
+            let mut icons: Vec<(&Card, (i32, i32), u8)> =
+                sc.cards.iter().map(|c| (c, self.card_offset(s, c, now), self.card_alpha(s, c, now))).collect();
+            // L'icône de la scène qui revient à l'écran s'efface pendant que ses fenêtres partent.
+            if let (Some(card), Some(switch)) = (&sc.departing, &sc.switch) {
+                icons.push((card, (0, 0), 255 - anim::fade_in(anim::progress(switch.start, switch.duration, now))));
             }
-            // Fenêtres de la scène empilées derrière, de la plus lointaine à la plus proche.
-            for (depth, &window) in card.windows.iter().enumerate().skip(1).rev() {
-                let d = depth as i32;
-                let image = self.snapshots.get(&window);
-                let area = offset(inflate(dest, -px(6) * d), 0, -px(9) * d);
-                let r = image.map_or(area, |img| fit(area, SIZE { cx: img.w, cy: img.h }));
-                let img = image.map_or(&placeholder, |i| i.as_ref());
-                canvas.draw_quad(img, tilt(r), alpha, (50 * d) as u8);
-            }
-            // Ombre douce sous la miniature, puis la miniature elle-même.
-            canvas.draw_quad(&shadow, tilt(offset(inflate(dest, px(2)), px(1), px(4))), fade(40), 0);
-            canvas.draw_quad(&shadow, tilt(offset(dest, px(1), px(2))), fade(70), 0);
-            let image = self.snapshots.get(&card.window);
-            canvas.draw_quad(image.map_or(&placeholder, |i| i.as_ref()), tilt(dest), alpha, 0);
-        }
-        canvas.gdi(|dc| unsafe {
-            SelectObject(dc, sc.font);
-            SetBkMode(dc, TRANSPARENT);
-            // Les libellés n'apparaissent qu'une fois la carte assez visible : GDI ne sait pas
-            // dessiner en semi-transparence.
-            for &(card, rect, dest, dy, _) in cards.iter().filter(|c| c.4 >= 160) {
-                if !self.snapshots.contains_key(&card.window) {
-                    // Pas d'image de la fenêtre : son icône au milieu de la carte.
-                    let big = px(32);
-                    let (cx, cy) = ((dest.left + dest.right - big) / 2, (dest.top + dest.bottom - big) / 2);
-                    let _ = DrawIconEx(dc, cx, cy, card.icon, big, big, 0, None, DI_NORMAL);
+            for (card, (dx, dy), alpha) in icons {
+                let alpha = (alpha as f64 * shown) as u8;
+                if alpha == 0 {
+                    continue;
                 }
-                let label_top = card.thumb_box.bottom + dy + px(4);
-                let icon = px(16);
-                let _ = DrawIconEx(
-                    dc,
-                    rect.left,
-                    label_top + (rect.bottom - label_top - icon) / 2,
-                    card.icon,
-                    icon,
-                    icon,
-                    0,
-                    None,
-                    DI_NORMAL,
-                );
-                let title = win::title(hwnd_of(card.window));
-                let text_rect = RECT { left: rect.left + icon + px(6), top: label_top, right: rect.right, bottom: rect.bottom };
-                let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-                draw_text(dc, &title, text_rect, flags, TEXT, px(1));
+                let r = offset(card.dest, dx, dy - lift);
+                let half = (r.right - r.left) as f64 * self.icon_scale(s, card, now) / 2.0;
+                let (cx, cy) = ((r.left + r.right) as f64 / 2.0, (r.top + r.bottom) as f64 / 2.0);
+                let (l, t, rr, b) = ((cx - half) as f32, (cy - half) as f32, (cx + half) as f32, (cy + half) as f32);
+                canvas.draw_quad(&card.icon, [(l, t), (rr, t), (rr, b), (l, b)], alpha, 0);
             }
-            let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-            if drop_target {
-                let text_rect = RECT { left: 0, top: h - px(70), right: w, bottom: h - px(30) };
-                draw_text(dc, "Lâcher pour séparer", text_rect, centered, TEXT, px(1));
-            } else if cards.is_empty() {
-                let text_rect = RECT { left: 0, top: px(20), right: w, bottom: px(60) };
-                draw_text(dc, "Aucune autre scène", text_rect, centered, TEXT_DIM, px(1));
-            }
-        });
+        }
         canvas.present(sc.hwnd, POINT { x: bar.left, y: bar.top });
     }
 }
 
 // --- Géométrie et dessin -------------------------------------------------------------
 
-/// Incline une miniature comme sur macOS : la carte pivote, son bord droit (côté écran)
-/// s'éloigne et rapetisse.
-fn tilt(r: RECT) -> [(f32, f32); 4] {
-    let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-    let (inset, squeeze) = ((b - t) * 0.11, (rr - l) * 0.07);
-    [(l, t), (rr - squeeze, t + inset), (rr - squeeze, b - inset), (l, b)]
+/// Dessine une icône Windows dans une image, pour pouvoir l'agrandir et la fondre.
+fn hicon_image(icon: HICON, size: i32) -> Image {
+    let mut canvas = Canvas::new(size, size);
+    canvas.gdi(|dc| unsafe {
+        let _ = DrawIconEx(dc, 0, 0, icon, size, size, 0, None, DI_NORMAL);
+    });
+    canvas.into_image()
 }
 
 fn contains(r: RECT, pt: POINT) -> bool {

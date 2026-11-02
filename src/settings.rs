@@ -9,13 +9,15 @@ pub enum Feature {
     Dock,
     Notch,
     Pin,
+    Float,
     Launcher,
     Corners,
 }
 
 impl Feature {
     /// Dans l'ordre de la fenêtre des réglages.
-    pub const ALL: [Feature; 6] = [Feature::Scenes, Feature::Dock, Feature::Notch, Feature::Pin, Feature::Launcher, Feature::Corners];
+    pub const ALL: [Feature; 7] =
+        [Feature::Scenes, Feature::Dock, Feature::Notch, Feature::Pin, Feature::Float, Feature::Launcher, Feature::Corners];
 
     /// Nom dans le fichier des réglages.
     fn key(self) -> &'static str {
@@ -24,6 +26,7 @@ impl Feature {
             Feature::Dock => "dock",
             Feature::Notch => "notch",
             Feature::Pin => "pin",
+            Feature::Float => "float",
             Feature::Launcher => "launcher",
             Feature::Corners => "corners",
         }
@@ -35,6 +38,7 @@ impl Feature {
             Feature::Dock => "Dock",
             Feature::Notch => "Encoche",
             Feature::Pin => "Page accrochée à l'encoche",
+            Feature::Float => "Fenêtres épinglées",
             Feature::Launcher => "Lanceur",
             Feature::Corners => "Coins arrondis",
         }
@@ -46,14 +50,16 @@ impl Feature {
             Feature::Dock => "Applis et volume en bas de l'écran, à la place de la barre des tâches",
             Feature::Notch => "L'heure et le lecteur de musique en haut de l'écran",
             Feature::Pin => "Une page web en direct dans l'encoche · Ctrl+Alt+P",
+            Feature::Float => "Glisser une fenêtre sur l'encoche la garde au premier plan",
             Feature::Launcher => "Rechercher et lancer une appli · Alt+Espace",
             Feature::Corners => "Les coins de l'écran arrondis, comme sur les Mac",
         }
     }
 
-    /// Fonctionnalité dont celle-ci a besoin pour servir : la page accrochée vit dans l'encoche.
+    /// Fonctionnalité dont celle-ci a besoin pour servir : la page accrochée vit dans l'encoche,
+    /// et c'est sur l'encoche qu'on dépose une fenêtre pour l'épingler.
     pub fn parent(self) -> Option<Feature> {
-        (self == Feature::Pin).then_some(Feature::Notch)
+        matches!(self, Feature::Pin | Feature::Float).then_some(Feature::Notch)
     }
 }
 
@@ -63,6 +69,7 @@ pub struct Features {
     pub dock: bool,
     pub notch: bool,
     pub pin: bool,
+    pub float: bool,
     pub launcher: bool,
     pub corners: bool,
 }
@@ -70,12 +77,12 @@ pub struct Features {
 impl Default for Features {
     /// Tout est activé, comme avant l'arrivée des réglages.
     fn default() -> Self {
-        Self { scenes: true, dock: true, notch: true, pin: true, launcher: true, corners: true }
+        Self { scenes: true, dock: true, notch: true, pin: true, float: true, launcher: true, corners: true }
     }
 }
 
 impl Features {
-    pub const NONE: Features = Features { scenes: false, dock: false, notch: false, pin: false, launcher: false, corners: false };
+    pub const NONE: Features = Features { scenes: false, dock: false, notch: false, pin: false, float: false, launcher: false, corners: false };
 
     pub fn get(&self, f: Feature) -> bool {
         match f {
@@ -83,6 +90,7 @@ impl Features {
             Feature::Dock => self.dock,
             Feature::Notch => self.notch,
             Feature::Pin => self.pin,
+            Feature::Float => self.float,
             Feature::Launcher => self.launcher,
             Feature::Corners => self.corners,
         }
@@ -94,6 +102,7 @@ impl Features {
             Feature::Dock => &mut self.dock,
             Feature::Notch => &mut self.notch,
             Feature::Pin => &mut self.pin,
+            Feature::Float => &mut self.float,
             Feature::Launcher => &mut self.launcher,
             Feature::Corners => &mut self.corners,
         };
@@ -155,7 +164,7 @@ mod tests {
         // Une fonctionnalité absente du fichier (ajoutée depuis) reste activée.
         let f = Features::parse("dock=0\n  notch = 0 \nbidule=0\n");
         assert!(!f.dock && !f.notch);
-        assert!(f.scenes && f.pin && f.launcher && f.corners);
+        assert!(f.scenes && f.pin && f.float && f.launcher && f.corners);
     }
 
     #[test]
@@ -164,6 +173,7 @@ mod tests {
         assert!(f.active(Feature::Pin));
         f.set(Feature::Notch, false);
         assert!(f.get(Feature::Pin) && !f.active(Feature::Pin));
+        assert!(f.get(Feature::Float) && !f.active(Feature::Float), "on dépose les fenêtres sur l'encoche");
         assert!(f.active(Feature::Dock));
     }
 }

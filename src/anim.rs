@@ -37,8 +37,10 @@ pub struct Switch {
     pub focus: Option<Wid>,
     /// Fenêtres dont on a coupé les animations de Windows le temps du changement.
     pub quiet: Vec<Wid>,
-    /// Moment où les vraies fenêtres ont été restaurées.
+    /// Moment où l'on a demandé à restaurer les vraies fenêtres.
     pub landed: Option<Instant>,
+    /// Moment où elles sont vraiment revenues (Windows les restaure en différé).
+    pub settled: Option<Instant>,
 }
 
 pub fn progress(start: Instant, duration: Duration, now: Instant) -> f64 {

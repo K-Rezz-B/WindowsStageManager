@@ -2,9 +2,9 @@
 
 Une reproduction du Stage Manager de macOS pour Windows 11, écrite en Rust.
 
-Une barre transparente sur le bord gauche de chaque écran affiche les autres « scènes » sous forme
-de cartes inclinées en perspective, comme sur macOS, posées sur le fond d'écran. La scène active reste seule à l'écran ;
-les autres sont réduites.
+Une petite pastille noire en haut de chaque écran, collée à gauche de l'encoche, montre les autres
+« scènes » par leur seule icône : ni nom, ni aperçu. La scène active reste seule à l'écran ; les
+autres sont réduites.
 
 ## Installation
 
@@ -42,12 +42,12 @@ nouvelle machine, tout est activé.
 cargo run --release
 ```
 
-- **Clic** sur une miniature : affiche cette scène et range la scène active dans la barre.
-- **Glisser une miniature hors de la barre** (ou Maj + clic, ou clic droit → « Ajouter à la
+- **Clic** sur une icône : affiche cette scène et range la scène active dans la barre.
+- **Glisser une icône vers le bas, hors de la barre** (ou Maj + clic, ou clic droit → « Ajouter à la
   scène active ») : regroupe les fenêtres de cette scène avec la scène active. La relâcher
   sur la barre annule.
 - **Séparer une fenêtre de sa scène** : la faire glisser par sa barre de titre jusque sur la
-  barre latérale (qui s'éclaire), ou **Ctrl + Alt + D** sur la fenêtre active. Elle rejoint la
+  pastille d'icônes (qui s'éclaire), ou **Ctrl + Alt + D** sur la fenêtre active. Elle rejoint la
   barre comme scène à part, et reviendra à sa place d'origine quand on la rouvrira.
 - **Clic droit sur une carte → « Séparer les fenêtres »** : éclate une scène regroupée en une
   scène par fenêtre.
@@ -68,12 +68,27 @@ cargo run --release
   est lancé sans sa détection des fenêtres cachées : la page continue de se dessiner.
   L'encoche fermée affiche son titre ; pour TradingView, le symbole, le cours et la variation
   du jour (en vert ou en rouge). Ouverte, elle montre la page en direct, sous le lecteur.
-  Un clic sur l'encoche amène la page à l'écran, au premier plan ; elle retourne au garage au
-  clic suivant ou dès qu'une autre fenêtre passe devant (la réduire la gare aussi). Sa taille
-  règle le zoom de l'aperçu. Fermée, elle se rouvre d'un clic sur l'encoche, et au démarrage
-  du Stage Manager. Ctrl + Alt + P sur la page elle-même (ou clic droit → « Décrocher la
-  page ») la ferme et la décroche. L'adresse est enregistrée dans
+  Un clic sur l'encoche amène la page à l'écran de cette encoche, au premier plan ; elle
+  retourne au garage au clic suivant ou dès qu'une autre fenêtre passe devant (la réduire la
+  gare aussi). Sa taille règle le zoom de l'aperçu. Fermée, elle se rouvre d'un clic sur
+  l'encoche, et au démarrage du Stage Manager. Ctrl + Alt + P sur la page elle-même (ou clic
+  droit → « Décrocher la page ») la ferme et la décroche. L'adresse est enregistrée dans
   `%APPDATA%\StageManager\notch.txt`.
+- **Fenêtres épinglées** : faites glisser n'importe quelle fenêtre (par sa barre de titre) vers
+  le haut de l'écran. L'encoche s'élargit en zone de dépôt (« Déposer ici pour épingler », une
+  punaise qui sautille), puis grandit et passe au bleu quand la fenêtre est au-dessus. Lâchée là,
+  la fenêtre reprend sa place d'avant et reste **au premier plan**, devant toutes les autres.
+  La réduire (bouton de réduction, Win + Bas) la change en **vignette** en direct dans le coin
+  en haut à droite de son écran, avec son titre (le cours, pour la page TradingView). Un clic sur
+  la vignette rouvre la fenêtre ; sa croix la désépingle. Redéposer la fenêtre sur l'encoche la
+  désépingle aussi. Une seule fenêtre épinglée à la fois ; la vignette s'efface devant un jeu
+  ou une vidéo en plein écran. La page accrochée s'épingle de la même façon (un clic sur
+  l'encoche la fait alors passer de l'écran à sa vignette).
+  La barre d'ancrage de Windows 11 qui descend au même endroit est coupée (réglage « Afficher
+  les dispositions d'ancrage… en haut de l'écran », remis comme avant si on désactive la
+  fonctionnalité). Windows ne relit ce réglage qu'à l'ouverture de session : pour qu'il
+  s'applique tout de suite, décochez-le dans Paramètres > Système > Multitâche > Ancrer les
+  fenêtres.
 - **Coins de l'écran arrondis**, comme sur les Mac : un quart de cercle noir dans chaque coin
   (20 pixels à 100 %), par-dessus tout, que la souris traverse. Ils s'effacent devant un jeu ou
   une vidéo en plein écran, pour ne pas lui ajouter de latence.
@@ -95,8 +110,9 @@ cargo run --release
   pour retrouver l'horloge et les icônes de notification.
 - **Réglages** : chaque fonctionnalité s'active ou se désactive avec son interrupteur, à la
   manière de macOS — le Stage Manager (les scènes et leur barre), le Dock, l'encoche, la page
-  accrochée (grisée sans l'encoche), le lanceur, les coins arrondis — ainsi que le lancement au
-  démarrage de Windows. Le changement est immédiat : sans les scènes, toutes les fenêtres
+  accrochée et les fenêtres épinglées (grisées sans l'encoche), le lanceur, les coins arrondis —
+  ainsi que le lancement au démarrage de Windows. Le changement est immédiat : sans les
+  scènes, toutes les fenêtres
   sont restaurées ; sans le Dock, la barre des tâches de Windows revient ; sans le lanceur,
   Alt + Espace retrouve son rôle habituel. Les réglages s'ouvrent d'un clic sur l'icône de
   notification, par le clic droit sur l'encoche, ou en relançant l'application. Ils sont
@@ -130,8 +146,8 @@ et intégré à l'exécutable par `build.rs`.
 Au démarrage, les fenêtres ouvertes sont regroupées par application et par écran : une scène
 par appli sur chaque écran.
 
-**Plusieurs écrans** : chaque écran a son propre Stage Manager, comme sur macOS — sa barre sur
-son bord gauche, ses scènes et sa scène active. Changer de scène sur un écran ne touche pas aux
+**Plusieurs écrans** : chaque écran a son propre Stage Manager, comme sur macOS — sa pastille
+d'icônes près de son encoche, ses scènes et sa scène active. Changer de scène sur un écran ne touche pas aux
 autres. Une fenêtre déplacée sur un autre écran (à la souris ou avec Win + Maj + flèche) quitte
 sa scène et rejoint la scène active de son nouvel écran ; les nouvelles fenêtres rejoignent les
 scènes de l'écran où elles s'ouvrent. Un écran débranché confie ses scènes à l'écran principal,
@@ -152,10 +168,12 @@ En quittant (ou en cas de plantage), toutes les fenêtres réduites par l'applic
 
 ## Animations
 
-Quand on change de scène, les fenêtres sortantes rejoignent la barre et les fenêtres entrantes
-en partent pour reprendre leur place ; les cartes de la barre glissent pour se réorganiser.
-Les mouvements suivent un ressort amorti (léger dépassement puis retour, comme sur macOS) et
-les miniatures qui apparaissent arrivent en fondu.
+Quand on change de scène, les fenêtres sortantes rapetissent jusqu'à leur icône et les fenêtres
+entrantes en jaillissent pour reprendre leur place ; les icônes glissent pour se réorganiser et
+la pastille s'allonge ou se resserre avec elles. Une icône qui arrive surgit en grandissant,
+l'icône survolée grossit avec un petit rebond, et s'enfonce sous le clic. Quand l'encoche
+s'ouvre, la pastille remonte dans le bord de l'écran pour lui laisser la place.
+Les mouvements suivent un ressort amorti (léger dépassement puis retour, comme sur macOS).
 La durée (650 ms par défaut) se règle avec une variable d'environnement, `0` pour les couper :
 
 ```bash
@@ -173,7 +191,7 @@ rafraîchissement de l'écran (`DwmFlush`).
 |---|---|
 | `src/stages.rs` | Modèle des scènes (une scène active par écran), sans Win32, couvert par des tests (`cargo test`) |
 | `src/win.rs` | Utilitaires Win32 : filtrage des fenêtres, processus, icônes, premier plan |
-| `src/app.rs` | Barres latérales (AppBar), miniatures DWM, icône de notification, événements |
+| `src/app.rs` | Barre d'icônes des scènes près de l'encoche, miniatures DWM, icône de notification, événements |
 | `src/app/screens.rs` | Écrans : une barre, un overlay et une encoche par écran, branchements, plein écran |
 | `src/anim.rs` | Animations : fenêtre transparente, trajectoires, courbes d'accélération |
 | `src/canvas.rs` | Dessin avec transparence par pixel pour la barre, projection en perspective |
@@ -181,10 +199,12 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/app/dockbar.rs` | Fenêtre du Dock : place réservée, dessin, clics, menu |
 | `src/shell.rs` | Raccourcis épinglés, grandes icônes, noms d'applis, lancement, corbeille |
 | `src/taskbar.rs` | Masquage automatique de la barre des tâches, et sa remise en état |
+| `src/snapbar.rs` | Barre d'ancrage de Windows 11 coupée, et sa remise en état |
 | `src/wallpaper.rs` | Fond d'écran derrière le Dock, flouté, pour la teinte des panneaux (fil à part) |
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
 | `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
 | `src/app/notch.rs` | Encoche en haut de chaque écran : formes, animation, lecteur complet |
+| `src/app/float.rs` | Fenêtres épinglées : glisser vers l'encoche, premier plan, vignette dans le coin |
 | `src/app/pin.rs` | Page accrochée à l'encoche : fenêtre Chrome dédiée, garage hors écran, cours |
 | `src/app/corners.rs` | Coins arrondis de l'écran |
 | `src/settings.rs` | Fonctionnalités activées ou non, et leur enregistrement (testé) |
@@ -197,8 +217,8 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/main.rs` | Point d'entrée, instance unique |
 
 Briques Windows utilisées : `SetWinEventHook` (focus, réduction, fermeture),
-`DwmRegisterThumbnail` (miniatures en direct), `SHAppBarMessage` (réserver le bord de l'écran
-comme la barre des tâches), `ShowWindowAsync` (une appli figée ne bloque pas la nôtre).
+`DwmRegisterThumbnail` (miniatures en direct), `SHAppBarMessage` (être prévenu des applis plein
+écran), `ShowWindowAsync` (une appli figée ne bloque pas la nôtre).
 
 ## Limites connues
 
@@ -208,9 +228,7 @@ comme la barre des tâches), `ShowWindowAsync` (une appli figée ne bloque pas l
 - L'encoche recouvre le milieu du haut de l'écran (environ 190 × 32 pixels à 100 %) : un clic
   à cet endroit l'ouvre au lieu d'atteindre la fenêtre en dessous (onglet, barre de titre).
 - Les bureaux virtuels ne sont pas encore pris en compte.
-- Les cartes de la barre sont des instantanés pris quand la fenêtre a quitté l'écran (les
-  miniatures DWM, elles, ne peuvent pas être inclinées) : elles ne suivent pas les changements
-  de contenu d'une fenêtre réduite. Pendant le trajet, les miniatures restent plates et se
-  fondent dans la carte inclinée à l'arrivée.
+- La barre montre au plus 8 scènes. Une scène qui regroupe plusieurs applis n'affiche que
+  l'icône de sa fenêtre la plus récente.
 - Les applis Chromium/Electron (Discord, Chrome…) cessent de se dessiner quand elles restent
   longtemps réduites : leur miniature volante peut être noire au début du trajet.

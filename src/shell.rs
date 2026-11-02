@@ -174,7 +174,7 @@ fn file_description(path: &str) -> Option<String> {
 }
 
 /// Grande icône (256 px demandés, réduite à 128) d'un fichier, d'un raccourci ou d'un dossier shell.
-fn big_icon(path: &str) -> Option<Image> {
+pub fn big_icon(path: &str) -> Option<Image> {
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(path), None).ok()?;
         let bmp = factory.GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;

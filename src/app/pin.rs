@@ -4,6 +4,9 @@
 //! Garée plutôt que réduite : une fenêtre réduite ne se dessine plus. Chrome, lui, cesse de
 //! dessiner une page qu'il croit cachée : on le lance dans son propre profil, sans quoi il
 //! rejoindrait le Chrome déjà ouvert et ignorerait nos options, avec cette détection coupée.
+//!
+//! Déposée sur l'encoche, elle s'épingle au premier plan comme n'importe quelle fenêtre (voir
+//! `float`) : elle n'est alors plus garée quand une autre fenêtre passe devant.
 
 use std::path::{Path, PathBuf};
 
@@ -38,7 +41,7 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const PARK_GAP: i32 = 200;
 /// Hauteur de la barre de titre des fenêtres d'appli de Chrome, en pixels à 100 % : on la
 /// coupe de l'aperçu.
-const TITLE_BAR: i32 = 33;
+pub(super) const TITLE_BAR: i32 = 33;
 
 /// Fenêtre garée, sa place à l'écran et si elle était agrandie : à lui rendre quoi qu'il
 /// arrive en quittant.
@@ -88,15 +91,18 @@ pub(super) struct Ticker {
 
 pub(super) fn parse_ticker(title: &str) -> Option<Ticker> {
     let words: Vec<&str> = title.split_whitespace().collect();
-    let (symbol, price) = (words.first()?, words.get(1)?);
-    if !price.starts_with(|c: char| c.is_ascii_digit()) {
+    let symbol = words.first()?;
+    // En français, TradingView sépare les milliers par une espace : « 3 899,44 ».
+    let digits = words[1..].iter().take_while(|w| w.starts_with(|c: char| c.is_ascii_digit())).count();
+    if digits == 0 {
         return None;
     }
-    let change = match (words.get(2), words.get(3)) {
+    let price = words[1..=digits].join("\u{a0}");
+    let change = match (words.get(digits + 1), words.get(digits + 2)) {
         (Some(&arrow), Some(change)) if arrow == "▲" || arrow == "▼" => Some((change.to_string(), arrow == "▲")),
         _ => None,
     };
-    Some(Ticker { symbol: symbol.to_string(), price: price.to_string(), change })
+    Some(Ticker { symbol: symbol.to_string(), price, change })
 }
 
 impl App {
@@ -219,10 +225,10 @@ impl App {
         }
         let mut fast = self.pin.launching.is_some();
         if let Some(h) = self.pin.hwnd {
-            if win::is_minimized(h) {
-                // Réduite, elle ne se dessinerait plus : on la rouvre, garée.
-                win::show(h, SW_SHOWNOACTIVATE);
-                self.pin.peek = false;
+            if self.float.hwnd == Some(h) {
+                // Épinglée : c'est `float` qui la montre ou la réduit.
+            } else if win::is_minimized(h) {
+                self.pin_minimized(h);
                 fast = true;
             } else if !self.pin.peek && !is_parked(h) {
                 self.park(h);
@@ -249,24 +255,34 @@ impl App {
     pub(super) fn pin_event(&mut self, event: u32, h: HWND) -> bool {
         let Some(pinned) = self.pin.hwnd.filter(|_| self.features.active(Feature::Pin)) else { return false };
         if h != pinned {
-            // Une autre appli passe au premier plan : la page retourne au garage.
-            if event == EVENT_SYSTEM_FOREGROUND && self.pin.peek && win::pid(h) != win::pid(pinned) && win::is_app_window(h) {
+            // Une autre appli passe au premier plan : la page retourne au garage, sauf si elle
+            // est épinglée.
+            if event == EVENT_SYSTEM_FOREGROUND
+                && self.pin.peek
+                && self.float.hwnd != Some(pinned)
+                && win::pid(h) != win::pid(pinned)
+                && win::is_app_window(h)
+            {
                 self.park(pinned);
             }
             return false;
         }
         match event {
             // Choisie avec Alt+Tab : elle revient à l'écran.
-            EVENT_SYSTEM_FOREGROUND if !self.pin.peek => self.unpark(false),
-            EVENT_SYSTEM_MINIMIZESTART => {
-                win::show(pinned, SW_SHOWNOACTIVATE);
-                self.pin.peek = false;
-                self.pin_poll_soon();
-            }
+            EVENT_SYSTEM_FOREGROUND if !self.pin.peek => self.unpark(false, None),
+            EVENT_SYSTEM_MINIMIZESTART => self.pin_minimized(pinned),
             EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY => self.pin_poll_soon(),
             _ => {}
         }
         true
+    }
+
+    /// Réduite (bouton de réduction, Win + Bas…), la page ne se dessinerait plus : on la
+    /// rouvre aussitôt, garée.
+    fn pin_minimized(&mut self, h: HWND) {
+        win::show(h, SW_SHOWNOACTIVATE);
+        self.pin.peek = false;
+        self.pin_poll_soon();
     }
 
     fn pin_poll_soon(&mut self) {
@@ -287,41 +303,54 @@ impl App {
     /// Pousse la fenêtre hors de l'écran, où elle continue de se dessiner.
     fn park(&mut self, h: HWND) {
         self.pin.peek = false;
-        if is_parked(h) {
-            return;
-        }
-        unsafe {
-            let maximized = IsZoomed(h).as_bool();
-            if maximized {
-                // Une fenêtre agrandie ne se déplace pas : on lui rend sa taille normale.
-                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
-            }
-            let home = anim::window_rect(h);
-            *PARKED.lock().unwrap_or_else(|e| e.into_inner()) = Some((h.0 as isize, home, maximized));
-            let x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + PARK_GAP;
-            let _ = SetWindowPos(h, None, x, home.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            // Le clavier ne doit pas rester sur une page invisible.
-            if GetForegroundWindow() == h {
-                if let Some(next) = self.window_below(h) {
-                    win::force_foreground(next);
+        if !is_parked(h) {
+            unsafe {
+                let maximized = IsZoomed(h).as_bool();
+                if maximized {
+                    // Une fenêtre agrandie ne se déplace pas : on lui rend sa taille normale.
+                    let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                }
+                let home = anim::window_rect(h);
+                *PARKED.lock().unwrap_or_else(|e| e.into_inner()) = Some((h.0 as isize, home, maximized));
+                let x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + PARK_GAP;
+                let _ = SetWindowPos(h, None, x, home.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                // Le clavier ne doit pas rester sur une page invisible.
+                if GetForegroundWindow() == h {
+                    if let Some(next) = self.window_below(h) {
+                        win::force_foreground(next);
+                    }
                 }
             }
         }
     }
 
-    /// Ramène la fenêtre à sa place à l'écran.
-    fn unpark(&mut self, focus: bool) {
+    /// Ramène la fenêtre à sa place à l'écran. `screen` : l'écran où on la demande (celui de
+    /// l'encoche cliquée…) ; garée depuis un autre écran, elle y arrive, au milieu.
+    fn unpark(&mut self, focus: bool, screen: Option<ScreenId>) {
         let Some(h) = self.pin.hwnd else { return };
         self.pin.peek = true;
-        restore_parked();
-        if is_parked(h) {
-            // Jamais vue à l'écran (lancée garée) : au milieu de l'écran principal.
+        let target = screen.and_then(|id| self.screen_index(id)).map(|s| self.screens[s].handle);
+        let parked = (*PARKED.lock().unwrap_or_else(|e| e.into_inner())).filter(|p| p.0 == h.0 as isize);
+        let elsewhere = parked
+            .zip(target)
+            .is_some_and(|((_, home, _), monitor)| unsafe { MonitorFromRect(&home, MONITOR_DEFAULTTONEAREST) } != monitor);
+        if elsewhere {
+            PARKED.lock().unwrap_or_else(|e| e.into_inner()).take();
+        } else {
+            restore_parked();
+        }
+        if elsewhere || is_parked(h) {
+            // Jamais vue à l'écran (lancée garée), ou ailleurs : au milieu de l'écran demandé (de
+            // l'écran principal, à défaut).
             let r = anim::window_rect(h);
             let (w, hh) = (r.right - r.left, r.bottom - r.top);
-            let work = work_area();
+            let work = target.map_or_else(work_area, monitor_work);
             let (x, y) = ((work.left + work.right - w) / 2, (work.top + work.bottom - hh) / 2);
             unsafe {
-                let _ = SetWindowPos(h, None, x, y.max(work.top), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = SetWindowPos(h, None, x.max(work.left), y.max(work.top), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                if elsewhere && parked.is_some_and(|p| p.2) {
+                    let _ = ShowWindow(h, SW_MAXIMIZE);
+                }
             }
         }
         if focus {
@@ -330,7 +359,7 @@ impl App {
     }
 
     /// Première fenêtre d'appli visible sous `h`, pour lui passer le clavier.
-    fn window_below(&mut self, h: HWND) -> Option<HWND> {
+    pub(super) fn window_below(&mut self, h: HWND) -> Option<HWND> {
         let mut next = h;
         loop {
             next = unsafe { GetWindow(next, GW_HWNDNEXT) }.ok()?;
@@ -340,16 +369,18 @@ impl App {
         }
     }
 
-    /// Clic sur l'encoche : montre la page, la regare, ou la rouvre si on l'a fermée.
-    pub(super) fn pin_toggle(&mut self) {
+    /// Clic sur l'encoche de l'écran `screen` : montre la page sur cet écran, la regare, ou la
+    /// rouvre si on l'a fermée. Épinglée, elle passe de l'écran à sa vignette, et inversement.
+    pub(super) fn pin_toggle(&mut self, screen: ScreenId) {
         if self.pin.url.is_none() {
             return;
         }
         match self.pin.hwnd {
             None if self.pin.launching.is_none() => self.pin_launch(true),
             None => {}
+            Some(h) if self.float.hwnd == Some(h) => self.toggle_float_reduced(),
             Some(h) if self.pin.peek => self.park(h),
-            Some(_) => self.unpark(true),
+            Some(_) => self.unpark(true, Some(screen)),
         }
     }
 
@@ -392,6 +423,9 @@ impl App {
     /// confirmation avant de se fermer.
     fn close_pin_window(&mut self) {
         let Some(h) = self.pin.hwnd.take() else { return };
+        if self.float.hwnd == Some(h) {
+            self.unpin_float();
+        }
         self.notch_drop_thumb();
         restore_parked();
         self.pin.peek = false;
@@ -434,30 +468,35 @@ impl App {
     /// Partie de la fenêtre à montrer dans l'encoche (sans ses bordures invisibles ni sa
     /// barre de titre), en coordonnées de la fenêtre, et sa taille.
     pub(super) fn pin_source(&self) -> Option<RECT> {
-        let h = self.pin.hwnd?;
-        let window = anim::window_rect(h);
-        let mut frame = RECT::default();
-        let ok = unsafe {
-            DwmGetWindowAttribute(
-                h,
-                DWMWA_EXTENDED_FRAME_BOUNDS,
-                &mut frame as *mut RECT as *mut core::ffi::c_void,
-                size_of::<RECT>() as u32,
-            )
-        }
-        .is_ok();
-        if !ok {
-            frame = window;
-        }
-        let dpi = unsafe { GetDpiForWindow(h) }.max(96) as i32;
-        let source = RECT {
-            left: frame.left - window.left,
-            top: frame.top - window.top + TITLE_BAR * dpi / 96,
-            right: frame.right - window.left,
-            bottom: frame.bottom - window.top,
-        };
-        (source.right > source.left && source.bottom > source.top).then_some(source)
+        window_source(self.pin.hwnd?, TITLE_BAR)
     }
+}
+
+/// Partie visible d'une fenêtre pour une miniature DWM, en coordonnées de la fenêtre : sans ses
+/// bordures invisibles, ni les `title_bar` premiers pixels (à 100 %) de sa barre de titre.
+pub(super) fn window_source(h: HWND, title_bar: i32) -> Option<RECT> {
+    let window = anim::window_rect(h);
+    let mut frame = RECT::default();
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            h,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut frame as *mut RECT as *mut core::ffi::c_void,
+            size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok();
+    if !ok {
+        frame = window;
+    }
+    let dpi = unsafe { GetDpiForWindow(h) }.max(96) as i32;
+    let source = RECT {
+        left: frame.left - window.left,
+        top: frame.top - window.top + title_bar * dpi / 96,
+        right: frame.right - window.left,
+        bottom: frame.bottom - window.top,
+    };
+    (source.right > source.left && source.bottom > source.top).then_some(source)
 }
 
 /// Rend sa place à la fenêtre garée (en quittant, en désactivant…).
@@ -475,7 +514,7 @@ pub(super) fn restore_parked() {
     }
 }
 
-fn is_parked(h: HWND) -> bool {
+pub(super) fn is_parked(h: HWND) -> bool {
     let right = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) };
     anim::window_rect(h).left >= right
 }
@@ -486,6 +525,15 @@ fn work_area() -> RECT {
         let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut RECT as *mut core::ffi::c_void), Default::default());
     }
     work
+}
+
+/// Zone de travail d'un écran : sans la barre des tâches, le Dock ni la barre des scènes.
+pub(super) fn monitor_work(monitor: HMONITOR) -> RECT {
+    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        let _ = GetMonitorInfoW(monitor, &mut info);
+    }
+    info.rcWork
 }
 
 // --- Chrome ------------------------------------------------------------------------------
@@ -649,6 +697,9 @@ mod tests {
         let t = parse_ticker("AAPL 231.5 ▼ −1.2% Ma disposition").unwrap();
         assert_eq!(t.change, Some(("−1.2%".into(), false)));
         assert_eq!(parse_ticker("EURUSD 1.0832").unwrap().change, None);
+        let t = parse_ticker("XAUUSD 3\u{202f}899,44 ▲ +0.61% Anonyme").unwrap();
+        assert_eq!(t.price, "3\u{a0}899,44", "milliers séparés par une espace, à la française");
+        assert_eq!(t.change, Some(("+0.61%".into(), true)));
         assert_eq!(parse_ticker("TradingView"), None);
         assert_eq!(parse_ticker("Graphiques en direct"), None);
     }

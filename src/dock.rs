@@ -99,7 +99,7 @@ pub struct Metrics {
 impl Metrics {
     pub fn new(dpi: i32) -> Self {
         let s = dpi as f32 / 96.0;
-        let (icon, max, pad) = (50.0 * s, 84.0 * s, 7.0 * s);
+        let (icon, max, pad) = (48.0 * s, 84.0 * s, 5.0 * s);
         let body_h = icon + 2.0 * pad;
         // La fenêtre s'arrête 3 px au-dessus du bas de l'écran : on y laisse la souris réveiller
         // la barre des tâches masquée.

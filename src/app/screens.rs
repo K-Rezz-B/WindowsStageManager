@@ -58,14 +58,26 @@ pub(super) struct Screen {
     pub hwnd: HWND,
     /// Fenêtre transparente qui porte les miniatures animées.
     pub overlay: HWND,
-    /// Place réservée sur le bord gauche, quand les scènes sont en service.
+    /// Position de la barre des scènes (en haut, près de l'encoche), quand elles sont en service.
     pub appbar: Option<RECT>,
+    /// La barre est calée contre l'encoche (sinon centrée en haut de l'écran).
+    pub bar_anchored: bool,
+    /// Largeur de la pastille au début et à la fin de son animation.
+    pub pill_from: i32,
+    pub pill_to: i32,
     pub font: HFONT,
     pub cards: Vec<Card>,
     /// Carte de la scène qui revient à l'écran : elle s'efface pendant que ses fenêtres partent.
     pub departing: Option<Card>,
     pub layout_key: LayoutKey,
     pub hover: Option<u64>,
+    /// Icône survolée juste avant : elle reprend sa taille pendant que l'autre grossit.
+    pub hover_prev: Option<u64>,
+    pub hover_start: Option<Instant>,
+    /// La pastille rentre dans le bord de l'écran pendant que l'encoche est ouverte.
+    pub veiled: bool,
+    pub veil_from: f64,
+    pub veil_start: Option<Instant>,
     pub tracking_mouse: bool,
     /// Après un changement de scène sur cet écran, on ignore les événements parasites qu'il
     /// provoque.
@@ -116,11 +128,19 @@ impl Screen {
             hwnd,
             overlay,
             appbar: None,
+            bar_anchored: false,
+            pill_from: 0,
+            pill_to: 0,
             font: HFONT::default(),
             cards: Vec::new(),
             departing: None,
             layout_key: Vec::new(),
             hover: None,
+            hover_prev: None,
+            hover_start: None,
+            veiled: false,
+            veil_from: 1.0,
+            veil_start: None,
             tracking_mouse: false,
             guard_until: Instant::now(),
             switch: None,
@@ -218,6 +238,9 @@ impl App {
             self.corners.show(self.monitor);
         }
         self.pin_displays_changed();
+        // La vignette de la fenêtre épinglée regagne son coin (celui de l'écran principal, si
+        // son écran est débranché).
+        self.render_vignette();
         self.refresh_all();
     }
 
@@ -259,8 +282,10 @@ impl App {
                 let _ = ShowWindow(self.screens[s].hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
             }
         }
-        // L'encoche n'est pas une barre réservée : elle suit la barre de son écran.
+        // L'encoche n'est pas une barre réservée : elle suit la barre de son écran. La vignette
+        // de la fenêtre épinglée aussi, si elle est dans son coin.
         self.notch_fullscreen(s, fullscreen);
+        self.render_vignette();
         // Les coins aussi : posés sur un jeu, ils l'obligeraient à passer par la composition du
         // bureau (un peu plus de latence).
         if self.screens[s].primary {

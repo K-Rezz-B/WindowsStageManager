@@ -97,11 +97,11 @@ impl Canvas {
         Self { w, h, px: vec![0; (w.max(0) * h.max(0)) as usize] }
     }
 
-    pub fn clear(&mut self, rgb: (u8, u8, u8), alpha: u8) {
-        self.px.fill(premul(rgb, alpha));
+    /// L'image dessinée, pour la réutiliser ailleurs (une icône à agrandir…).
+    pub fn into_image(self) -> Image {
+        Image { w: self.w, h: self.h, px: self.px }
     }
 
-    /// Rectangle arrondi translucide posé par-dessus, avec des coins lissés.
     pub fn round_rect(&mut self, r: RECT, radius: i32, rgb: (u8, u8, u8), alpha: u8) {
         let rad = radius.min((r.right - r.left) / 2).min((r.bottom - r.top) / 2).max(0) as f32;
         let (left, top, right, bottom) = (r.left as f32 + rad, r.top as f32 + rad, r.right as f32 - rad, r.bottom as f32 - rad);

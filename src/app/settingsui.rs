@@ -36,6 +36,7 @@ const SECTIONS: [(&str, &[Row]); 2] = [
             Row::Feature(Feature::Dock),
             Row::Feature(Feature::Notch),
             Row::Feature(Feature::Pin),
+            Row::Feature(Feature::Float),
             Row::Feature(Feature::Launcher),
             Row::Feature(Feature::Corners),
         ],
