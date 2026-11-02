@@ -2,6 +2,7 @@
 //! pendant que les vraies fenêtres sont réduites ou restaurées en coulisse.
 
 use std::{
+    cell::Cell,
     ffi::c_void,
     mem::size_of,
     time::{Duration, Instant},
@@ -12,9 +13,54 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::{Dwm::*, Gdi::*},
+        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         UI::WindowsAndMessaging::*,
     },
 };
+
+thread_local! {
+    /// Moment où l'image en préparation sera affichée (voir `begin_frame`).
+    static FRAME: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Heure à laquelle dessiner les animations : pendant une image, le moment où elle arrivera à
+/// l'écran ; sinon, maintenant.
+pub fn now() -> Instant {
+    FRAME.with(Cell::get).unwrap_or_else(Instant::now)
+}
+
+/// Début d'une image d'animation : toutes les positions sont calculées pour la prochaine
+/// synchronisation de l'écran, et non pour l'instant (variable) où l'on se met à dessiner.
+/// Les images sont ainsi régulièrement espacées dans le mouvement, sans saccades.
+pub fn begin_frame() -> Instant {
+    let at = next_vblank().unwrap_or_else(Instant::now);
+    FRAME.with(|f| f.set(Some(at)));
+    at
+}
+
+pub fn end_frame() {
+    FRAME.with(|f| f.set(None));
+}
+
+/// Prochaine synchronisation verticale, d'après le compositeur de Windows.
+fn next_vblank() -> Option<Instant> {
+    let now = Instant::now();
+    unsafe {
+        let mut info = DWM_TIMING_INFO { cbSize: size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
+        DwmGetCompositionTimingInfo(None, &mut info).ok()?;
+        let (mut qpc, mut freq) = (0i64, 0i64);
+        QueryPerformanceCounter(&mut qpc).ok()?;
+        QueryPerformanceFrequency(&mut freq).ok()?;
+        let (vblank, period) = (info.qpcVBlank as i64, info.qpcRefreshPeriod as i64);
+        if period <= 0 || freq <= 0 || vblank <= 0 {
+            return None;
+        }
+        let next = if vblank > qpc { vblank } else { vblank + ((qpc - vblank) / period + 1) * period };
+        let ahead = Duration::from_secs_f64((next - qpc) as f64 / freq as f64);
+        // Valeurs incohérentes (écran en veille…) : on s'en tient à maintenant.
+        (ahead < Duration::from_millis(100)).then(|| now + ahead)
+    }
+}
 
 use crate::stages::Wid;
 

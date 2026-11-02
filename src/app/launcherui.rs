@@ -360,7 +360,7 @@ fn capture_screen(rect: RECT, blur: i32) -> Option<Image> {
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     unsafe {
         let screen = GetDC(None);
-        let dib = Dib::new(screen, w, h);
+        let dib = Dib::new(w, h);
         let image = dib.map(|dib| {
             let _ = BitBlt(dib.dc, 0, 0, w, h, screen, rect.left, rect.top, SRCCOPY | CAPTUREBLT);
             let _ = GdiFlush();

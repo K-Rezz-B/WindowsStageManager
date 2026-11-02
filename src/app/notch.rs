@@ -487,7 +487,7 @@ impl App {
             return;
         }
         self.update_notch_art(s);
-        let now = Instant::now();
+        let now = anim::now();
         let n = &self.screens[s].notch;
         let px = |v: i32| n.s(v);
         let k = n.dpi as f32 / 96.0;

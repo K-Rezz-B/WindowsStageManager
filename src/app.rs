@@ -208,6 +208,9 @@ struct App {
     last_rects: HashMap<Wid, RECT>,
     /// Peut-on piloter les fenêtres de ce processus ? (pas s'il est admin et nous non)
     manageable: HashMap<u32, bool>,
+    /// Exécutable de chaque processus (clé d'application), relu seulement pour un nouveau
+    /// processus : on le demande à chaque changement de premier plan.
+    process_paths: HashMap<u32, Option<String>>,
     self_elevated: bool,
     /// Icône de chaque fenêtre de la barre, et celle de chaque appli (par chemin).
     icons: HashMap<Wid, Rc<Image>>,
@@ -260,6 +263,7 @@ impl App {
             pending_minimize: HashSet::new(),
             last_rects: HashMap::new(),
             manageable: HashMap::new(),
+            process_paths: HashMap::new(),
             self_elevated: win::is_elevated(None).unwrap_or(false),
             icons: HashMap::new(),
             app_icons: HashMap::new(),
@@ -567,7 +571,19 @@ impl App {
             return None;
         }
         let pid = win::app_pid(h);
-        Some(win::process_path(pid).unwrap_or_else(|| format!("pid:{pid}")))
+        Some(self.process_path(pid).unwrap_or_else(|| format!("pid:{pid}")))
+    }
+
+    fn process_path(&mut self, pid: u32) -> Option<String> {
+        self.process_paths.entry(pid).or_insert_with(|| win::process_path(pid)).clone()
+    }
+
+    /// Oublie ce qu'on sait des processus qui n'ont plus de fenêtre : leur numéro peut être
+    /// redonné à un autre programme.
+    fn forget_processes(&mut self, windows: &[HWND]) {
+        let alive: HashSet<u32> = windows.iter().map(|&h| win::pid(h)).collect();
+        self.manageable.retain(|pid, _| alive.contains(pid));
+        self.process_paths.retain(|pid, _| alive.contains(pid));
     }
 
     fn on_event(&mut self, event: u32, h: HWND) {
@@ -764,6 +780,8 @@ impl App {
     /// suit celles passées sur un autre écran sans qu'on le voie (Win + Maj + flèche…).
     fn rescan(&mut self) {
         // Le Dock suit les applis ouvertes, avec ou sans les scènes.
+        let windows = win::top_level_windows();
+        self.forget_processes(&windows);
         self.update_running();
         if !self.features.scenes {
             return;
@@ -773,7 +791,7 @@ impl App {
                 self.forget(w);
             }
         }
-        for h in win::top_level_windows() {
+        for h in windows {
             let w = wid_of(h);
             if win::is_minimized(h) {
                 continue;
@@ -794,9 +812,8 @@ impl App {
                 }
             }
         }
+        // Les barres ne montrent que des icônes : elles ne changent qu'avec leurs scènes.
         self.refresh_all();
-        // Les titres des fenêtres ont pu changer.
-        self.render_all();
     }
 
     fn show_stage(&mut self, stage: u64, merge: bool) {
@@ -1009,19 +1026,28 @@ impl App {
 
     /// Une image d'animation, appelée à chaque rafraîchissement de l'écran.
     fn tick(&mut self) {
-        let now = Instant::now();
+        let now = anim::begin_frame();
+        // Les barres d'applis bougent toutes avec le Dock, ou chacune avec la pastille des
+        // scènes de son écran (voir `tick_screen`).
+        let apps = self.dock_tick(now);
         for s in 0..self.screens.len() {
-            self.tick_screen(s, now);
+            let veiling = self.tick_screen(s, now);
+            if apps || veiling {
+                self.render_apps(s);
+            }
         }
-        self.dock_tick(now);
         self.notch_tick(now);
+        anim::end_frame();
     }
 
-    fn tick_screen(&mut self, s: usize, now: Instant) {
+    /// Avance les animations d'un écran. Renvoie `true` si sa pastille rentre ou sort du bord :
+    /// la barre d'applis la suit.
+    fn tick_screen(&mut self, s: usize, now: Instant) -> bool {
         let duration = self.anim_duration;
         let sc = &mut self.screens[s];
+        let veiling = sc.veil_start.is_some();
         // La barre se redessine tant que ses cartes bougent ou s'enchaînent en fondu.
-        let mut redraw = sc.slide_start.is_some() || sc.hover_start.is_some() || sc.veil_start.is_some();
+        let mut redraw = sc.slide_start.is_some() || sc.hover_start.is_some() || veiling;
         if sc.slide_start.is_some_and(|start| anim::progress(start, duration, now) >= 1.0) {
             sc.slide_start = None;
         }
@@ -1081,6 +1107,7 @@ impl App {
         if redraw {
             self.render(s);
         }
+        veiling
     }
 
     /// Fin du trajet : les vraies fenêtres reprennent la place de leurs miniatures.
@@ -1310,7 +1337,7 @@ impl App {
             return Rc::clone(icon);
         }
         let h = hwnd_of(w);
-        let path = win::process_path(win::app_pid(h));
+        let path = self.process_path(win::app_pid(h));
         let icon = match path.as_ref().and_then(|p| self.app_icons.get(p)) {
             Some(icon) => Rc::clone(icon),
             None => {
@@ -1333,12 +1360,6 @@ impl App {
     fn refresh_all(&mut self) {
         for s in 0..self.screens.len() {
             self.refresh(s);
-        }
-    }
-
-    fn render_all(&self) {
-        for s in 0..self.screens.len() {
-            self.render(s);
         }
     }
 
@@ -1607,7 +1628,7 @@ impl App {
             return;
         }
         let px = |v: i32| self.px(s, v);
-        let now = Instant::now();
+        let now = anim::now();
         let shown = self.bar_shown(s, now);
         let drop_target = self.drop_target == Some(sc.id);
         let mut width = self.pill_shown_width(s, now);

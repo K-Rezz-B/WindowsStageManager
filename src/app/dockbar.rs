@@ -51,6 +51,8 @@ pub(super) struct DockUi {
     loader: shell::IconLoader,
     requested: HashSet<String>,
     trash_full: bool,
+    /// Dernière fois qu'on a regardé la corbeille : Windows la parcourt pour la compter.
+    trash_checked: Option<Instant>,
     /// Écran dont la barre est sous la souris : lui seul montre le survol et le curseur de volume.
     active: Option<ScreenId>,
     tracking: bool,
@@ -153,6 +155,7 @@ impl DockUi {
             loader: shell::IconLoader::start(hwnd, WM_DOCK_LOADED),
             requested: HashSet::new(),
             trash_full: false,
+            trash_checked: None,
             active: None,
             tracking: false,
             hover: None,
@@ -292,8 +295,14 @@ impl App {
                 *part = None;
             }
         }
-        // La corbeille change d'icône quand elle se remplit ou se vide.
-        let full = shell::recycle_bin_items() > 0;
+        // La corbeille change d'icône quand elle se remplit ou se vide (vérifié au plus une fois
+        // par seconde : chaque changement de premier plan passe par ici).
+        let now = Instant::now();
+        let due = self.dock.trash_checked.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
+        if due {
+            self.dock.trash_checked = Some(now);
+        }
+        let full = if due { shell::recycle_bin_items() > 0 } else { self.dock.trash_full };
         if full != self.dock.trash_full {
             self.dock.trash_full = full;
             self.dock.requested.remove(shell::RECYCLE_BIN);
@@ -403,7 +412,7 @@ impl App {
         if !self.dock.enabled || self.screens[s].fullscreen {
             return;
         }
-        let now = Instant::now();
+        let now = anim::now();
         let layout = self.apps_layout(s);
         let window = self.apps_window(s, layout.size);
         self.screens[s].apps_rect = window;
@@ -564,9 +573,11 @@ impl App {
         self.dock.enabled && (self.dock.model.animating() || self.dock.slider_anim.is_some() || self.dock.hover_start.is_some())
     }
 
-    pub(super) fn dock_tick(&mut self, now: Instant) {
+    /// Avance les animations du Dock. Renvoie `true` s'il faut redessiner toutes les barres
+    /// d'applis.
+    pub(super) fn dock_tick(&mut self, now: Instant) -> bool {
         if !self.dock.enabled {
-            return;
+            return false;
         }
         let mut redraw = self.dock.model.animating();
         if let Some((start, _)) = self.dock.slider_anim {
@@ -583,11 +594,7 @@ impl App {
             }
             redraw = true;
         }
-        // La pastille rentre ou sort du bord avec celle des scènes.
-        redraw |= self.screens.iter().any(|sc| sc.veil_start.is_some());
-        if redraw {
-            self.render_all_apps();
-        }
+        redraw
     }
 
     /// Ouvre ou referme le curseur de volume, en douceur.
@@ -624,7 +631,10 @@ impl App {
         let id = self.screens[s].id;
         match msg {
             WM_MOUSEMOVE => {
+                // Redessinée seulement si quelque chose change sous la souris.
+                let mut changed = false;
                 if self.dock.active != Some(id) {
+                    changed = true;
                     // La souris passe d'un écran à l'autre : le curseur de volume reste où il était.
                     let previous = self.dock.active.replace(id).and_then(|p| self.screen_index(p));
                     self.dock.tracking = false;
@@ -643,8 +653,11 @@ impl App {
                     return;
                 }
                 let part = self.apps_part(s, pt);
+                changed |= self.dock.hover != part;
                 self.set_apps_hover(part);
-                self.render_apps(s);
+                if changed {
+                    self.render_apps(s);
+                }
             }
             WM_MOUSELEAVE => {
                 self.dock.tracking = false;
@@ -916,16 +929,18 @@ pub(super) fn clock_text() -> (String, String) {
     }
 }
 
-/// Largeur d'un texte dans une police donnée, en pixels.
+/// Largeur d'un texte dans une police donnée, en pixels. Le DC de mesure sert toute la vie du
+/// programme : l'encoche mesure ses textes à chaque image de ses animations.
 pub(super) fn text_width(font: HFONT, text: &str) -> i32 {
-    unsafe {
-        let dc = CreateCompatibleDC(None);
+    thread_local! {
+        static MEASURE: HDC = unsafe { CreateCompatibleDC(None) };
+    }
+    MEASURE.with(|&dc| unsafe {
         let old = SelectObject(dc, font);
         let wide: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE::default();
         let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
         SelectObject(dc, old);
-        let _ = DeleteDC(dc);
         size.cx
-    }
+    })
 }
