@@ -327,6 +327,10 @@ impl App {
                     if self.screens[s].appbar.take().is_some() {
                         self.reserve_bar(s);
                     }
+                    if self.screens[s].notch_band.is_some() {
+                        self.screens[s].notch_band = Some(RECT::default());
+                        self.reserve_notch_band(s);
+                    }
                 }
                 self.reregister_dock();
             }
@@ -340,7 +344,10 @@ impl App {
         let Some(s) = self.bar_index(hwnd) else { return };
         match msg {
             WM_APPBAR => match wp.0 as u32 {
-                ABN_POSCHANGED => self.place_appbar(s),
+                ABN_POSCHANGED => {
+                    self.place_appbar(s);
+                    self.reserve_notch_band(s);
+                }
                 // Reçu même quand la barre ne réserve aucune place (voir `register_appbar`).
                 ABN_FULLSCREENAPP => self.on_fullscreen(lp.0 != 0),
                 _ => {}
@@ -1143,8 +1150,9 @@ impl App {
 
     // --- Barre des scènes -----------------------------------------------------------
 
-    /// Inscrit la barre d'un écran auprès de Windows, sans réserver de place : elle apprend
-    /// ainsi qu'une appli passe en plein écran, ce qui sert aussi aux encoches et aux coins.
+    /// Inscrit la barre d'un écran auprès de Windows, sans réserver de place (sauf la bande de
+    /// l'encoche, voir `reserve_notch_band`) : elle apprend ainsi qu'une appli passe en plein
+    /// écran, ce qui sert aussi aux encoches et aux coins.
     fn register_appbar(&mut self, s: usize) {
         let mut abd = APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
@@ -1157,6 +1165,7 @@ impl App {
 
     fn unregister_appbar(&mut self, s: usize) {
         self.screens[s].appbar = None;
+        self.screens[s].notch_band = None;
         let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.screens[s].hwnd, ..Default::default() };
         unsafe { SHAppBarMessage(ABM_REMOVE, &mut abd) };
     }

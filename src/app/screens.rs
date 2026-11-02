@@ -60,6 +60,9 @@ pub(super) struct Screen {
     pub overlay: HWND,
     /// Position de la barre des scènes (en haut, près de l'encoche), quand elles sont en service.
     pub appbar: Option<RECT>,
+    /// Bande réservée en haut de l'écran pour l'encoche : les fenêtres (agrandies ou non)
+    /// s'arrêtent dessous au lieu de passer derrière elle.
+    pub notch_band: Option<RECT>,
     /// La barre est calée contre l'encoche (sinon centrée en haut de l'écran).
     pub bar_anchored: bool,
     /// Largeur de la pastille au début et à la fin de son animation.
@@ -128,6 +131,7 @@ impl Screen {
             hwnd,
             overlay,
             appbar: None,
+            notch_band: None,
             bar_anchored: false,
             pill_from: 0,
             pill_to: 0,
@@ -219,6 +223,9 @@ impl App {
             sc.rect = m.rect;
             sc.dpi = m.dpi;
             sc.primary = m.primary;
+            if moved && sc.notch_band.is_some() {
+                sc.notch_band = Some(RECT::default());
+            }
             if moved && sc.appbar.is_some() {
                 // Place réservée à recalculer (et police à refaire, si l'échelle a changé).
                 sc.appbar = Some(RECT::default());
@@ -282,7 +289,7 @@ impl App {
                 let _ = ShowWindow(self.screens[s].hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
             }
         }
-        // L'encoche n'est pas une barre réservée : elle suit la barre de son écran. La vignette
+        // L'encoche suit la barre de son écran (sa bande reste réservée). La vignette
         // de la fenêtre épinglée aussi, si elle est dans son coin.
         self.notch_fullscreen(s, fullscreen);
         self.render_vignette();

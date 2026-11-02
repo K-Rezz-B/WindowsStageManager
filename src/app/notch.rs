@@ -248,6 +248,10 @@ impl App {
             }
         }
         self.retarget_notch(s);
+        if self.screens[s].notch_band.is_none() {
+            self.screens[s].notch_band = Some(RECT::default());
+        }
+        self.reserve_notch_band(s);
     }
 
     pub(super) fn disable_notch(&mut self) {
@@ -268,7 +272,46 @@ impl App {
             }
             self.drop_notch_thumb(s);
             self.follow_notch(s);
+            self.release_notch_band(s);
         }
+    }
+
+    /// Réserve, auprès de Windows, la bande du haut de l'écran où se trouve l'encoche fermée :
+    /// rien ne passe derrière elle. La réservation passe par la barre des scènes, déjà inscrite
+    /// (voir `register_appbar`) : elle couvre toute la largeur de l'écran, comme la barre des
+    /// menus du Mac.
+    pub(super) fn reserve_notch_band(&mut self, s: usize) {
+        let sc = &mut self.screens[s];
+        let Some(current) = sc.notch_band else { return };
+        let height = (REST.h * sc.dpi as f32 / 96.0).round() as i32;
+        let mut abd = APPBARDATA {
+            cbSize: size_of::<APPBARDATA>() as u32,
+            hWnd: sc.hwnd,
+            uEdge: ABE_TOP,
+            rc: sc.rect,
+            ..Default::default()
+        };
+        abd.rc.bottom = abd.rc.top + height;
+        unsafe {
+            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+            abd.rc.bottom = abd.rc.top + height;
+            if abd.rc != current {
+                SHAppBarMessage(ABM_SETPOS, &mut abd);
+                sc.notch_band = Some(abd.rc);
+            }
+        }
+    }
+
+    /// Rend la bande de l'encoche aux fenêtres. La barre reste inscrite, pour le plein écran.
+    fn release_notch_band(&mut self, s: usize) {
+        if self.screens[s].notch_band.take().is_none() {
+            return;
+        }
+        let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.screens[s].hwnd, ..Default::default() };
+        unsafe {
+            SHAppBarMessage(ABM_REMOVE, &mut abd);
+        }
+        self.register_appbar(s);
     }
 
     /// Demi-largeur de l'encoche fermée, congés compris, en pixels : la barre des scènes se
