@@ -2,7 +2,7 @@
 
 Une reproduction du Stage Manager de macOS pour Windows 11, écrite en Rust.
 
-Une barre transparente sur le bord gauche de l'écran affiche les autres « scènes » sous forme
+Une barre transparente sur le bord gauche de chaque écran affiche les autres « scènes » sous forme
 de cartes inclinées en perspective, comme sur macOS, posées sur le fond d'écran. La scène active reste seule à l'écran ;
 les autres sont réduites.
 
@@ -51,7 +51,7 @@ cargo run --release
   barre comme scène à part, et reviendra à sa place d'origine quand on la rouvrira.
 - **Clic droit sur une carte → « Séparer les fenêtres »** : éclate une scène regroupée en une
   scène par fenêtre.
-- **Encoche** en haut de l'écran, au milieu, comme celle des MacBook Pro : noire, collée au
+- **Encoche** en haut de chaque écran, au milieu, comme celle des MacBook Pro : noire, collée au
   bord, raccordée à lui par deux petits congés. Fermée, elle affiche l'heure. Pendant la
   lecture, elle s'élargit un peu : l'heure glisse à gauche et un petit symbole de lecture
   apparaît à droite (de la couleur de la pochette). Au survol (ou au clic), elle
@@ -127,7 +127,17 @@ libre la plus proche de SF Pro, intégrée à l'exécutable et chargée pour ce 
 `assets/icon.ico` est généré par `assets/make-icon.ps1` (aperçu : `assets/icon-preview.png`)
 et intégré à l'exécutable par `build.rs`.
 
-Au démarrage, les fenêtres ouvertes sont regroupées par application : une scène par appli.
+Au démarrage, les fenêtres ouvertes sont regroupées par application et par écran : une scène
+par appli sur chaque écran.
+
+**Plusieurs écrans** : chaque écran a son propre Stage Manager, comme sur macOS — sa barre sur
+son bord gauche, ses scènes et sa scène active. Changer de scène sur un écran ne touche pas aux
+autres. Une fenêtre déplacée sur un autre écran (à la souris ou avec Win + Maj + flèche) quitte
+sa scène et rejoint la scène active de son nouvel écran ; les nouvelles fenêtres rejoignent les
+scènes de l'écran où elles s'ouvrent. Un écran débranché confie ses scènes à l'écran principal,
+un écran branché reçoit aussitôt sa barre et son encoche. Une appli plein écran n'efface que la
+barre et l'encoche de son écran.
+
 Ensuite :
 
 - une nouvelle fenêtre d'une appli déjà présente dans la scène active la rejoint ;
@@ -161,9 +171,10 @@ rafraîchissement de l'écran (`DwmFlush`).
 
 | Fichier | Rôle |
 |---|---|
-| `src/stages.rs` | Modèle des scènes, sans Win32, couvert par des tests (`cargo test`) |
+| `src/stages.rs` | Modèle des scènes (une scène active par écran), sans Win32, couvert par des tests (`cargo test`) |
 | `src/win.rs` | Utilitaires Win32 : filtrage des fenêtres, processus, icônes, premier plan |
-| `src/app.rs` | Barre latérale (AppBar), miniatures DWM, icône de notification, événements |
+| `src/app.rs` | Barres latérales (AppBar), miniatures DWM, icône de notification, événements |
+| `src/app/screens.rs` | Écrans : une barre, un overlay et une encoche par écran, branchements, plein écran |
 | `src/anim.rs` | Animations : fenêtre transparente, trajectoires, courbes d'accélération |
 | `src/canvas.rs` | Dessin avec transparence par pixel pour la barre, projection en perspective |
 | `src/dock.rs` | Modèle du Dock : éléments, épinglage, grossissement, rebond (testé) |
@@ -173,7 +184,7 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/wallpaper.rs` | Fond d'écran derrière le Dock, flouté, pour la teinte des panneaux (fil à part) |
 | `src/launcher.rs` | Lanceur : recherche des applis (testée) |
 | `src/app/launcherui.rs` | Fenêtre du lanceur : saisie, résultats |
-| `src/app/notch.rs` | Encoche en haut de l'écran : formes, animation, lecteur complet |
+| `src/app/notch.rs` | Encoche en haut de chaque écran : formes, animation, lecteur complet |
 | `src/app/pin.rs` | Page accrochée à l'encoche : fenêtre Chrome dédiée, garage hors écran, cours |
 | `src/app/corners.rs` | Coins arrondis de l'écran |
 | `src/settings.rs` | Fonctionnalités activées ou non, et leur enregistrement (testé) |
@@ -193,7 +204,7 @@ comme la barre des tâches), `ShowWindowAsync` (une appli figée ne bloque pas l
 
 - Les fenêtres lancées en administrateur ne sont pas gérées (Windows l'interdit), sauf si
   Stage Manager est lui-même lancé en administrateur.
-- La barre, l'encoche et les coins arrondis n'apparaissent que sur l'écran principal.
+- Le Dock, le lanceur et les coins arrondis n'apparaissent que sur l'écran principal.
 - L'encoche recouvre le milieu du haut de l'écran (environ 190 × 32 pixels à 100 %) : un clic
   à cet endroit l'ouvre au lieu d'atteindre la fenêtre en dessous (onglet, barre de titre).
 - Les bureaux virtuels ne sont pas encore pris en compte.

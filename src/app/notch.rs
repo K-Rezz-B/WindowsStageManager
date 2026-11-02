@@ -1,4 +1,4 @@
-//! L'encoche en haut de l'écran, comme celle des MacBook Pro : noire, collée au bord.
+//! L'encoche en haut de chaque écran, comme celle des MacBook Pro : noire, collée au bord.
 //! Fermée, elle affiche l'heure ; pendant la lecture, elle s'élargit un peu et montre un petit
 //! symbole de lecture. Au survol, elle s'agrandit et montre le lecteur complet.
 //! Une page peut y être accrochée (voir `pin`) : fermée, l'encoche affiche alors son cours ;
@@ -40,8 +40,6 @@ const DOWN: COLORREF = rgb(255, 69, 58);
 const SHOULDER: f32 = 6.0;
 /// Place autour de l'encoche pour son ombre et le léger dépassement du ressort.
 const MARGIN: f32 = 30.0;
-
-pub(super) static NOTCH: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Clone, Copy, PartialEq)]
 struct Shape {
@@ -88,7 +86,7 @@ pub(super) struct NotchUi {
     /// Masquée devant une appli en plein écran (jeu, vidéo).
     fullscreen: bool,
     dpi: i32,
-    /// Milieu du haut de l'écran principal : l'encoche y est centrée.
+    /// Milieu du haut de son écran : l'encoche y est centrée.
     anchor: POINT,
     /// Position de la fenêtre à l'écran (elle suit la taille de l'encoche).
     window: RECT,
@@ -186,67 +184,75 @@ impl NotchUi {
 }
 
 impl App {
-    pub(super) fn handle_notch_message(&mut self, msg: u32, wp: WPARAM) -> bool {
-        match msg {
-            WM_TIMER if wp.0 == TIMER_NOTCH_HOVER => {
+    /// Minuteurs d'une encoche (posés sur sa fenêtre) : le survol, l'égaliseur.
+    pub(super) fn notch_timer(&mut self, hwnd: HWND, timer: usize) {
+        let Some(s) = self.notch_index(hwnd) else { return };
+        match timer {
+            TIMER_NOTCH_HOVER => {
                 unsafe {
-                    let _ = KillTimer(self.hwnd, TIMER_NOTCH_HOVER);
+                    let _ = KillTimer(hwnd, TIMER_NOTCH_HOVER);
                 }
-                if self.notch.hover {
-                    self.set_notch_open(true);
+                if self.screens[s].notch.hover {
+                    self.set_notch_open(s, true);
                 }
             }
             // L'égaliseur danse (et la barre de progression avance) ; pendant une animation,
             // l'encoche est déjà redessinée à chaque image.
-            WM_TIMER if wp.0 == TIMER_NOTCH_EQ => {
-                if !self.notch_animating() {
-                    self.render_notch();
+            TIMER_NOTCH_EQ => {
+                if self.screens[s].notch.start.is_none() {
+                    self.render_notch(s);
                 }
             }
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
     // --- Mise en place ----------------------------------------------------------------
 
+    /// Une encoche en haut de chaque écran.
     pub(super) fn enable_notch(&mut self) {
-        self.notch.shown = true;
-        self.place_notch();
-        if !self.notch.fullscreen {
+        for s in 0..self.screens.len() {
+            self.enable_notch_on(s);
+        }
+    }
+
+    pub(super) fn enable_notch_on(&mut self, s: usize) {
+        self.screens[s].notch.shown = true;
+        self.place_notch(s);
+        let n = &self.screens[s].notch;
+        if !n.fullscreen {
             unsafe {
-                let _ = ShowWindow(self.notch.hwnd, SW_SHOWNOACTIVATE);
+                let _ = ShowWindow(n.hwnd, SW_SHOWNOACTIVATE);
             }
         }
-        self.notch_retarget();
+        self.retarget_notch(s);
     }
 
     pub(super) fn disable_notch(&mut self) {
-        let n = &mut self.notch;
-        n.shown = false;
-        n.open = false;
-        n.hover = false;
-        n.hover_control = None;
-        n.start = None;
-        n.from = REST;
-        n.target = REST;
-        unsafe {
-            let _ = ShowWindow(n.hwnd, SW_HIDE);
-            let _ = KillTimer(self.hwnd, TIMER_NOTCH_HOVER);
-            let _ = KillTimer(self.hwnd, TIMER_NOTCH_EQ);
+        for s in 0..self.screens.len() {
+            let n = &mut self.screens[s].notch;
+            n.shown = false;
+            n.open = false;
+            n.hover = false;
+            n.hover_control = None;
+            n.start = None;
+            n.from = REST;
+            n.target = REST;
+            unsafe {
+                let _ = ShowWindow(n.hwnd, SW_HIDE);
+                let _ = KillTimer(n.hwnd, TIMER_NOTCH_HOVER);
+                let _ = KillTimer(n.hwnd, TIMER_NOTCH_EQ);
+            }
+            self.drop_notch_thumb(s);
         }
-        self.notch_drop_thumb();
     }
 
-    /// Centre l'encoche en haut de l'écran principal, à la bonne échelle.
-    pub(super) fn place_notch(&mut self) {
-        let mon = self.monitor;
-        let n = &mut self.notch;
+    /// Centre l'encoche en haut de son écran, à la bonne échelle.
+    pub(super) fn place_notch(&mut self, s: usize) {
+        let sc = &mut self.screens[s];
+        let (mon, n) = (sc.rect, &mut sc.notch);
+        n.dpi = sc.dpi;
         unsafe {
-            let handle = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let (mut dpi, mut dpi_y) = (96u32, 96u32);
-            let _ = GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
-            n.dpi = dpi as i32;
             for font in [n.font_title, n.font_artist, n.font_small, n.font_time] {
                 if !font.is_invalid() {
                     let _ = DeleteObject(font);
@@ -258,48 +264,52 @@ impl App {
             n.font_time = make_font("Inter SemiBold", 13, 600, n.dpi);
         }
         n.anchor = POINT { x: (mon.left + mon.right) / 2, y: mon.top };
-        self.render_notch();
+        // L'échelle a pu changer : la forme en cours aussi.
+        self.retarget_notch(s);
     }
 
-    /// Une appli passe en plein écran (ou en sort) : l'encoche s'efface, et ne dessine plus rien.
-    pub(super) fn notch_fullscreen(&mut self, fullscreen: bool) {
-        self.notch.fullscreen = fullscreen;
+    /// Une appli passe en plein écran sur cet écran (ou en sort) : son encoche s'efface, et ne
+    /// dessine plus rien.
+    pub(super) fn notch_fullscreen(&mut self, s: usize, fullscreen: bool) {
+        self.screens[s].notch.fullscreen = fullscreen;
         if fullscreen {
-            self.notch_drop_thumb();
+            self.drop_notch_thumb(s);
         }
         // Désactivée, elle reste cachée, mais retient l'état du plein écran pour plus tard.
-        if !self.notch.shown {
+        let n = &self.screens[s].notch;
+        if !n.shown {
             return;
         }
         unsafe {
-            let _ = ShowWindow(self.notch.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+            let _ = ShowWindow(n.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
         }
-        self.notch_retarget();
+        self.retarget_notch(s);
     }
 
     // --- États ------------------------------------------------------------------------
 
-    fn set_notch_open(&mut self, open: bool) {
-        if self.notch.open != open {
-            self.notch.open = open;
-            self.notch_retarget();
+    fn set_notch_open(&mut self, s: usize, open: bool) {
+        if self.screens[s].notch.open != open {
+            self.screens[s].notch.open = open;
+            self.retarget_notch(s);
         }
     }
 
     /// Formes de l'encoche fermée et ouverte, d'après la musique et la page accrochée.
-    fn notch_shapes(&self) -> (Shape, Shape) {
+    fn notch_shapes(&self, s: usize) -> (Shape, Shape) {
+        let n = &self.screens[s].notch;
         let media = self.now_playing.is_some();
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
-        let k = self.notch.dpi as f32 / 96.0;
+        let k = n.dpi as f32 / 96.0;
         let mut closed = if playing { LIVE } else { REST };
-        let ticker = self.ticker_width();
+        let ticker = self.ticker_width(s);
         if ticker > 0 {
             // L'heure à gauche, le cours à droite (avant le symbole de lecture). Arrondie, la
             // largeur ne suit pas chaque petit mouvement du cours.
             let (time, _) = clock_text();
-            let s = |v: i32| self.notch.s(v);
-            let play = if playing { s(20) } else { 0 };
-            let w = (s(16) + text_width(self.notch.font_time, &time) + s(18) + ticker + s(16) + play) as f32 / k;
+            let px = |v: i32| n.s(v);
+            let play = if playing { px(20) } else { 0 };
+            let w = (px(16) + text_width(n.font_time, &time) + px(18) + ticker + px(16) + play) as f32 / k;
             closed.w = closed.w.max((w / 16.0).ceil() * 16.0);
         }
         let open = match self.pin_chart_size() {
@@ -314,11 +324,18 @@ impl App {
         (closed, open)
     }
 
-    /// Choisit la forme de l'encoche d'après la musique et la souris, et l'y amène en douceur.
+    /// Choisit la forme de chaque encoche d'après la musique et la souris.
     pub(super) fn notch_retarget(&mut self) {
+        for s in 0..self.screens.len() {
+            self.retarget_notch(s);
+        }
+    }
+
+    /// Choisit la forme d'une encoche d'après la musique et la souris, et l'y amène en douceur.
+    fn retarget_notch(&mut self, s: usize) {
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
-        let (closed, open) = self.notch_shapes();
-        let n = &mut self.notch;
+        let (closed, open) = self.notch_shapes(s);
+        let n = &mut self.screens[s].notch;
         let target = if n.open { open } else { closed };
         if target != n.target {
             let now = Instant::now();
@@ -329,34 +346,37 @@ impl App {
         // Fermée, l'encoche ne bouge pas : l'égaliseur ne danse que dans le lecteur ouvert.
         unsafe {
             if playing && n.open && n.shown && !n.fullscreen {
-                SetTimer(self.hwnd, TIMER_NOTCH_EQ, 66, None);
+                SetTimer(n.hwnd, TIMER_NOTCH_EQ, 66, None);
             } else {
-                let _ = KillTimer(self.hwnd, TIMER_NOTCH_EQ);
+                let _ = KillTimer(n.hwnd, TIMER_NOTCH_EQ);
             }
         }
-        self.render_notch();
+        self.render_notch(s);
     }
 
     pub(super) fn notch_animating(&self) -> bool {
-        self.notch.start.is_some()
+        self.screens.iter().any(|sc| sc.notch.start.is_some())
     }
 
     pub(super) fn notch_tick(&mut self, now: Instant) {
-        let Some(start) = self.notch.start else { return };
-        if anim::progress(start, ANIM, now) >= 1.0 {
-            self.notch.start = None;
+        for s in 0..self.screens.len() {
+            let Some(start) = self.screens[s].notch.start else { continue };
+            if anim::progress(start, ANIM, now) >= 1.0 {
+                self.screens[s].notch.start = None;
+            }
+            self.render_notch(s);
         }
-        self.render_notch();
     }
 
     /// Arrondit la pochette (et en tire la couleur de l'égaliseur) quand le morceau change.
-    fn update_notch_art(&mut self) {
+    fn update_notch_art(&mut self, s: usize) {
         let art = self.now_playing.as_ref().and_then(|np| np.art.clone());
         let key = art.as_ref().map_or(0, |a| Arc::as_ptr(a) as usize);
-        if self.notch.art.as_ref().map_or(0, |a| a.0) == key {
+        let n = &mut self.screens[s].notch;
+        if n.art.as_ref().map_or(0, |a| a.0) == key {
             return;
         }
-        self.notch.art = art.map(|img| {
+        n.art = art.map(|img| {
             let mut rounded = (*img).clone();
             rounded.round_corners(img.w as f32 * 0.19);
             (key, Rc::new(rounded), accent(&img))
@@ -365,19 +385,25 @@ impl App {
 
     // --- Dessin -----------------------------------------------------------------------
 
-    pub(super) fn render_notch(&mut self) {
-        if !self.notch.shown || self.notch.fullscreen {
+    pub(super) fn render_notches(&mut self) {
+        for s in 0..self.screens.len() {
+            self.render_notch(s);
+        }
+    }
+
+    fn render_notch(&mut self, s: usize) {
+        if !self.screens[s].notch.shown || self.screens[s].notch.fullscreen {
             return;
         }
-        self.update_notch_art();
+        self.update_notch_art(s);
         let now = Instant::now();
-        let n = &self.notch;
-        let s = |v: i32| n.s(v);
+        let n = &self.screens[s].notch;
+        let px = |v: i32| n.s(v);
         let k = n.dpi as f32 / 96.0;
         let shape = n.shape(now);
         let (r, size) = n.frame(shape);
         let np = self.now_playing.as_ref();
-        let (_, full) = self.notch_shapes();
+        let (_, full) = self.notch_shapes(s);
         let pinned = self.pin_shown();
         // 0 au repos, 1 ouverte.
         let opened = ((shape.h - REST.h) / (full.h - REST.h)).clamp(0.0, 1.0);
@@ -391,8 +417,8 @@ impl App {
         if opened > 0.0 {
             // Ombre douce sous l'encoche ouverte.
             let radius = (shape.radius * k) as i32;
-            canvas.round_rect(offset(inflate(r, s(6)), 0, s(10)), radius + s(6), (0, 0, 0), (35.0 * opened) as u8);
-            canvas.round_rect(offset(inflate(r, s(1)), 0, s(3)), radius + s(1), (0, 0, 0), (60.0 * opened) as u8);
+            canvas.round_rect(offset(inflate(r, px(6)), 0, px(10)), radius + px(6), (0, 0, 0), (35.0 * opened) as u8);
+            canvas.round_rect(offset(inflate(r, px(1)), 0, px(3)), radius + px(1), (0, 0, 0), (60.0 * opened) as u8);
         }
         canvas.notch(r, shape.radius * k, SHOULDER * k, (0, 0, 0), 255);
 
@@ -402,25 +428,25 @@ impl App {
         let closed = (1.0 - opened * 4.0).clamp(0.0, 1.0);
         if closed > 0.0 {
             let mut layer = Canvas::new(size.cx, size.cy);
-            let band = s(REST.h as i32);
+            let band = px(REST.h as i32);
             let live = if playing { ((shape.w - REST.w) / (LIVE.w - REST.w)).clamp(0.0, 1.0) } else { 0.0 };
-            let ticker = self.ticker_parts();
+            let ticker = self.ticker_parts(s);
             let (time, _) = clock_text();
             let tw = text_width(n.font_time, &time);
             let middle = (r.left + r.right - tw) / 2;
             let slide = if ticker.is_empty() { live } else { 1.0 };
-            let x = middle + ((r.left + s(16) - middle) as f32 * slide).round() as i32;
+            let x = middle + ((r.left + px(16) - middle) as f32 * slide).round() as i32;
             if live > 0.0 {
-                let (cx, cy) = ((r.right - s(20)) as f32, band as f32 / 2.0);
+                let (cx, cy) = ((r.right - px(20)) as f32, band as f32 / 2.0);
                 let (w, h) = (9.0 * k, 11.0 * k);
                 let left = cx - w / 2.0 + 1.0 * k;
                 let triangle = [(left, cy - h / 2.0), (left + w, cy), (left, cy + h / 2.0)];
                 layer.fill_convex(&round_corners(&triangle, 1.5 * k), accent, (255.0 * live) as u8);
             }
-            let text = RECT { left: x, top: 0, right: x + tw + s(4), bottom: band };
+            let text = RECT { left: x, top: 0, right: x + tw + px(4), bottom: band };
             // Le cours, calé à droite : symbole, prix, variation.
-            let right = r.right - s(16) - (s(20) as f32 * live).round() as i32;
-            let start = right - ticker.iter().map(|p| p.3).sum::<i32>() - s(6) * (ticker.len() as i32 - 1).max(0);
+            let right = r.right - px(16) - (px(20) as f32 * live).round() as i32;
+            let start = right - ticker.iter().map(|p| p.3).sum::<i32>() - px(6) * (ticker.len() as i32 - 1).max(0);
             layer.gdi(|dc| unsafe {
                 SetBkMode(dc, TRANSPARENT);
                 SelectObject(dc, n.font_time);
@@ -430,7 +456,7 @@ impl App {
                     SelectObject(dc, *font);
                     let rect = RECT { left, top: 0, right: left + width, bottom: band };
                     draw_text(dc, part, rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, *color, 0);
-                    left += width + s(6);
+                    left += width + px(6);
                 }
             });
             canvas.overlay_inside(&layer, closed);
@@ -446,7 +472,7 @@ impl App {
                 // Rien à lire : la page accrochée occupe toute l'encoche.
                 None if pinned => {}
                 None => {
-                    let text = RECT { top: r.top + s(28), bottom: r.bottom - s(6), ..r };
+                    let text = RECT { top: r.top + px(28), bottom: r.bottom - px(6), ..r };
                     layer.gdi(|dc| unsafe {
                         SetBkMode(dc, TRANSPARENT);
                         SelectObject(dc, n.font_artist);
@@ -457,7 +483,7 @@ impl App {
                     let l = n.layout(r);
                     match &art {
                         Some(img) => layer.draw_quad(img, quad(l.art), 255, 0),
-                        None => layer.round_rect(l.art, s(12), (60, 60, 68), 255),
+                        None => layer.round_rect(l.art, px(12), (60, 60, 68), 255),
                     }
                     draw_equalizer(&mut layer, l.equalizer, t, playing, accent);
                     for (rect, control) in [(l.previous, Control::Previous), (l.button, Control::PlayPause), (l.next, Control::Next)] {
@@ -500,16 +526,16 @@ impl App {
             // l'encoche dessinée ; fermée, la page laisse place à une invitation à la rouvrir.
             if pinned {
                 let top = if np.is_some() { OPEN.h } else { CHART_TOP };
-                let pad = s(CHART_PAD as i32);
-                let area = RECT { left: r.left + pad, top: r.top + s(top as i32), right: r.right - pad, bottom: r.bottom - pad };
+                let pad = px(CHART_PAD as i32);
+                let area = RECT { left: r.left + pad, top: r.top + px(top as i32), right: r.right - pad, bottom: r.bottom - pad };
                 match self.pin_source() {
                     Some(source) => {
                         let dest = fit(area, anim::size(source));
-                        layer.round_rect(dest, s(6), (28, 28, 32), 255);
+                        layer.round_rect(dest, px(6), (28, 28, 32), 255);
                         thumb = Some((dest, source, (255.0 * content) as u8));
                     }
                     None => {
-                        layer.round_rect(area, s(14), (34, 34, 40), 255);
+                        layer.round_rect(area, px(14), (34, 34, 40), 255);
                         let invite = format!("Cliquer pour ouvrir {}", self.pin.url.as_deref().map_or("la page", host));
                         layer.gdi(|dc| unsafe {
                             SetBkMode(dc, TRANSPARENT);
@@ -524,8 +550,8 @@ impl App {
 
         let pos = POINT { x: n.anchor.x - size.cx / 2, y: n.anchor.y };
         canvas.present(n.hwnd, pos);
-        self.notch.window = RECT { left: pos.x, top: pos.y, right: pos.x + size.cx, bottom: pos.y + size.cy };
-        self.place_notch_thumb(thumb);
+        self.screens[s].notch.window = RECT { left: pos.x, top: pos.y, right: pos.x + size.cx, bottom: pos.y + size.cy };
+        self.place_notch_thumb(s, thumb);
     }
 
     // --- Page accrochée -----------------------------------------------------------------
@@ -541,8 +567,8 @@ impl App {
 
     /// Le cours affiché dans l'encoche fermée, en morceaux : texte, police, couleur, largeur.
     /// TradingView l'écrit dans son titre ; pour une autre page, le titre tout court.
-    fn ticker_parts(&self) -> Vec<(String, HFONT, COLORREF, i32)> {
-        let n = &self.notch;
+    fn ticker_parts(&self, s: usize) -> Vec<(String, HFONT, COLORREF, i32)> {
+        let n = &self.screens[s].notch;
         let title = self.pin.title.trim();
         if !self.pin_shown() || title.is_empty() {
             return Vec::new();
@@ -564,22 +590,23 @@ impl App {
         }
     }
 
-    fn ticker_width(&self) -> i32 {
-        let parts = self.ticker_parts();
-        parts.iter().map(|p| p.3).sum::<i32>() + self.notch.s(6) * (parts.len() as i32 - 1).max(0)
+    fn ticker_width(&self, s: usize) -> i32 {
+        let parts = self.ticker_parts(s);
+        parts.iter().map(|p| p.3).sum::<i32>() + self.screens[s].notch.s(6) * (parts.len() as i32 - 1).max(0)
     }
 
-    /// Pose (ou retire) la miniature de la page accrochée : où, quelle partie de la fenêtre,
-    /// avec quelle opacité.
-    fn place_notch_thumb(&mut self, thumb: Option<(RECT, RECT, u8)>) {
+    /// Pose (ou retire) la miniature de la page accrochée dans une encoche : où, quelle partie
+    /// de la fenêtre, avec quelle opacité.
+    fn place_notch_thumb(&mut self, s: usize, thumb: Option<(RECT, RECT, u8)>) {
         let (Some((dest, source, opacity)), Some(page)) = (thumb, self.pin.hwnd) else {
-            self.notch_drop_thumb();
+            self.drop_notch_thumb(s);
             return;
         };
-        if self.notch.thumb.is_none() {
-            self.notch.thumb = unsafe { DwmRegisterThumbnail(self.notch.hwnd, page) }.ok();
+        let n = &mut self.screens[s].notch;
+        if n.thumb.is_none() {
+            n.thumb = unsafe { DwmRegisterThumbnail(n.hwnd, page) }.ok();
         }
-        let Some(thumb) = self.notch.thumb else { return };
+        let Some(thumb) = n.thumb else { return };
         let props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
             rcDestination: dest,
@@ -593,8 +620,15 @@ impl App {
         }
     }
 
+    /// Retire la miniature de la page accrochée de toutes les encoches.
     pub(super) fn notch_drop_thumb(&mut self) {
-        if let Some(thumb) = self.notch.thumb.take() {
+        for s in 0..self.screens.len() {
+            self.drop_notch_thumb(s);
+        }
+    }
+
+    pub(super) fn drop_notch_thumb(&mut self, s: usize) {
+        if let Some(thumb) = self.screens[s].notch.thumb.take() {
             unsafe {
                 let _ = DwmUnregisterThumbnail(thumb);
             }
@@ -603,53 +637,57 @@ impl App {
 
     // --- Souris -----------------------------------------------------------------------
 
-    fn notch_control_at(&self, pt: POINT) -> Option<Control> {
-        if !self.notch.open || self.now_playing.is_none() {
+    fn notch_control_at(&self, s: usize, pt: POINT) -> Option<Control> {
+        let n = &self.screens[s].notch;
+        if !n.open || self.now_playing.is_none() {
             return None;
         }
-        let (r, _) = self.notch.frame(self.notch.shape(Instant::now()));
-        let l = self.notch.layout(r);
+        let (r, _) = n.frame(n.shape(Instant::now()));
+        let l = n.layout(r);
         [(l.previous, Control::Previous), (l.button, Control::PlayPause), (l.next, Control::Next)]
             .into_iter()
             .find(|&(rect, _)| contains(rect, pt))
             .map(|(_, control)| control)
     }
 
-    pub(super) fn notch_mouse(&mut self, msg: u32, lp: LPARAM) {
+    pub(super) fn notch_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) {
+        let Some(s) = self.notch_index(hwnd) else { return };
         let pt = point(lp);
         match msg {
             WM_MOUSEMOVE => {
-                if !self.notch.tracking {
+                let n = &mut self.screens[s].notch;
+                if !n.tracking {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE,
-                        hwndTrack: self.notch.hwnd,
+                        hwndTrack: n.hwnd,
                         dwHoverTime: 0,
                     };
-                    self.notch.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+                    n.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
                 }
-                if !self.notch.hover {
-                    self.notch.hover = true;
+                if !n.hover {
+                    n.hover = true;
                     unsafe {
-                        SetTimer(self.hwnd, TIMER_NOTCH_HOVER, HOVER_DELAY, None);
+                        SetTimer(n.hwnd, TIMER_NOTCH_HOVER, HOVER_DELAY, None);
                     }
                 }
-                let control = self.notch_control_at(pt);
-                if control != self.notch.hover_control {
-                    self.notch.hover_control = control;
-                    self.render_notch();
+                let control = self.notch_control_at(s, pt);
+                if control != self.screens[s].notch.hover_control {
+                    self.screens[s].notch.hover_control = control;
+                    self.render_notch(s);
                 }
             }
             WM_MOUSELEAVE => {
-                self.notch.tracking = false;
-                self.notch.hover = false;
-                self.notch.hover_control = None;
+                let n = &mut self.screens[s].notch;
+                n.tracking = false;
+                n.hover = false;
+                n.hover_control = None;
                 unsafe {
-                    let _ = KillTimer(self.hwnd, TIMER_NOTCH_HOVER);
+                    let _ = KillTimer(n.hwnd, TIMER_NOTCH_HOVER);
                 }
-                self.set_notch_open(false);
+                self.set_notch_open(s, false);
             }
-            WM_LBUTTONUP => match self.notch_control_at(pt) {
+            WM_LBUTTONUP => match self.notch_control_at(s, pt) {
                 Some(Control::PlayPause) => {
                     self.media.toggle_play_pause();
                     // Affiché tout de suite, sans attendre la confirmation du lecteur.
@@ -663,11 +701,11 @@ impl App {
                 // Ailleurs, un clic montre la page accrochée (ou la regare) : l'encoche se
                 // referme pour ne pas la masquer.
                 None if self.pin_shown() => {
-                    self.set_notch_open(false);
+                    self.set_notch_open(s, false);
                     self.pin_toggle();
                 }
                 // Un clic sur l'encoche fermée l'ouvre sans attendre.
-                None => self.set_notch_open(true),
+                None => self.set_notch_open(s, true),
             },
             _ => {}
         }

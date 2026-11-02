@@ -213,7 +213,8 @@ pub fn set_restore_position(h: HWND, rect: RECT, maximized: bool) {
     }
 }
 
-/// Fenêtre plein écran transparente et traversable par la souris, qui porte les miniatures animées.
+/// Fenêtre plein écran transparente et traversable par la souris, qui porte les miniatures animées
+/// (une par écran).
 pub unsafe fn create_overlay(instance: HINSTANCE) -> Result<HWND> {
     let class = w!("StageManagerOverlay");
     let wc = WNDCLASSW {
@@ -223,7 +224,8 @@ pub unsafe fn create_overlay(instance: HINSTANCE) -> Result<HWND> {
         hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
         ..Default::default()
     };
-    if RegisterClassW(&wc) == 0 {
+    // Déjà inscrite par l'overlay d'un autre écran : on la réutilise.
+    if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
         return Err(Error::from_win32());
     }
     let h = CreateWindowExW(

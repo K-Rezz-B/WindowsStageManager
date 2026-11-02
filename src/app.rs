@@ -1,4 +1,5 @@
-//! Barre latérale, icône de notification et branchement sur les événements Windows.
+//! Barres latérales (une par écran), icône de notification et branchement sur les événements
+//! Windows.
 
 use std::{
     cell::RefCell,
@@ -29,7 +30,7 @@ use crate::{
     media::{Media, NowPlaying},
     settings::{self, Feature, Features},
     snapshot, taskbar, wallpaper,
-    stages::{Model, Transition, Wid},
+    stages::{Model, ScreenId, Transition, Wid},
     win::{self, hwnd_of, wid_of},
 };
 
@@ -38,13 +39,15 @@ mod dockbar;
 mod launcherui;
 mod notch;
 mod pin;
+mod screens;
 mod settingsui;
 
 use corners::Corners;
 use dockbar::{DockUi, DOCK, TIMER_CLOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
-use notch::{NotchUi, NOTCH};
+use notch::NotchUi;
 use pin::{Pin, HOTKEY_PIN};
+use screens::{Screen, BAR_CLASS, NOTCH_CLASS};
 use settingsui::{SettingsUi, SETTINGS, WM_SHOW_SETTINGS};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
@@ -56,6 +59,8 @@ const SPI_SETDESKWALLPAPER: usize = 0x0014;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_RESCAN: usize = 1;
 const TIMER_WINDOW_DRAG: usize = 2;
+/// Les écrans ont changé : on attend que la rafale de messages soit passée.
+const TIMER_SCREENS: usize = 9;
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_DETACH: i32 = 2;
 const MENU_SETTINGS: usize = 1;
@@ -80,7 +85,8 @@ const SETTLE: Duration = Duration::from_millis(150);
 const TEXT: COLORREF = rgb(245, 245, 248);
 const TEXT_DIM: COLORREF = rgb(200, 200, 208);
 
-static SIDEBAR: AtomicIsize = AtomicIsize::new(0);
+/// Fenêtre principale, invisible : elle reçoit les événements, les minuteurs et les raccourcis.
+static MAIN: AtomicIsize = AtomicIsize::new(0);
 /// Fenêtres réduites par nous, à restaurer quoi qu'il arrive en quittant.
 static HIDDEN: Mutex<Vec<Wid>> = Mutex::new(Vec::new());
 
@@ -116,12 +122,19 @@ fn restore_minimized() {
 /// Lancé une deuxième fois : on ouvre les réglages de celui qui tourne déjà.
 pub fn show_running_settings() {
     unsafe {
-        let Ok(sidebar) = FindWindowW(w!("StageManagerSidebar"), None) else { return };
+        let Ok(main) = FindWindowW(w!("StageManagerSidebar"), None) else { return };
         let mut pid = 0;
-        GetWindowThreadProcessId(sidebar, Some(&mut pid));
+        GetWindowThreadProcessId(main, Some(&mut pid));
         // Pour qu'il puisse passer sa fenêtre au premier plan.
         let _ = AllowSetForegroundWindow(pid);
-        let _ = PostMessageW(sidebar, WM_SHOW_SETTINGS, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(main, WM_SHOW_SETTINGS, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Les écrans ont changé (branchement, résolution, mise à l'échelle) : on les relira bientôt.
+fn screens_changed() {
+    unsafe {
+        SetTimer(HWND(MAIN.load(Ordering::Relaxed) as _), TIMER_SCREENS, 300, None);
     }
 }
 
@@ -162,12 +175,12 @@ struct Drag {
 }
 
 struct App {
+    /// Fenêtre principale, invisible (voir `MAIN`).
     hwnd: HWND,
-    overlay: HWND,
+    /// Les scènes de tous les écrans : chacune appartient à un écran.
     model: Model,
     /// Fonctionnalités en service (les scènes, le Dock…), d'après les réglages.
     features: Features,
-    guard_until: Instant,
     /// Fenêtres qu'on vient de réduire : leur événement de réduction vient de nous.
     pending_minimize: HashSet<Wid>,
     /// Position de chaque fenêtre au moment où on l'a réduite : c'est là qu'elle reviendra.
@@ -176,48 +189,35 @@ struct App {
     /// Peut-on piloter les fenêtres de ce processus ? (pas s'il est admin et nous non)
     manageable: HashMap<u32, bool>,
     self_elevated: bool,
-    cards: Vec<Card>,
     /// Image de chaque fenêtre au moment où elle a quitté l'écran (cartes inclinées).
     snapshots: HashMap<Wid, Rc<Image>>,
-    /// Carte de la scène qui revient à l'écran : elle s'efface pendant que ses fenêtres partent.
-    departing: Option<Card>,
-    layout_key: LayoutKey,
     icons: HashMap<Wid, HICON>,
-    hover: Option<u64>,
-    tracking_mouse: bool,
-    font: HFONT,
     media: Media,
-    /// Morceau en cours, affiché dans l'encoche.
+    /// Morceau en cours, affiché dans les encoches.
     now_playing: Option<NowPlaying>,
-    appbar: Option<RECT>,
+    /// Les écrans, le principal en premier : chacun a sa barre des scènes et son encoche.
+    screens: Vec<Screen>,
+    /// Dernier identifiant d'écran attribué.
+    next_screen: ScreenId,
+    /// L'écran principal (le Dock, le lanceur, les réglages et les coins y sont).
     monitor: RECT,
     taskbar_created: u32,
     anim_duration: Duration,
-    switch: Option<Switch>,
-    slide_start: Option<Instant>,
-    arriving: Option<u64>,
-    drag: Option<Drag>,
-    /// Point de départ imposé au prochain changement de scène (la carte qu'on vient de lâcher).
-    drag_source: Option<RECT>,
-    /// Le Dock, en bas de l'écran.
+    /// Le Dock, en bas de l'écran principal.
     dock: DockUi,
     /// Le lanceur façon Spotlight (Alt + Espace).
     launcher: LauncherUi,
-    /// L'encoche en haut de l'écran, qui s'ouvre sur le lecteur.
-    notch: NotchUi,
-    /// Page accrochée à l'encoche, qu'elle montre en direct.
+    /// Page accrochée aux encoches, qu'elles montrent en direct.
     pin: Pin,
     /// Coins arrondis de l'écran.
     corners: Corners,
     /// La fenêtre des réglages.
     settings: SettingsUi,
-    /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
-    /// la sort de sa scène.
+    /// Fenêtre d'une scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
+    /// de son écran la sort de sa scène.
     window_drag: Option<WindowDrag>,
-    /// La souris survole la barre pendant ce déplacement : la barre s'éclaire.
-    drop_target: bool,
-    /// Positions à rendre aux fenêtres détachées une fois réduites (voir `detach`).
-    pending_placements: Vec<WindowDrag>,
+    /// Écran dont la souris survole la barre pendant ce déplacement : cette barre s'éclaire.
+    drop_target: Option<ScreenId>,
 }
 
 /// Fenêtre déplacée par l'utilisateur, avec sa position d'avant le déplacement.
@@ -229,60 +229,38 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND, notch: HWND, settings: HWND, corners: Corners) -> Self {
+    fn new(hwnd: HWND, dock: HWND, launcher: HWND, settings: HWND, corners: Corners) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
-            overlay,
             model: Model::default(),
             features: Features::NONE,
-            guard_until: Instant::now(),
             pending_minimize: HashSet::new(),
             last_rects: HashMap::new(),
             manageable: HashMap::new(),
             self_elevated: win::is_elevated(None).unwrap_or(false),
-            cards: Vec::new(),
             snapshots: HashMap::new(),
-            departing: None,
-            layout_key: Vec::new(),
             icons: HashMap::new(),
-            hover: None,
-            tracking_mouse: false,
-            font: HFONT::default(),
             media: Media::start(hwnd, WM_MEDIA),
             now_playing: None,
-            appbar: None,
+            screens: Vec::new(),
+            next_screen: 0,
             monitor: RECT::default(),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             anim_duration: Duration::from_millis(anim_ms),
-            switch: None,
-            slide_start: None,
-            arriving: None,
-            drag: None,
-            drag_source: None,
             dock: DockUi::new(dock),
             launcher: LauncherUi::new(launcher),
-            notch: NotchUi::new(notch),
             pin: Pin::new(),
             corners,
             settings: SettingsUi::new(settings),
             window_drag: None,
-            drop_target: false,
-            pending_placements: Vec::new(),
-        }
-    }
-
-    fn dpi(&self) -> i32 {
-        match unsafe { GetDpiForWindow(self.hwnd) } {
-            0 => 96,
-            dpi => dpi as i32,
+            drop_target: None,
         }
     }
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         if self.handle_dock_message(msg, wp, lp)
             || self.handle_launcher_message(msg, wp)
-            || self.handle_notch_message(msg, wp)
             || self.handle_pin_message(msg, wp)
             || self.handle_settings_message(msg, wp)
         {
@@ -291,63 +269,38 @@ impl App {
         match msg {
             WM_WINEVENT => self.on_event(wp.0 as u32, HWND(lp.0 as _)),
             WM_MEDIA => {
-                // Le lecteur est dans l'encoche.
+                // Le lecteur est dans les encoches.
                 self.now_playing = self.media.now_playing();
                 self.notch_retarget();
             }
             WM_SETTINGCHANGE if wp.0 == SPI_SETDESKWALLPAPER => self.reload_dock_backdrop(),
             WM_TIMER if wp.0 == TIMER_RESCAN => self.rescan(),
-            WM_TIMER if wp.0 == TIMER_WINDOW_DRAG => self.set_drop_target(self.window_over_bar()),
-            WM_MOUSEMOVE if self.drag.is_some() => self.drag_to(point(lp)),
-            WM_MOUSEMOVE => self.on_mouse_move(point(lp)),
-            WM_MOUSELEAVE => {
-                self.tracking_mouse = false;
-                self.set_hover(None);
+            WM_TIMER if wp.0 == TIMER_WINDOW_DRAG => {
+                let target = self.window_drop_target();
+                self.set_drop_target(target);
             }
-            WM_LBUTTONDOWN => self.press(point(lp)),
-            WM_LBUTTONUP => self.release(point(lp)),
-            // Capture perdue (Alt+Tab, Échap…) : on annule le glisser.
-            WM_CAPTURECHANGED => self.cancel_drag(),
+            WM_TIMER if wp.0 == TIMER_SCREENS => {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, TIMER_SCREENS);
+                }
+                self.update_screens();
+            }
             WM_HOTKEY if wp.0 == HOTKEY_TOGGLE as usize => self.set_feature(Feature::Scenes, !self.features.scenes),
             WM_HOTKEY if wp.0 == HOTKEY_DETACH as usize && self.features.scenes => {
                 let foreground = wid_of(unsafe { GetForegroundWindow() });
                 self.detach(foreground, None);
             }
-            WM_APPBAR => match wp.0 as u32 {
-                ABN_POSCHANGED => self.place_appbar(),
-                // Reçu même quand la barre ne réserve aucune place (voir `register_appbar`).
-                ABN_FULLSCREENAPP => {
-                    let fullscreen = lp.0 != 0 && win::fullscreen_app_in_front();
-                    if self.features.scenes {
-                        unsafe {
-                            let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
-                        }
-                    }
-                    // L'encoche n'est pas une barre réservée : elle suit la barre latérale.
-                    self.notch_fullscreen(fullscreen);
-                    // Les coins aussi : posés sur un jeu, ils l'obligeraient à passer par la
-                    // composition du bureau (un peu plus de latence).
-                    self.corners.set_visible(!fullscreen);
-                }
-                _ => {}
-            },
-            WM_DISPLAYCHANGE | WM_DPICHANGED => {
-                self.update_monitor();
-                self.place_appbar();
-                self.place_notch();
-                self.pin_displays_changed();
-                if self.features.corners {
-                    self.corners.show(self.monitor);
-                }
-            }
+            WM_DISPLAYCHANGE | WM_DPICHANGED => screens_changed(),
             WM_ENDSESSION if wp.0 != 0 => restore_hidden(),
             WM_CLOSE => {}
             m if m == self.taskbar_created => {
-                // L'explorateur a redémarré : il a perdu notre icône et notre barre.
+                // L'explorateur a redémarré : il a perdu notre icône et nos barres.
                 self.add_tray();
-                self.register_appbar();
-                if self.appbar.take().is_some() {
-                    self.reserve_bar();
+                for s in 0..self.screens.len() {
+                    self.register_appbar(s);
+                    if self.screens[s].appbar.take().is_some() {
+                        self.reserve_bar(s);
+                    }
                 }
                 self.reregister_dock();
             }
@@ -356,12 +309,36 @@ impl App {
         Some(LRESULT(0))
     }
 
+    /// Message reçu par la barre d'un écran : sa place réservée, le plein écran, la souris.
+    fn bar_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
+        let Some(s) = self.bar_index(hwnd) else { return };
+        match msg {
+            WM_APPBAR => match wp.0 as u32 {
+                ABN_POSCHANGED => self.place_appbar(s),
+                // Reçu même quand la barre ne réserve aucune place (voir `register_appbar`).
+                ABN_FULLSCREENAPP => self.on_fullscreen(lp.0 != 0),
+                _ => {}
+            },
+            WM_MOUSEMOVE if self.screens[s].drag.is_some() => self.drag_to(s, point(lp)),
+            WM_MOUSEMOVE => self.on_mouse_move(s, point(lp)),
+            WM_MOUSELEAVE => {
+                self.screens[s].tracking_mouse = false;
+                self.set_hover(s, None);
+            }
+            WM_LBUTTONDOWN => self.press(s, point(lp)),
+            WM_LBUTTONUP => self.release(s, point(lp)),
+            // Capture perdue (Alt+Tab, Échap…) : on annule le glisser.
+            WM_CAPTURECHANGED => self.cancel_drag(s),
+            _ => {}
+        }
+    }
+
     // --- Activation ---------------------------------------------------------------
 
-    /// Démarrage : l'écran, la surveillance du plein écran, puis les fonctionnalités choisies.
+    /// Démarrage : les écrans (et la surveillance du plein écran), puis les fonctionnalités
+    /// choisies.
     fn start(&mut self) {
-        self.update_monitor();
-        self.register_appbar();
+        self.update_screens();
         self.apply_features(settings::load());
     }
 
@@ -374,7 +351,9 @@ impl App {
         }
         self.features.pin = false;
         self.apply_features(Features::NONE);
-        self.unregister_appbar();
+        for s in 0..self.screens.len() {
+            self.unregister_appbar(s);
+        }
     }
 
     /// Active ou désactive une fonctionnalité, et l'enregistre.
@@ -451,7 +430,7 @@ impl App {
             self.notch_retarget();
         }
         unsafe {
-            // L'horloge sert au Dock (volume) et à l'encoche (heure) ; la surveillance des
+            // L'horloge sert au Dock (volume) et aux encoches (heure) ; la surveillance des
             // fenêtres, aux scènes et aux applis ouvertes du Dock.
             if wanted.dock || wanted.notch {
                 SetTimer(self.hwnd, TIMER_CLOCK, 1000, None);
@@ -467,46 +446,65 @@ impl App {
         self.render_settings();
     }
 
+    /// Une barre par écran, et une scène par application sur chaque écran.
     fn enable_scenes(&mut self) {
-        self.reserve_bar();
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        for s in 0..self.screens.len() {
+            self.show_bar(s);
         }
-        let windows: Vec<(Wid, String)> = win::top_level_windows()
-            .into_iter()
-            .filter(|h| !win::is_minimized(*h))
-            .filter_map(|h| self.app_key(h).map(|app| (wid_of(h), app)))
-            .collect();
+        let mut windows: Vec<(Wid, String, ScreenId)> = Vec::new();
+        for h in win::top_level_windows() {
+            if win::is_minimized(h) {
+                continue;
+            }
+            let (Some(app), Some(screen)) = (self.app_key(h), self.screen_at(h)) else { continue };
+            windows.push((wid_of(h), app, screen));
+        }
         let foreground = unsafe { GetForegroundWindow() };
         let t = self.model.init(&windows, Some(wid_of(foreground)));
-        self.apply(t, false);
-        self.refresh();
+        self.apply_now(t);
+        self.refresh_all();
     }
 
-    /// Toutes les fenêtres sont restaurées, la barre rend le bord de l'écran.
+    /// Toutes les fenêtres sont restaurées, les barres rendent le bord des écrans.
     fn disable_scenes(&mut self) {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_WINDOW_DRAG);
         }
-        self.cancel_drag();
         self.window_drag = None;
-        self.drop_target = false;
-        // Termine l'animation (et replace les fenêtres détachées) avant de tout restaurer.
-        self.finish_switch();
-        self.slide_start = None;
+        self.drop_target = None;
+        for s in 0..self.screens.len() {
+            self.cancel_drag(s);
+            // Termine l'animation (et replace les fenêtres détachées) avant de tout restaurer.
+            self.finish_switch(s);
+            self.screens[s].slide_start = None;
+        }
         restore_minimized();
         self.model = Model::default();
         self.pending_minimize.clear();
         self.icons.clear();
         self.last_rects.clear();
-        self.cards.clear();
         self.snapshots.clear();
-        self.departing = None;
-        self.layout_key.clear();
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        for s in 0..self.screens.len() {
+            let sc = &mut self.screens[s];
+            sc.cards.clear();
+            sc.departing = None;
+            sc.layout_key.clear();
+            sc.hover = None;
+            unsafe {
+                let _ = ShowWindow(sc.hwnd, SW_HIDE);
+            }
+            self.release_bar(s);
         }
-        self.release_bar();
+    }
+
+    /// Réserve le bord de l'écran et montre sa barre (sauf devant une appli plein écran).
+    fn show_bar(&mut self, s: usize) {
+        self.reserve_bar(s);
+        if !self.screens[s].fullscreen {
+            unsafe {
+                let _ = ShowWindow(self.screens[s].hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
     }
 
     // --- Scènes ---------------------------------------------------------------------
@@ -547,11 +545,16 @@ impl App {
             return;
         }
         let w = wid_of(h);
-        let guarded = Instant::now() < self.guard_until;
         match event {
             EVENT_SYSTEM_FOREGROUND => {
-                if guarded && !self.model.in_active_stage(w) {
+                let Some(here) = self.screen_at(h) else { return };
+                let screen = self.model.screen_of(w).unwrap_or(here);
+                if self.guarded(screen) && !self.model.in_active_stage(w) {
                     return;
+                }
+                // Passée sur un autre écran sans qu'on le voie : elle rejoint ses scènes.
+                if self.model.is_tracked(w) && !win::is_minimized(h) {
+                    self.follow_screen(w, here);
                 }
                 let t = if let Some(id) = self.model.stage_of(w) {
                     self.model.activate(id, Some(w))
@@ -559,35 +562,39 @@ impl App {
                     return;
                 } else {
                     let Some(app) = self.app_key(h) else { return };
-                    self.model.add_focused(w, &app)
+                    self.model.add_focused(w, &app, here)
                 };
-                self.apply(t, true);
+                let screen = self.model.screen_of(w).unwrap_or(here);
+                self.apply(screen, t, true);
             }
             EVENT_SYSTEM_MINIMIZESTART => {
                 if self.pending_minimize.remove(&w) || !self.model.in_active_stage(w) {
                     return;
                 }
+                let Some(screen) = self.model.screen_of(w) else { return };
                 // Réduite par l'utilisateur : elle quitte sa scène, comme sur macOS.
                 self.forget(w);
-                self.show_next_stage();
+                self.show_next_stage(screen);
             }
             EVENT_SYSTEM_MINIMIZEEND => {
-                if guarded || self.model.in_active_stage(w) {
+                let Some(screen) = self.model.screen_of(w) else { return };
+                if self.guarded(screen) || self.model.in_active_stage(w) {
                     return;
                 }
                 let Some(id) = self.model.stage_of(w) else { return };
                 let t = self.model.activate(id, Some(w));
-                self.apply(t, true);
+                self.apply(screen, t, true);
             }
             EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY => {
-                if !self.model.is_tracked(w) || win::is_alive(h) {
+                let Some(screen) = self.model.screen_of(w) else { return };
+                if win::is_alive(h) {
                     return;
                 }
                 self.forget(w);
-                self.show_next_stage();
+                self.show_next_stage(screen);
             }
             EVENT_SYSTEM_MOVESIZESTART => {
-                if !self.model.can_detach(w) {
+                if !self.model.in_active_stage(w) {
                     return;
                 }
                 let maximized = unsafe { IsZoomed(h) }.as_bool();
@@ -602,77 +609,99 @@ impl App {
                 if self.window_drag.is_none_or(|d| d.window != w) {
                     return;
                 }
-                let over = self.window_over_bar();
+                let target = self.window_drop_target();
                 let Some(drag) = self.window_drag.take() else { return };
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_WINDOW_DRAG);
                 }
-                self.set_drop_target(false);
-                if !over {
-                    return;
+                self.set_drop_target(None);
+                if target.is_some() {
+                    self.detach(w, Some(drag));
+                } else if let Some(here) = self.screen_at(h) {
+                    // Lâchée sur un autre écran : elle rejoint sa scène active.
+                    self.follow_screen(w, here);
                 }
-                self.detach(w, Some(drag));
             }
             _ => return,
         }
-        self.refresh();
+        self.refresh_all();
         // Une appli a pu s'ouvrir ou se fermer : le Dock suit.
         self.update_running();
     }
 
-    /// Sort une fenêtre de la scène active : elle rejoint la barre comme scène à part.
-    /// `moved` : si on l'a traînée jusqu'à la barre, sa position d'avant le déplacement,
+    /// Une fenêtre affichée est passée sur l'écran `here` : elle rejoint sa scène active. Si
+    /// la scène qu'elle quitte s'est vidée, la suivante de la barre de son ancien écran la
+    /// remplace.
+    fn follow_screen(&mut self, w: Wid, here: ScreenId) {
+        if let Some(from) = self.model.move_window(w, here) {
+            self.show_next_stage(from);
+        }
+    }
+
+    /// Sort une fenêtre de la scène active de son écran : elle rejoint la barre comme scène à
+    /// part. `moved` : si on l'a traînée jusqu'à la barre, sa position d'avant le déplacement,
     /// pour qu'elle revienne là et non à l'endroit où on l'a lâchée.
     fn detach(&mut self, w: Wid, moved: Option<WindowDrag>) {
+        let Some(screen) = self.model.screen_of(w) else { return };
         let t = self.model.detach(w);
         if t.is_empty() {
             return;
         }
-        self.apply(t, true);
-        if let Some(drag) = moved {
+        self.apply(screen, t, true);
+        if let (Some(drag), Some(s)) = (moved, self.screen_index(screen)) {
             self.last_rects.insert(w, drag.rect);
-            self.pending_placements.push(drag);
-            if self.switch.is_none() {
-                self.apply_placements();
+            self.screens[s].pending_placements.push(drag);
+            if self.screens[s].switch.is_none() {
+                self.apply_placements(s);
             }
         }
-        self.refresh();
+        self.refresh_all();
     }
 
     /// À appeler une fois les fenêtres réduites : changer leur position ne se voit plus.
-    fn apply_placements(&mut self) {
-        for drag in std::mem::take(&mut self.pending_placements) {
+    fn apply_placements(&mut self, s: usize) {
+        for drag in std::mem::take(&mut self.screens[s].pending_placements) {
             anim::set_restore_position(hwnd_of(drag.window), drag.rect, drag.maximized);
         }
     }
 
-    /// La fenêtre en cours de déplacement est-elle lâchable sur la barre ?
-    fn window_over_bar(&self) -> bool {
-        let Some(drag) = self.window_drag else { return false };
+    /// Écran dont la barre est sous la fenêtre en cours de déplacement, si on peut l'y lâcher :
+    /// la barre de son propre écran, et il doit rester une autre fenêtre dans sa scène.
+    fn window_drop_target(&self) -> Option<ScreenId> {
+        let drag = self.window_drag?;
         // Un redimensionnement passe par les mêmes événements : on ne retient que les
         // déplacements (taille inchangée). Une fenêtre agrandie reprend sa taille normale
         // dès qu'on la tire, ce n'est pas un redimensionnement.
         let resized = size(anim::window_rect(hwnd_of(drag.window))) != size(drag.rect);
-        if resized && !drag.maximized {
-            return false;
+        if (resized && !drag.maximized) || !self.model.can_detach(drag.window) {
+            return None;
         }
+        let screen = self.model.screen_of(drag.window)?;
+        let bar = self.screens[self.screen_index(screen)?].appbar?;
         let mut pt = POINT::default();
-        unsafe { GetCursorPos(&mut pt) }.is_ok() && self.appbar.is_some_and(|bar| contains(bar, pt))
+        unsafe { GetCursorPos(&mut pt) }.ok()?;
+        contains(bar, pt).then_some(screen)
     }
 
-    fn set_drop_target(&mut self, over: bool) {
-        if self.drop_target != over {
-            self.drop_target = over;
-            self.render();
+    fn set_drop_target(&mut self, target: Option<ScreenId>) {
+        if self.drop_target == target {
+            return;
+        }
+        let old = std::mem::replace(&mut self.drop_target, target);
+        for screen in [old, target].into_iter().flatten() {
+            if let Some(s) = self.screen_index(screen) {
+                self.render(s);
+            }
         }
     }
 
-    /// La scène active vient de se vider (dernière fenêtre fermée ou réduite) : la scène la plus
-    /// récente de la barre prend sa place, plutôt que de laisser le bureau seul à l'écran.
-    fn show_next_stage(&mut self) {
-        if let Some(next) = self.model.next_stage() {
+    /// La scène active d'un écran vient de se vider (dernière fenêtre fermée, réduite ou partie
+    /// sur un autre écran) : la scène la plus récente de sa barre prend sa place, plutôt que de
+    /// laisser le bureau seul à l'écran.
+    fn show_next_stage(&mut self, screen: ScreenId) {
+        if let Some(next) = self.model.next_stage(screen) {
             let t = self.model.activate(next, None);
-            self.apply(t, true);
+            self.apply(screen, t, true);
         }
     }
 
@@ -685,7 +714,8 @@ impl App {
         HIDDEN.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != w);
     }
 
-    /// Filet de sécurité : purge les fenêtres disparues et adopte celles apparues sans focus.
+    /// Filet de sécurité : purge les fenêtres disparues, adopte celles apparues sans focus et
+    /// suit celles passées sur un autre écran sans qu'on le voie (Win + Maj + flèche…).
     fn rescan(&mut self) {
         // Le Dock suit les applis ouvertes, avec ou sans les scènes.
         self.update_running();
@@ -697,33 +727,80 @@ impl App {
                 self.forget(w);
             }
         }
-        if Instant::now() >= self.guard_until {
-            for h in win::top_level_windows() {
-                let w = wid_of(h);
-                if self.model.is_tracked(w) || win::is_minimized(h) {
-                    continue;
+        for h in win::top_level_windows() {
+            let w = wid_of(h);
+            if win::is_minimized(h) {
+                continue;
+            }
+            let Some(here) = self.screen_at(h) else { continue };
+            if self.guarded(here) {
+                continue;
+            }
+            match self.model.screen_of(w) {
+                Some(from) if from != here && !self.guarded(from) && self.model.in_active_stage(w) => {
+                    self.follow_screen(w, here);
                 }
-                if let Some(app) = self.app_key(h) {
-                    self.model.adopt(w, &app);
+                Some(_) => {}
+                None => {
+                    if let Some(app) = self.app_key(h) {
+                        self.model.adopt(w, &app, here);
+                    }
                 }
             }
         }
-        self.refresh();
+        self.refresh_all();
         // Les titres des fenêtres ont pu changer.
-        self.invalidate();
+        self.render_all();
     }
 
     fn show_stage(&mut self, stage: u64, merge: bool) {
+        let Some(screen) = self.model.stage(stage).map(|s| s.screen) else { return };
         let t = if merge { self.model.merge_into_active(stage) } else { self.model.activate(stage, None) };
-        self.apply(t, true);
-        self.refresh();
+        self.apply(screen, t, true);
+        self.refresh_all();
     }
 
-    fn apply(&mut self, t: Transition, animate: bool) {
+    /// Applique un changement de scène sur l'écran `screen`, animé si possible.
+    fn apply(&mut self, screen: ScreenId, t: Transition, animate: bool) {
         if t.is_empty() {
             return;
         }
-        self.finish_switch();
+        let Some(s) = self.screen_index(screen) else {
+            self.apply_now(t);
+            return;
+        };
+        self.finish_switch(s);
+        self.prepare(&t);
+        let sc = &self.screens[s];
+        let animate = animate && !self.anim_duration.is_zero() && sc.appbar.is_some();
+        let extra = if animate { self.anim_duration } else { Duration::ZERO };
+        self.screens[s].guard_until = Instant::now() + SWITCH_GUARD + extra;
+        if animate && self.start_switch(s, &t) {
+            return;
+        }
+        self.reveal(&t.restore, t.focus);
+        self.hide(&t.minimize);
+    }
+
+    /// Applique un changement sans animation, sur tous les écrans à la fois (mise en route des
+    /// scènes, écran débranché).
+    fn apply_now(&mut self, t: Transition) {
+        if t.is_empty() {
+            return;
+        }
+        let guard = Instant::now() + SWITCH_GUARD;
+        for s in 0..self.screens.len() {
+            self.finish_switch(s);
+            self.screens[s].guard_until = guard;
+        }
+        self.prepare(&t);
+        self.reveal(&t.restore, t.focus);
+        self.hide(&t.minimize);
+    }
+
+    /// Avant de réduire des fenêtres : leur photo pour la barre, et la liste à restaurer en
+    /// quittant.
+    fn prepare(&mut self, t: &Transition) {
         // Dernière occasion de photographier les fenêtres sortantes : réduites, elles ne se
         // dessinent plus. Ces images servent aux cartes inclinées de la barre.
         for &w in &t.minimize {
@@ -734,40 +811,33 @@ impl App {
                 }
             }
         }
-        {
-            let mut hidden = HIDDEN.lock().unwrap_or_else(|e| e.into_inner());
-            hidden.retain(|w| !t.restore.contains(w) && t.focus != Some(*w));
-            for &w in &t.minimize {
-                if !hidden.contains(&w) {
-                    hidden.push(w);
-                }
+        let mut hidden = HIDDEN.lock().unwrap_or_else(|e| e.into_inner());
+        hidden.retain(|w| !t.restore.contains(w) && t.focus != Some(*w));
+        for &w in &t.minimize {
+            if !hidden.contains(&w) {
+                hidden.push(w);
             }
         }
-        let animate = animate && !self.anim_duration.is_zero() && self.appbar.is_some();
-        let extra = if animate { self.anim_duration } else { Duration::ZERO };
-        self.guard_until = Instant::now() + SWITCH_GUARD + extra;
-        if animate && self.start_switch(&t) {
-            return;
-        }
-        self.reveal(&t.restore, t.focus);
-        self.hide(&t.minimize);
     }
 
-    /// Lance l'animation d'un changement de scène. Renvoie `false` s'il n'y a rien à animer.
-    fn start_switch(&mut self, t: &Transition) -> bool {
+    /// Lance l'animation d'un changement de scène sur l'écran `s`. Renvoie `false` s'il n'y a
+    /// rien à animer.
+    fn start_switch(&mut self, s: usize, t: &Transition) -> bool {
         let now = Instant::now();
-        let mon = self.monitor;
-        let bar = self.appbar.unwrap_or_default();
+        let (mon, bar, overlay) = {
+            let sc = &self.screens[s];
+            (sc.rect, sc.appbar.unwrap_or_default(), sc.overlay)
+        };
         let to_overlay = |r: RECT| offset(r, -mon.left, -mon.top);
         let bar_to_overlay = |r: RECT| offset(r, bar.left - mon.left, bar.top - mon.top);
 
         // Les fenêtres entrantes partent de leur carte actuelle dans la barre.
         let incoming: Vec<Wid> = t.restore.iter().copied().chain(t.focus).collect();
         // Si on vient de lâcher une carte, elles partent de là où on l'a lâchée.
-        let dropped = self.drag_source.take();
-        let card = self.cards.iter().find(|c| incoming.contains(&c.window)).map(|c| {
+        let dropped = self.screens[s].drag_source.take();
+        let card = self.screens[s].cards.iter().find(|c| incoming.contains(&c.window)).map(|c| {
             // Figée à sa position affichée : elle va s'effacer pendant que ses fenêtres partent.
-            let (dx, dy) = self.card_offset(c, now);
+            let (dx, dy) = self.card_offset(s, c, now);
             Card {
                 rect: offset(c.rect, dx, dy),
                 thumb_box: offset(c.thumb_box, dx, dy),
@@ -778,18 +848,20 @@ impl App {
             }
         });
         let source = dropped.or_else(|| card.as_ref().map(|c| bar_to_overlay(c.thumb_box)));
-        self.departing = if dropped.is_none() { card } else { None };
+        self.screens[s].departing = if dropped.is_none() { card } else { None };
 
         // La scène sortante prend la première place de la barre ; sa carte reste cachée
         // jusqu'à ce que les miniatures l'aient rejointe.
-        self.arriving = t.minimize.first().and_then(|w| self.model.stage_of(*w));
-        self.refresh();
+        self.screens[s].arriving = t.minimize.first().and_then(|w| self.model.stage_of(*w));
+        self.refresh(s);
         let bar_w = bar.right - bar.left;
-        let target = self
-            .arriving
-            .and_then(|id| self.cards.iter().find(|c| c.stage == id))
-            .map(|c| bar_to_overlay(c.thumb_box))
-            .unwrap_or_else(|| bar_to_overlay(RECT { left: 0, top: 0, right: bar_w, bottom: bar_w * 5 / 8 }));
+        let target = {
+            let sc = &self.screens[s];
+            sc.arriving
+                .and_then(|id| sc.cards.iter().find(|c| c.stage == id))
+                .map(|c| bar_to_overlay(c.thumb_box))
+                .unwrap_or_else(|| bar_to_overlay(RECT { left: 0, top: 0, right: bar_w, bottom: bar_w * 5 / 8 }))
+        };
 
         // Fenêtres concernées, de l'avant vers l'arrière, avec leur position à l'écran.
         let outgoing: Vec<(Wid, RECT)> = t
@@ -812,7 +884,7 @@ impl App {
 
         let mut flights = Vec::new();
         let mut fly = |w: Wid, from: RECT, to: RECT, fade_in: bool| unsafe {
-            if let Ok(thumb) = DwmRegisterThumbnail(self.overlay, hwnd_of(w)) {
+            if let Ok(thumb) = DwmRegisterThumbnail(overlay, hwnd_of(w)) {
                 anim::place_thumb(thumb, from, true, if fade_in { 0 } else { 255 });
                 flights.push(Flight { thumb, from, to, fade_in });
             }
@@ -830,8 +902,8 @@ impl App {
             fly(w, from, to, true);
         }
         if flights.is_empty() {
-            self.departing = None;
-            self.reveal_arriving();
+            self.screens[s].departing = None;
+            self.reveal_arriving(s);
             return false;
         }
 
@@ -839,9 +911,9 @@ impl App {
             anim::set_transitions(hwnd_of(w), false);
         }
         // Les miniatures doivent être à l'écran avant que les vraies fenêtres disparaissent.
-        self.show_overlay();
+        self.show_overlay(s);
         self.hide(&t.minimize);
-        self.switch = Some(Switch {
+        self.screens[s].switch = Some(Switch {
             start: now,
             duration: self.anim_duration,
             flights,
@@ -853,13 +925,14 @@ impl App {
         true
     }
 
-    fn show_overlay(&self) {
-        let mon = self.monitor;
+    fn show_overlay(&self, s: usize) {
+        let sc = &self.screens[s];
+        let mon = sc.rect;
         unsafe {
             // Un pixel de moins que l'écran : sinon Windows croit à une appli plein écran
             // et demande à la barre de se cacher.
             let _ = SetWindowPos(
-                self.overlay,
+                sc.overlay,
                 HWND_TOPMOST,
                 mon.left,
                 mon.top,
@@ -871,25 +944,38 @@ impl App {
         }
     }
 
-    fn hide_overlay(&self) {
+    fn hide_overlay(&self, s: usize) {
         unsafe {
-            let _ = ShowWindow(self.overlay, SW_HIDE);
+            let _ = ShowWindow(self.screens[s].overlay, SW_HIDE);
         }
     }
 
     fn animating(&self) -> bool {
-        self.switch.is_some() || self.slide_start.is_some() || self.dock_animating() || self.notch_animating()
+        self.screens.iter().any(|sc| sc.switch.is_some() || sc.slide_start.is_some())
+            || self.dock_animating()
+            || self.notch_animating()
     }
 
     /// Une image d'animation, appelée à chaque rafraîchissement de l'écran.
     fn tick(&mut self) {
         let now = Instant::now();
-        // La barre se redessine tant que ses cartes bougent ou s'enchaînent en fondu.
-        let mut redraw = self.slide_start.is_some();
-        if self.slide_start.is_some_and(|start| anim::progress(start, self.anim_duration, now) >= 1.0) {
-            self.slide_start = None;
+        for s in 0..self.screens.len() {
+            self.tick_screen(s, now);
         }
-        if let Some(switch) = &self.switch {
+        self.dock_tick(now);
+        self.notch_tick(now);
+    }
+
+    fn tick_screen(&mut self, s: usize, now: Instant) {
+        let duration = self.anim_duration;
+        let sc = &mut self.screens[s];
+        // La barre se redessine tant que ses cartes bougent ou s'enchaînent en fondu.
+        let mut redraw = sc.slide_start.is_some();
+        if sc.slide_start.is_some_and(|start| anim::progress(start, duration, now) >= 1.0) {
+            sc.slide_start = None;
+        }
+        let (mut land, mut finish) = (false, false);
+        if let Some(switch) = &sc.switch {
             match switch.landed {
                 None => {
                     let p = anim::progress(switch.start, switch.duration, now);
@@ -904,55 +990,56 @@ impl App {
                         };
                         anim::place_thumb(f.thumb, anim::lerp(f.from, f.to, e), true, opacity);
                     }
-                    redraw |= self.arriving.is_some() || self.departing.is_some();
-                    if p >= 1.0 {
-                        self.land(now);
-                    }
+                    redraw |= sc.arriving.is_some() || sc.departing.is_some();
+                    land = p >= 1.0;
                 }
-                Some(landed) if now.duration_since(landed) >= SETTLE => self.finish_switch(),
-                Some(_) => {}
+                Some(landed) => finish = now.duration_since(landed) >= SETTLE,
             }
         }
-        if redraw {
-            self.render();
+        if land {
+            self.land(s, now);
         }
-        self.dock_tick(now);
-        self.notch_tick(now);
+        if finish {
+            self.finish_switch(s);
+        }
+        if redraw {
+            self.render(s);
+        }
     }
 
     /// Fin du trajet : les vraies fenêtres reprennent la place de leurs miniatures.
-    fn land(&mut self, now: Instant) {
-        let Some(switch) = self.switch.as_mut().filter(|s| s.landed.is_none()) else { return };
+    fn land(&mut self, s: usize, now: Instant) {
+        let Some(switch) = self.screens[s].switch.as_mut().filter(|sw| sw.landed.is_none()) else { return };
         switch.landed = Some(now);
         let restore = std::mem::take(&mut switch.restore);
         let focus = switch.focus;
         self.reveal(&restore, focus);
-        self.departing = None;
-        self.reveal_arriving();
+        self.screens[s].departing = None;
+        self.reveal_arriving(s);
     }
 
-    /// Termine tout de suite l'animation en cours, s'il y en a une.
-    fn finish_switch(&mut self) {
-        self.land(Instant::now());
-        let Some(switch) = self.switch.take() else { return };
+    /// Termine tout de suite l'animation en cours sur cet écran, s'il y en a une.
+    fn finish_switch(&mut self, s: usize) {
+        self.land(s, Instant::now());
+        let Some(switch) = self.screens[s].switch.take() else { return };
         unsafe {
             for f in switch.flights {
                 let _ = DwmUnregisterThumbnail(f.thumb);
             }
         }
         // L'overlay porte aussi la carte qu'on est en train de déplacer.
-        if !self.dragging() {
-            self.hide_overlay();
+        if !self.dragging(s) {
+            self.hide_overlay(s);
         }
-        self.apply_placements();
+        self.apply_placements(s);
         for w in switch.quiet {
             anim::set_transitions(hwnd_of(w), true);
         }
     }
 
-    fn reveal_arriving(&mut self) {
-        if self.arriving.take().is_some() {
-            self.render();
+    fn reveal_arriving(&mut self, s: usize) {
+        if self.screens[s].arriving.take().is_some() {
+            self.render(s);
         }
     }
 
@@ -985,72 +1072,56 @@ impl App {
         }
     }
 
-    // --- Barre latérale -------------------------------------------------------------
+    // --- Barres latérales -----------------------------------------------------------
 
-    /// Écran principal (la barre, l'encoche et les coins y sont).
-    fn update_monitor(&mut self) {
-        unsafe {
-            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
-            let _ = GetMonitorInfoW(monitor, &mut info);
-            self.monitor = info.rcMonitor;
-        }
-    }
-
-    /// Inscrit la barre auprès de Windows, sans réserver de place : elle apprend ainsi
-    /// qu'une appli passe en plein écran, ce qui sert aussi à l'encoche et aux coins.
-    fn register_appbar(&mut self) {
+    /// Inscrit la barre d'un écran auprès de Windows, sans réserver de place : elle apprend
+    /// ainsi qu'une appli passe en plein écran, ce qui sert aussi aux encoches et aux coins.
+    fn register_appbar(&mut self, s: usize) {
         let mut abd = APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
-            hWnd: self.hwnd,
+            hWnd: self.screens[s].hwnd,
             uCallbackMessage: WM_APPBAR,
             ..Default::default()
         };
         unsafe { SHAppBarMessage(ABM_NEW, &mut abd) };
     }
 
-    fn unregister_appbar(&mut self) {
-        self.appbar = None;
-        let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.hwnd, ..Default::default() };
+    fn unregister_appbar(&mut self, s: usize) {
+        self.screens[s].appbar = None;
+        let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.screens[s].hwnd, ..Default::default() };
         unsafe { SHAppBarMessage(ABM_REMOVE, &mut abd) };
     }
 
-    /// Réserve le bord gauche de l'écran pour la barre des scènes.
-    fn reserve_bar(&mut self) {
-        if self.appbar.is_none() {
-            self.appbar = Some(RECT::default());
-            self.place_appbar();
+    /// Réserve le bord gauche de l'écran pour sa barre des scènes.
+    fn reserve_bar(&mut self, s: usize) {
+        if self.screens[s].appbar.is_none() {
+            self.screens[s].appbar = Some(RECT::default());
+            self.place_appbar(s);
         }
     }
 
     /// Rend le bord gauche de l'écran, en restant inscrit pour le plein écran.
-    fn release_bar(&mut self) {
-        if self.appbar.is_some() {
-            self.unregister_appbar();
-            self.register_appbar();
+    fn release_bar(&mut self, s: usize) {
+        if self.screens[s].appbar.is_some() {
+            self.unregister_appbar(s);
+            self.register_appbar(s);
         }
     }
 
-    /// Réserve une bande sur le bord gauche de l'écran principal, comme la barre des tâches :
-    /// les fenêtres maximisées s'arrêtent à côté.
-    fn place_appbar(&mut self) {
-        let Some(current) = self.appbar else { return };
+    /// Réserve une bande sur le bord gauche de l'écran, comme la barre des tâches : les
+    /// fenêtres maximisées s'arrêtent à côté.
+    fn place_appbar(&mut self, s: usize) {
+        let sc = &mut self.screens[s];
+        let Some(current) = sc.appbar else { return };
+        let width = BAR_WIDTH * sc.dpi / 96;
+        let mut abd = APPBARDATA {
+            cbSize: size_of::<APPBARDATA>() as u32,
+            hWnd: sc.hwnd,
+            uEdge: ABE_LEFT,
+            rc: sc.rect,
+            ..Default::default()
+        };
         unsafe {
-            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
-            let _ = GetMonitorInfoW(monitor, &mut info);
-            self.monitor = info.rcMonitor;
-            let (mut dpi, mut dpi_y) = (96u32, 96u32);
-            let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
-            let width = BAR_WIDTH * dpi as i32 / 96;
-
-            let mut abd = APPBARDATA {
-                cbSize: size_of::<APPBARDATA>() as u32,
-                hWnd: self.hwnd,
-                uEdge: ABE_LEFT,
-                rc: info.rcMonitor,
-                ..Default::default()
-            };
             abd.rc.right = abd.rc.left + width;
             SHAppBarMessage(ABM_QUERYPOS, &mut abd);
             abd.rc.right = abd.rc.left + width;
@@ -1059,18 +1130,17 @@ impl App {
             }
             SHAppBarMessage(ABM_SETPOS, &mut abd);
             let r = abd.rc;
-            self.appbar = Some(r);
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+            sc.appbar = Some(r);
+            let _ = SetWindowPos(sc.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
 
-            if !self.font.is_invalid() {
-                let _ = DeleteObject(self.font);
+            if !sc.font.is_invalid() {
+                let _ = DeleteObject(sc.font);
             }
-            let dpi = self.dpi();
             // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
-            self.font = make_font("Inter", 12, 400, dpi);
+            sc.font = make_font("Inter", 12, 400, sc.dpi);
         }
-        self.layout_key.clear();
-        self.refresh();
+        sc.layout_key.clear();
+        self.refresh(s);
     }
 
     fn add_tray(&self) {
@@ -1103,47 +1173,63 @@ impl App {
         *self.icons.entry(w).or_insert_with(|| win::icon(hwnd_of(w)))
     }
 
-    /// Recalcule la disposition des cartes de la barre.
-    fn refresh(&mut self) {
+    fn refresh_all(&mut self) {
+        for s in 0..self.screens.len() {
+            self.refresh(s);
+        }
+    }
+
+    fn render_all(&self) {
+        for s in 0..self.screens.len() {
+            self.render(s);
+        }
+    }
+
+    /// Recalcule la disposition des cartes de la barre d'un écran.
+    fn refresh(&mut self, s: usize) {
+        let (hwnd, dpi, screen) = {
+            let sc = &self.screens[s];
+            (sc.hwnd, sc.dpi, sc.id)
+        };
         let mut rc = RECT::default();
         unsafe {
-            let _ = GetClientRect(self.hwnd, &mut rc);
+            let _ = GetClientRect(hwnd, &mut rc);
         }
-        let dpi = self.dpi();
-        let s = move |v: i32| v * dpi / 96;
-        let margin = s(16);
-        let stack = s(10);
+        let px = move |v: i32| v * dpi / 96;
+        let margin = px(16);
+        let stack = px(10);
         let width = (rc.right - 2 * margin).max(1);
         let thumb_h = (width - stack) * 5 / 8;
-        let label_h = s(26);
+        let label_h = px(26);
         let card_h = stack + thumb_h + label_h;
 
         let limit = rc.bottom - margin;
         let mut layout: LayoutKey = Vec::new();
-        let mut y = s(20);
-        for stage in self.model.sidebar() {
+        let mut y = px(20);
+        for stage in self.model.sidebar(screen) {
             if y + card_h > limit {
                 break;
             }
             let rect = RECT { left: margin, top: y, right: margin + width, bottom: y + card_h };
             layout.push((stage.id, stage.windows[0], stage.windows.len(), rect));
-            y += card_h + s(18);
+            y += card_h + px(18);
         }
-        if layout == self.layout_key {
+        if layout == self.screens[s].layout_key {
             return;
         }
 
         // Les cartes qui restent glissent depuis l'endroit où elles sont affichées en ce moment.
         let now = Instant::now();
-        let previous: HashMap<u64, RECT> = self
+        let previous: HashMap<u64, RECT> = self.screens[s]
             .cards
             .iter()
             .map(|c| {
-                let (dx, dy) = self.card_offset(c, now);
+                let (dx, dy) = self.card_offset(s, c, now);
                 (c.stage, offset(c.rect, dx, dy))
             })
             .collect();
-        self.cards.clear();
+        let arriving = self.screens[s].arriving;
+        let mut cards = Vec::new();
         let mut sliding = false;
         for &(stage, window, _, rect) in &layout {
             let thumb_box = RECT { left: rect.left, top: rect.top + stack, right: rect.right, bottom: rect.top + stack + thumb_h };
@@ -1151,32 +1237,29 @@ impl App {
             let dest = fit(thumb_box, self.window_size(window));
             let slide = previous.get(&stage).map_or((0, 0), |r| (r.left - rect.left, r.top - rect.top));
             // Une carte qui n'était pas affichée (et ne vient pas d'un trajet) apparaît en fondu.
-            let fade_in = !previous.contains_key(&stage) && self.arriving != Some(stage);
+            let fade_in = !previous.contains_key(&stage) && arriving != Some(stage);
             sliding |= slide != (0, 0) || fade_in;
             let icon = self.icon(window);
-            self.cards.push(Card { stage, window, windows, rect, thumb_box, dest, icon, slide, hidden: false, fade_in });
+            cards.push(Card { stage, window, windows, rect, thumb_box, dest, icon, slide, hidden: false, fade_in });
         }
-        self.slide_start = sliding.then_some(now);
-        self.layout_key = layout;
-        if self.hover.is_some_and(|h| !self.cards.iter().any(|c| c.stage == h)) {
-            self.hover = None;
+        let sc = &mut self.screens[s];
+        sc.cards = cards;
+        sc.slide_start = sliding.then_some(now);
+        sc.layout_key = layout;
+        if sc.hover.is_some_and(|h| !sc.cards.iter().any(|c| c.stage == h)) {
+            sc.hover = None;
         }
-        self.place_cards(now);
-        self.invalidate();
+        self.render(s);
     }
 
     /// Décalage d'affichage d'une carte pendant l'animation de glissement.
-    fn card_offset(&self, card: &Card, now: Instant) -> (i32, i32) {
-        let remaining = 1.0 - anim::spring(self.slide_progress(now));
+    fn card_offset(&self, s: usize, card: &Card, now: Instant) -> (i32, i32) {
+        let remaining = 1.0 - anim::spring(self.slide_progress(s, now));
         ((card.slide.0 as f64 * remaining) as i32, (card.slide.1 as f64 * remaining) as i32)
     }
 
-    fn slide_progress(&self, now: Instant) -> f64 {
-        self.slide_start.map_or(1.0, |start| anim::progress(start, self.anim_duration, now))
-    }
-
-    fn place_cards(&self, _now: Instant) {
-        self.render();
+    fn slide_progress(&self, s: usize, now: Instant) -> f64 {
+        self.screens[s].slide_start.map_or(1.0, |start| anim::progress(start, self.anim_duration, now))
     }
 
     /// Taille de la fenêtre telle qu'on la dessine : son instantané, sinon sa position mémorisée.
@@ -1190,80 +1273,85 @@ impl App {
 
     /// Opacité d'une carte : fondu d'apparition, fondu enchaîné avec les miniatures qui la
     /// rejoignent, ou invisible pendant qu'on la déplace.
-    fn card_alpha(&self, card: &Card, now: Instant) -> u8 {
-        if self.arriving == Some(card.stage) {
-            let p = self.switch.as_ref().map_or(1.0, |s| anim::progress(s.start, s.duration, now));
+    fn card_alpha(&self, s: usize, card: &Card, now: Instant) -> u8 {
+        let sc = &self.screens[s];
+        if sc.arriving == Some(card.stage) {
+            let p = sc.switch.as_ref().map_or(1.0, |sw| anim::progress(sw.start, sw.duration, now));
             return (anim::cross_fade(p) * 255.0) as u8;
         }
         if card.hidden {
             return 0;
         }
         if card.fade_in {
-            return anim::fade_in(self.slide_progress(now));
+            return anim::fade_in(self.slide_progress(s, now));
         }
         255
     }
 
-    fn invalidate(&self) {
-        self.render();
+    fn hit(&self, s: usize, pt: POINT) -> Option<u64> {
+        self.screens[s].cards.iter().find(|c| contains(c.rect, pt)).map(|c| c.stage)
     }
 
-    fn hit(&self, pt: POINT) -> Option<u64> {
-        self.cards.iter().find(|c| contains(c.rect, pt)).map(|c| c.stage)
+    /// Scène sous la souris dans la barre `hwnd` (clic droit).
+    fn bar_hit(&self, hwnd: HWND, pt: POINT) -> Option<u64> {
+        self.hit(self.bar_index(hwnd)?, pt)
     }
 
-    fn on_mouse_move(&mut self, pt: POINT) {
-        if !self.tracking_mouse {
+    fn on_mouse_move(&mut self, s: usize, pt: POINT) {
+        let sc = &mut self.screens[s];
+        if !sc.tracking_mouse {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
-                hwndTrack: self.hwnd,
+                hwndTrack: sc.hwnd,
                 dwHoverTime: 0,
             };
-            self.tracking_mouse = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+            sc.tracking_mouse = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
         }
-        self.set_hover(self.hit(pt));
+        self.set_hover(s, self.hit(s, pt));
     }
 
-    fn set_hover(&mut self, hover: Option<u64>) {
-        if self.hover != hover {
-            self.hover = hover;
-            self.invalidate();
+    fn set_hover(&mut self, s: usize, hover: Option<u64>) {
+        if self.screens[s].hover != hover {
+            self.screens[s].hover = hover;
+            self.render(s);
         }
     }
 
     // --- Glisser-déposer ------------------------------------------------------------
 
-    fn dragging(&self) -> bool {
-        self.drag.as_ref().is_some_and(|d| d.ghost.is_some())
+    fn dragging(&self, s: usize) -> bool {
+        self.screens[s].drag.as_ref().is_some_and(|d| d.ghost.is_some())
     }
 
-    fn press(&mut self, pt: POINT) {
-        let Some(bar) = self.appbar else { return };
-        let Some(card) = self.cards.iter().find(|c| !c.hidden && contains(c.rect, pt)) else { return };
-        let mon = self.monitor;
-        let (dx, dy) = self.card_offset(card, Instant::now());
+    fn press(&mut self, s: usize, pt: POINT) {
+        let sc = &self.screens[s];
+        let Some(bar) = sc.appbar else { return };
+        let Some(card) = sc.cards.iter().find(|c| !c.hidden && contains(c.rect, pt)) else { return };
+        let mon = sc.rect;
+        let (dx, dy) = self.card_offset(s, card, Instant::now());
         let origin = offset(card.dest, dx + bar.left - mon.left, dy + bar.top - mon.top);
-        self.drag = Some(Drag { stage: card.stage, window: card.window, start: pt, origin, ghost: None, rect: origin });
+        let drag = Drag { stage: card.stage, window: card.window, start: pt, origin, ghost: None, rect: origin };
+        self.screens[s].drag = Some(drag);
         unsafe {
             // Garde la souris même quand elle sort de la barre.
-            SetCapture(self.hwnd);
+            SetCapture(self.screens[s].hwnd);
         }
     }
 
-    fn drag_to(&mut self, pt: POINT) {
-        let Some(bar) = self.appbar else { return };
-        let Some(start) = self.drag.as_ref().map(|d| d.start) else { return };
-        if !self.dragging() {
+    fn drag_to(&mut self, s: usize, pt: POINT) {
+        let Some(bar) = self.screens[s].appbar else { return };
+        let Some(start) = self.screens[s].drag.as_ref().map(|d| d.start) else { return };
+        if !self.dragging(s) {
             // Un petit tremblement pendant un clic ne doit pas lancer un glisser.
             let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(4);
             if (pt.x - start.x).abs() < threshold && (pt.y - start.y).abs() < threshold {
                 return;
             }
-            self.begin_drag();
+            self.begin_drag(s);
         }
-        let mon = self.monitor;
-        let Some(drag) = self.drag.as_mut() else { return };
+        let mon = self.screens[s].rect;
+        let Some(drag) = self.screens[s].drag.as_mut() else { return };
         let Some(ghost) = drag.ghost else { return };
         let to_overlay = |p: POINT| POINT { x: p.x + bar.left - mon.left, y: p.y + bar.top - mon.top };
         let (cursor, grab) = (to_overlay(pt), to_overlay(drag.start));
@@ -1278,141 +1366,142 @@ impl App {
         anim::place_thumb(ghost, drag.rect, true, 235);
     }
 
-    fn begin_drag(&mut self) {
-        self.finish_switch();
-        let overlay = self.overlay;
-        let Some(drag) = self.drag.as_mut() else { return };
+    fn begin_drag(&mut self, s: usize) {
+        self.finish_switch(s);
+        let overlay = self.screens[s].overlay;
+        let Some(drag) = self.screens[s].drag.as_mut() else { return };
         let Ok(ghost) = (unsafe { DwmRegisterThumbnail(overlay, hwnd_of(drag.window)) }) else { return };
         anim::place_thumb(ghost, drag.origin, true, 235);
         drag.ghost = Some(ghost);
         let stage = drag.stage;
         // La carte quitte la barre pendant qu'on la déplace.
-        self.set_card_hidden(stage, true);
-        self.hover = None;
-        self.show_overlay();
-        self.render();
+        self.set_card_hidden(s, stage, true);
+        self.screens[s].hover = None;
+        self.show_overlay(s);
+        self.render(s);
     }
 
-    fn release(&mut self, pt: POINT) {
-        let Some(drag) = self.drag.take() else { return };
+    fn release(&mut self, s: usize, pt: POINT) {
+        let Some(drag) = self.screens[s].drag.take() else { return };
         unsafe {
             let _ = ReleaseCapture();
         }
         let Some(ghost) = drag.ghost else {
             // Simple clic : Maj ajoute la scène à la scène active.
-            if self.hit(pt) == Some(drag.stage) {
+            if self.hit(s, pt) == Some(drag.stage) {
                 let merge = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
                 self.show_stage(drag.stage, merge);
             }
             return;
         };
-        let bar_w = self.appbar.map_or(0, |b| b.right - b.left);
+        let bar_w = self.screens[s].appbar.map_or(0, |b| b.right - b.left);
         if pt.x >= bar_w {
             // Lâchée hors de la barre : la scène rejoint la scène active, en partant d'ici.
-            self.drag_source = Some(drag.rect);
+            self.screens[s].drag_source = Some(drag.rect);
             self.show_stage(drag.stage, true);
-            self.drag_source = None;
+            self.screens[s].drag_source = None;
         }
-        self.drop_ghost(ghost, drag.stage);
+        self.drop_ghost(s, ghost, drag.stage);
     }
 
-    fn cancel_drag(&mut self) {
-        let Some(drag) = self.drag.take() else { return };
+    fn cancel_drag(&mut self, s: usize) {
+        let Some(drag) = self.screens[s].drag.take() else { return };
         if let Some(ghost) = drag.ghost {
-            self.drop_ghost(ghost, drag.stage);
+            self.drop_ghost(s, ghost, drag.stage);
         }
     }
 
-    fn drop_ghost(&mut self, ghost: isize, stage: u64) {
+    fn drop_ghost(&mut self, s: usize, ghost: isize, stage: u64) {
         unsafe {
             let _ = DwmUnregisterThumbnail(ghost);
         }
-        if self.switch.is_none() {
-            self.hide_overlay();
+        if self.screens[s].switch.is_none() {
+            self.hide_overlay(s);
         }
         // Lâchée sur la barre : la carte reprend sa place.
-        self.set_card_hidden(stage, false);
-        self.render();
+        self.set_card_hidden(s, stage, false);
     }
 
-    fn set_card_hidden(&mut self, stage: u64, hidden: bool) {
-        for card in self.cards.iter_mut().filter(|c| c.stage == stage) {
+    fn set_card_hidden(&mut self, s: usize, stage: u64, hidden: bool) {
+        for card in self.screens[s].cards.iter_mut().filter(|c| c.stage == stage) {
             card.hidden = hidden;
         }
-        self.place_cards(Instant::now());
+        self.render(s);
     }
 
-    /// Redessine la barre. Fond transparent : seuls les cartes, le survol et les libellés
-    /// sont visibles, posés directement sur le fond d'écran.
-    fn render(&self) {
-        let Some(bar) = self.appbar else { return };
+    /// Redessine la barre d'un écran. Fond transparent : seuls les cartes, le survol et les
+    /// libellés sont visibles, posés directement sur le fond d'écran.
+    fn render(&self, s: usize) {
+        let sc = &self.screens[s];
+        let Some(bar) = sc.appbar else { return };
         let (w, h) = (bar.right - bar.left, bar.bottom - bar.top);
-        let dpi = self.dpi();
-        let s = move |v: i32| v * dpi / 96;
+        let dpi = sc.dpi;
+        let px = move |v: i32| v * dpi / 96;
         let now = Instant::now();
         // (carte, rectangle, miniature à plat, décalage vertical, opacité)
-        let mut cards: Vec<(&Card, RECT, RECT, i32, u8)> = self
+        let mut cards: Vec<(&Card, RECT, RECT, i32, u8)> = sc
             .cards
             .iter()
             .map(|c| {
-                let (dx, dy) = self.card_offset(c, now);
-                (c, offset(c.rect, dx, dy), offset(c.dest, dx, dy), dy, self.card_alpha(c, now))
+                let (dx, dy) = self.card_offset(s, c, now);
+                (c, offset(c.rect, dx, dy), offset(c.dest, dx, dy), dy, self.card_alpha(s, c, now))
             })
             .filter(|c| c.4 > 0)
             .collect();
         // La carte de la scène qui revient à l'écran s'efface pendant que ses fenêtres partent.
-        if let (Some(card), Some(switch)) = (&self.departing, &self.switch) {
+        if let (Some(card), Some(switch)) = (&sc.departing, &sc.switch) {
             let alpha = 255 - anim::fade_in(anim::progress(switch.start, switch.duration, now));
             if alpha > 0 {
                 cards.push((card, card.rect, card.dest, 0, alpha));
             }
         }
+        let drop_target = self.drop_target == Some(sc.id);
 
         let mut canvas = Canvas::new(w, h);
         // Alpha 1 et non 0 : invisible, mais la barre reste cliquable partout
         // (Windows laisse passer les clics sur les pixels totalement transparents).
         canvas.clear((0, 0, 0), 1);
         let white = (255, 255, 255);
-        if self.drop_target {
+        if drop_target {
             // Une fenêtre est traînée au-dessus de la barre : la lâcher la sortira de sa scène.
-            canvas.round_rect(RECT { left: s(6), top: s(6), right: w - s(6), bottom: h - s(6) }, s(18), white, 56);
+            canvas.round_rect(RECT { left: px(6), top: px(6), right: w - px(6), bottom: h - px(6) }, px(18), white, 56);
         }
         let solid = |r: u8, g: u8, b: u8| Image { w: 1, h: 1, px: vec![0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32] };
         let (shadow, placeholder) = (solid(0, 0, 0), solid(58, 58, 66));
         for &(card, rect, dest, _, alpha) in &cards {
             let fade = |a: u8| (a as u32 * alpha as u32 / 255) as u8;
-            if self.hover == Some(card.stage) {
-                canvas.round_rect(inflate(rect, s(8)), s(16), white, fade(46));
+            if sc.hover == Some(card.stage) {
+                canvas.round_rect(inflate(rect, px(8)), px(16), white, fade(46));
             }
             // Fenêtres de la scène empilées derrière, de la plus lointaine à la plus proche.
             for (depth, &window) in card.windows.iter().enumerate().skip(1).rev() {
                 let d = depth as i32;
                 let image = self.snapshots.get(&window);
-                let area = offset(inflate(dest, -s(6) * d), 0, -s(9) * d);
+                let area = offset(inflate(dest, -px(6) * d), 0, -px(9) * d);
                 let r = image.map_or(area, |img| fit(area, SIZE { cx: img.w, cy: img.h }));
                 let img = image.map_or(&placeholder, |i| i.as_ref());
                 canvas.draw_quad(img, tilt(r), alpha, (50 * d) as u8);
             }
             // Ombre douce sous la miniature, puis la miniature elle-même.
-            canvas.draw_quad(&shadow, tilt(offset(inflate(dest, s(2)), s(1), s(4))), fade(40), 0);
-            canvas.draw_quad(&shadow, tilt(offset(dest, s(1), s(2))), fade(70), 0);
+            canvas.draw_quad(&shadow, tilt(offset(inflate(dest, px(2)), px(1), px(4))), fade(40), 0);
+            canvas.draw_quad(&shadow, tilt(offset(dest, px(1), px(2))), fade(70), 0);
             let image = self.snapshots.get(&card.window);
             canvas.draw_quad(image.map_or(&placeholder, |i| i.as_ref()), tilt(dest), alpha, 0);
         }
         canvas.gdi(|dc| unsafe {
-            SelectObject(dc, self.font);
+            SelectObject(dc, sc.font);
             SetBkMode(dc, TRANSPARENT);
             // Les libellés n'apparaissent qu'une fois la carte assez visible : GDI ne sait pas
             // dessiner en semi-transparence.
             for &(card, rect, dest, dy, _) in cards.iter().filter(|c| c.4 >= 160) {
                 if !self.snapshots.contains_key(&card.window) {
                     // Pas d'image de la fenêtre : son icône au milieu de la carte.
-                    let big = s(32);
+                    let big = px(32);
                     let (cx, cy) = ((dest.left + dest.right - big) / 2, (dest.top + dest.bottom - big) / 2);
                     let _ = DrawIconEx(dc, cx, cy, card.icon, big, big, 0, None, DI_NORMAL);
                 }
-                let label_top = card.thumb_box.bottom + dy + s(4);
-                let icon = s(16);
+                let label_top = card.thumb_box.bottom + dy + px(4);
+                let icon = px(16);
                 let _ = DrawIconEx(
                     dc,
                     rect.left,
@@ -1425,20 +1514,20 @@ impl App {
                     DI_NORMAL,
                 );
                 let title = win::title(hwnd_of(card.window));
-                let text_rect = RECT { left: rect.left + icon + s(6), top: label_top, right: rect.right, bottom: rect.bottom };
+                let text_rect = RECT { left: rect.left + icon + px(6), top: label_top, right: rect.right, bottom: rect.bottom };
                 let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
-                draw_text(dc, &title, text_rect, flags, TEXT, s(1));
+                draw_text(dc, &title, text_rect, flags, TEXT, px(1));
             }
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-            if self.drop_target {
-                let text_rect = RECT { left: 0, top: h - s(70), right: w, bottom: h - s(30) };
-                draw_text(dc, "Lâcher pour séparer", text_rect, centered, TEXT, s(1));
+            if drop_target {
+                let text_rect = RECT { left: 0, top: h - px(70), right: w, bottom: h - px(30) };
+                draw_text(dc, "Lâcher pour séparer", text_rect, centered, TEXT, px(1));
             } else if cards.is_empty() {
-                let text_rect = RECT { left: 0, top: s(20), right: w, bottom: s(60) };
-                draw_text(dc, "Aucune autre scène", text_rect, centered, TEXT_DIM, s(1));
+                let text_rect = RECT { left: 0, top: px(20), right: w, bottom: px(60) };
+                draw_text(dc, "Aucune autre scène", text_rect, centered, TEXT_DIM, px(1));
             }
         });
-        canvas.present(self.hwnd, POINT { x: bar.left, y: bar.top });
+        canvas.present(sc.hwnd, POINT { x: bar.left, y: bar.top });
     }
 }
 
@@ -1533,14 +1622,13 @@ unsafe extern "system" fn win_event(
         return;
     }
     // Traité plus tard dans la boucle de messages, jamais en plein milieu d'un autre traitement.
-    let sidebar = HWND(SIDEBAR.load(Ordering::Relaxed) as _);
-    let _ = PostMessageW(sidebar, WM_WINEVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize));
+    let main = HWND(MAIN.load(Ordering::Relaxed) as _);
+    let _ = PostMessageW(main, WM_WINEVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize));
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let is_dock = hwnd.0 as isize == DOCK.load(Ordering::Relaxed);
     let is_launcher = hwnd.0 as isize == LAUNCHER.load(Ordering::Relaxed);
-    let is_notch = hwnd.0 as isize == NOTCH.load(Ordering::Relaxed);
     if hwnd.0 as isize == SETTINGS.load(Ordering::Relaxed) {
         // Une vraie fenêtre, qui prend le premier plan comme les autres.
         if msg == WM_MOUSEACTIVATE {
@@ -1552,14 +1640,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         };
     }
     match msg {
-        WM_RBUTTONUP if is_notch => {
-            notch::notch_menu(hwnd);
-            return LRESULT(0);
-        }
-        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP if is_notch => {
-            with_app(|app| app.notch_mouse(msg, lp));
-            return LRESULT(0);
-        }
         // Le lanceur, lui, prend le premier plan : il lui faut le clavier.
         WM_CHAR | WM_KEYDOWN | WM_ACTIVATE | WM_MOUSEMOVE | WM_LBUTTONUP if is_launcher => {
             with_app(|app| app.launcher_input(msg, wp, lp));
@@ -1586,12 +1666,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             return LRESULT(0);
         }
-        WM_RBUTTONUP => {
-            if let Some(Some(stage)) = with_app(|app| app.hit(point(lp))) {
-                card_menu(hwnd, stage);
-            }
-            return LRESULT(0);
-        }
         _ => {}
     }
     match with_app(|app| app.handle(msg, wp, lp)) {
@@ -1599,7 +1673,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Some(None) => DefWindowProcW(hwnd, msg, wp, lp),
         None => {
             // Occupé : on remet l'événement à plus tard plutôt que de le perdre.
-            if [WM_WINEVENT, WM_APPBAR, WM_MEDIA, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
+            if [WM_WINEVENT, WM_MEDIA, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
                 .contains(&msg)
             {
                 let _ = PostMessageW(hwnd, msg, wp, lp);
@@ -1607,6 +1681,58 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
+    }
+}
+
+/// Barre des scènes d'un écran.
+unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        // Le menu a sa propre boucle de messages : on l'ouvre hors de `with_app`.
+        WM_RBUTTONUP => {
+            if let Some(Some(stage)) = with_app(|app| app.bar_hit(hwnd, point(lp))) {
+                card_menu(hwnd, stage);
+            }
+            LRESULT(0)
+        }
+        WM_APPBAR | WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            // Occupé : on remet l'avis de Windows à plus tard plutôt que de le perdre.
+            if with_app(|app| app.bar_message(hwnd, msg, wp, lp)).is_none() && msg == WM_APPBAR {
+                let _ = PostMessageW(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            screens_changed();
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Encoche d'un écran.
+unsafe extern "system" fn notch_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_RBUTTONUP => {
+            notch::notch_menu(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP => {
+            with_app(|app| app.notch_mouse(hwnd, msg, lp));
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            with_app(|app| app.notch_timer(hwnd, wp.0));
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            screens_changed();
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
@@ -1666,7 +1792,7 @@ unsafe fn card_menu(hwnd: HWND, stage: u64) {
         MENU_MERGE => with_app(|app| app.show_stage(stage, true)),
         MENU_SPLIT => with_app(|app| {
             if app.model.split(stage) {
-                app.refresh();
+                app.refresh_all();
             }
         }),
         _ => None,
@@ -1680,6 +1806,8 @@ pub fn run() -> Result<()> {
         // COM : le Dock lance des applis et ouvre la corbeille via le shell.
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
+        // La fenêtre principale garde l'ancien nom de classe : une deuxième instance la trouve
+        // pour ouvrir les réglages (voir `show_running_settings`).
         let class = w!("StageManagerSidebar");
         let wc = WNDCLASSW {
             hInstance: instance,
@@ -1692,8 +1820,9 @@ pub fn run() -> Result<()> {
         if RegisterClassW(&wc) == 0 {
             return Err(Error::from_win32());
         }
+        // Jamais affichée : elle reçoit les événements, les minuteurs et l'icône de notification.
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class,
             w!("Stage Manager"),
             WS_POPUP,
@@ -1706,8 +1835,15 @@ pub fn run() -> Result<()> {
             instance,
             None,
         )?;
-        SIDEBAR.store(hwnd.0 as isize, Ordering::Relaxed);
-        let overlay = anim::create_overlay(instance)?;
+        MAIN.store(hwnd.0 as isize, Ordering::Relaxed);
+        // Les barres des scènes et les encoches : une de chaque par écran (voir `screens`).
+        let procs: [(PCWSTR, WNDPROC); 2] = [(BAR_CLASS, Some(bar_proc)), (NOTCH_CLASS, Some(notch_proc))];
+        for (name, proc) in procs {
+            let screen_wc = WNDCLASSW { lpszClassName: name, lpfnWndProc: proc, ..wc };
+            if RegisterClassW(&screen_wc) == 0 {
+                return Err(Error::from_win32());
+            }
+        }
         let dock_class = w!("StageManagerDock");
         let dock_wc = WNDCLASSW { lpszClassName: dock_class, ..wc };
         if RegisterClassW(&dock_wc) == 0 {
@@ -1748,26 +1884,6 @@ pub fn run() -> Result<()> {
             None,
         )?;
         LAUNCHER.store(launcher.0 as isize, Ordering::Relaxed);
-        let notch_class = w!("StageManagerNotch");
-        let notch_wc = WNDCLASSW { lpszClassName: notch_class, ..wc };
-        if RegisterClassW(&notch_wc) == 0 {
-            return Err(Error::from_win32());
-        }
-        let notch = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            notch_class,
-            w!("Encoche"),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            instance,
-            None,
-        )?;
-        NOTCH.store(notch.0 as isize, Ordering::Relaxed);
         // Les réglages : une fenêtre ordinaire (barre des tâches, Alt+Tab), avec l'icône de l'appli.
         let settings_class = w!("StageManagerSettings");
         let settings_wc = WNDCLASSW { lpszClassName: settings_class, hIcon: win::app_icon(), ..wc };
@@ -1790,7 +1906,7 @@ pub fn run() -> Result<()> {
         )?;
         SETTINGS.store(settings.0 as isize, Ordering::Relaxed);
         let corners = Corners::create(instance)?;
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher, notch, settings, corners)));
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, dock, launcher, settings, corners)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [

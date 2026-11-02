@@ -8,7 +8,7 @@ use windows::{
         Foundation::*,
         Graphics::{
             Dwm::*,
-            Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+            Gdi::{GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         },
         Security::*,
         System::{LibraryLoader::GetModuleHandleW, Threading::*},
@@ -84,22 +84,67 @@ pub fn is_app_window(h: HWND) -> bool {
 /// Une vraie appli plein écran (jeu, vidéo…) est-elle au premier plan ? Windows prévient aussi
 /// quand c'est le bureau qui prend le premier plan (il couvre tout l'écran) : on l'écarte.
 pub fn fullscreen_app_in_front() -> bool {
+    fullscreen_monitor().is_some()
+}
+
+/// Écran couvert par l'appli plein écran au premier plan, s'il y en a une.
+pub fn fullscreen_monitor() -> Option<HMONITOR> {
     unsafe {
         let h = GetForegroundWindow();
-        if h.is_invalid() || pid(h) == GetCurrentProcessId() {
-            return false;
+        if h.is_invalid() || pid(h) == GetCurrentProcessId() || SHELL_CLASSES.contains(&class_name(h).as_str()) {
+            return None;
         }
-        if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"].contains(&class_name(h).as_str()) {
-            return false;
-        }
-        let mut rect = RECT::default();
-        let _ = GetWindowRect(h, &mut rect);
         let monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(monitor, &mut info);
-        let m = info.rcMonitor;
-        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+        covers(window_rect(h), info.rcMonitor).then_some(monitor)
     }
+}
+
+/// Une appli plein écran est-elle encore devant tout sur cet écran ? (la première fenêtre
+/// qu'on y voit, dans l'ordre Z, le couvre en entier sans être simplement agrandie). Les petites
+/// fenêtres « toujours au premier plan » qui flottent par-dessus (vidéo en incrustation…) sont
+/// passées.
+pub fn fullscreen_window_on(monitor: RECT) -> bool {
+    let me = unsafe { GetCurrentProcessId() };
+    for h in top_level_windows() {
+        unsafe {
+            if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() || pid(h) == me || is_cloaked(h) {
+                continue;
+            }
+        }
+        if SHELL_CLASSES.contains(&class_name(h).as_str()) {
+            continue;
+        }
+        let r = window_rect(h);
+        let overlaps = r.left < monitor.right && r.right > monitor.left && r.top < monitor.bottom && r.bottom > monitor.top;
+        if !overlaps {
+            continue;
+        }
+        if covers(r, monitor) {
+            return !unsafe { IsZoomed(h) }.as_bool();
+        }
+        let topmost = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
+        if !topmost {
+            return false;
+        }
+    }
+    false
+}
+
+/// Fenêtres du bureau et de la barre des tâches : elles couvrent l'écran sans être des applis.
+const SHELL_CLASSES: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+
+fn covers(r: RECT, m: RECT) -> bool {
+    r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
+fn window_rect(h: HWND) -> RECT {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(h, &mut rect);
+    }
+    rect
 }
 
 pub fn is_alive(h: HWND) -> bool {

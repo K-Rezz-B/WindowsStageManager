@@ -184,7 +184,7 @@ impl App {
                 let clock = clock_text();
                 if clock != self.dock.clock {
                     self.dock.clock = clock;
-                    self.render_notch();
+                    self.render_notches();
                 }
             }
             WM_DOCK_WALLPAPER => {
@@ -391,6 +391,8 @@ impl App {
         let m = Metrics::new(self.dock.dpi);
         let dpi = self.dock.dpi;
         let s = move |v: i32| v * dpi / 96;
+        // Le nom des applis, dans la police de la barre de l'écran principal.
+        let label_font = self.screens.first().map_or(HFONT::default(), |sc| sc.font);
         let window = self.dock_window_rect(&m);
         self.dock.window = window;
         let (w, h) = (window.right - window.left, window.bottom - window.top);
@@ -460,7 +462,7 @@ impl App {
             content.round_rect(knob_rect, knob / 2, white, 255);
             content.gdi(|dc| unsafe {
                 SetBkMode(dc, TRANSPARENT);
-                SelectObject(dc, self.font);
+                SelectObject(dc, label_font);
                 let text = if muted { "—".to_owned() } else { format!("{} %", (level * 100.0).round()) };
                 draw_text(dc, &text, sl.percent, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, TEXT, 0);
             });
@@ -497,7 +499,7 @@ impl App {
             _ => self.dock.model.hover.and_then(|i| Some((self.dock.model.items.get(i)?.name.as_str(), *layout.icons.get(i)?))),
         };
         let label_box = label.map(|(name, rect)| {
-            let width = text_width(self.font, name) + s(22);
+            let width = text_width(label_font, name) + s(22);
             let cx = (rect.left + rect.right) / 2;
             let bottom = rect.top - s(10);
             let r = RECT { left: cx - width / 2, top: bottom - s(26), right: cx + width / 2, bottom };
@@ -510,7 +512,7 @@ impl App {
             SetBkMode(dc, TRANSPARENT);
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
             if let (Some((name, _)), Some(r)) = (label, label_box) {
-                SelectObject(dc, self.font);
+                SelectObject(dc, label_font);
                 SetTextColor(dc, TEXT);
                 let mut text: Vec<u16> = name.encode_utf16().collect();
                 let mut rect = r;
@@ -711,8 +713,10 @@ impl App {
             match self.model.stage_of(w) {
                 Some(id) if !self.model.in_active_stage(w) => {
                     let t = self.model.activate(id, Some(w));
-                    self.apply(t, true);
-                    self.refresh();
+                    if let Some(screen) = self.model.screen_of(w) {
+                        self.apply(screen, t, true);
+                    }
+                    self.refresh_all();
                 }
                 _ => win::force_foreground(h),
             }
