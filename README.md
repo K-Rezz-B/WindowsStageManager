@@ -6,6 +6,36 @@ Une barre transparente sur le bord gauche de l'écran affiche les autres « scè
 de cartes inclinées en perspective, comme sur macOS, posées sur le fond d'écran. La scène active reste seule à l'écran ;
 les autres sont réduites.
 
+## Installation
+
+Il faut Windows 11, avec :
+
+- **Rust**, installé par [rustup](https://rustup.rs) (chaîne `stable-x86_64-pc-windows-msvc`,
+  celle par défaut) ;
+- les **Build Tools de Visual Studio**, charge de travail « Développement Desktop en C++ »,
+  avec le SDK Windows 11 : l'éditeur de liens MSVC, et `rc.exe` pour intégrer l'icône ;
+- **Google Chrome**, seulement pour la page accrochée à l'encoche.
+
+En ligne de commande, avec winget :
+
+```bash
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+Puis, dans un nouveau terminal :
+
+```bash
+git clone https://github.com/K-Rezz-B/WindowsStageManager.git
+cd WindowsStageManager
+cargo build --release
+```
+
+L'exécutable est `target\release\stage-manager.exe`. Lancez-le une fois, puis cochez
+« Lancer au démarrage de Windows » dans ses Réglages pour qu'il démarre avec la session.
+Les réglages sont propres à chaque PC (`%APPDATA%\StageManager\settings.txt`) : sur une
+nouvelle machine, tout est activé.
+
 ## Utilisation
 
 ```bash
