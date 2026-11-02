@@ -13,7 +13,7 @@ pub(super) const WM_DOCKBAR: u32 = WM_APP + 6;
 pub(super) const WM_DOCK_LOADED: u32 = WM_APP + 7;
 pub(super) const WM_DOCK_WALLPAPER: u32 = WM_APP + 8;
 
-const TIMER_CLOCK: usize = 3;
+pub(super) const TIMER_CLOCK: usize = 3;
 
 /// Largeur du panneau du volume (à droite du Dock) et son écart avec le Dock, en pixels à 100 %.
 const VOLUME_WIDTH: i32 = 54;
@@ -167,7 +167,7 @@ impl App {
         match msg {
             WM_DOCKBAR => match wp.0 as u32 {
                 ABN_POSCHANGED => self.place_dock(),
-                ABN_FULLSCREENAPP if self.enabled => unsafe {
+                ABN_FULLSCREENAPP if self.dock.reserved.is_some() => unsafe {
                     let cmd = if lp.0 != 0 && win::fullscreen_app_in_front() { SW_HIDE } else { SW_SHOWNOACTIVATE };
                     let _ = ShowWindow(self.dock.hwnd, cmd);
                 },
@@ -217,17 +217,15 @@ impl App {
         }
         self.update_running();
         self.place_dock();
+        // L'horloge (TIMER_CLOCK) est lancée par `apply_features` : l'encoche s'en sert aussi.
         unsafe {
             let _ = ShowWindow(self.dock.hwnd, SW_SHOWNOACTIVATE);
-            // L'horloge vérifie chaque seconde si la minute a changé.
-            SetTimer(self.hwnd, TIMER_CLOCK, 1000, None);
         }
     }
 
     pub(super) fn disable_dock(&mut self) {
         unsafe {
             let _ = ShowWindow(self.dock.hwnd, SW_HIDE);
-            let _ = KillTimer(self.hwnd, TIMER_CLOCK);
         }
         if self.dock.reserved.take().is_some() {
             let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.dock.hwnd, ..Default::default() };
@@ -387,7 +385,7 @@ impl App {
     }
 
     pub(super) fn render_dock(&mut self) {
-        if !self.enabled || self.dock.reserved.is_none() {
+        if self.dock.reserved.is_none() {
             return;
         }
         let m = Metrics::new(self.dock.dpi);

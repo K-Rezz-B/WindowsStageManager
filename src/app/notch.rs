@@ -213,8 +213,10 @@ impl App {
     pub(super) fn enable_notch(&mut self) {
         self.notch.shown = true;
         self.place_notch();
-        unsafe {
-            let _ = ShowWindow(self.notch.hwnd, SW_SHOWNOACTIVATE);
+        if !self.notch.fullscreen {
+            unsafe {
+                let _ = ShowWindow(self.notch.hwnd, SW_SHOWNOACTIVATE);
+            }
         }
         self.notch_retarget();
     }
@@ -264,6 +266,10 @@ impl App {
         self.notch.fullscreen = fullscreen;
         if fullscreen {
             self.notch_drop_thumb();
+        }
+        // Désactivée, elle reste cachée, mais retient l'état du plein écran pour plus tard.
+        if !self.notch.shown {
+            return;
         }
         unsafe {
             let _ = ShowWindow(self.notch.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
@@ -372,7 +378,7 @@ impl App {
         let (r, size) = n.frame(shape);
         let np = self.now_playing.as_ref();
         let (_, full) = self.notch_shapes();
-        let pinned = self.pin.url.is_some();
+        let pinned = self.pin_shown();
         // 0 au repos, 1 ouverte.
         let opened = ((shape.h - REST.h) / (full.h - REST.h)).clamp(0.0, 1.0);
         let playing = np.is_some_and(|np| np.playing);
@@ -526,7 +532,9 @@ impl App {
 
     /// Taille de l'aperçu de la page accrochée, en pixels à 100 %, aux proportions de sa fenêtre.
     fn pin_chart_size(&self) -> Option<(f32, f32)> {
-        self.pin.url.as_ref()?;
+        if !self.pin_shown() {
+            return None;
+        }
         let (w, h) = self.pin_source().map_or((16.0, 9.0), |r| ((r.right - r.left) as f32, (r.bottom - r.top) as f32));
         Some((CHART_W, (CHART_W * h / w).clamp(CHART_H.0, CHART_H.1)))
     }
@@ -536,7 +544,7 @@ impl App {
     fn ticker_parts(&self) -> Vec<(String, HFONT, COLORREF, i32)> {
         let n = &self.notch;
         let title = self.pin.title.trim();
-        if self.pin.url.is_none() || title.is_empty() {
+        if !self.pin_shown() || title.is_empty() {
             return Vec::new();
         }
         let part = |text: &str, font: HFONT, color: COLORREF| (text.to_owned(), font, color, text_width(font, text));
@@ -654,7 +662,7 @@ impl App {
                 Some(Control::Next) => self.media.next(),
                 // Ailleurs, un clic montre la page accrochée (ou la regare) : l'encoche se
                 // referme pour ne pas la masquer.
-                None if self.pin.url.is_some() => {
+                None if self.pin_shown() => {
                     self.set_notch_open(false);
                     self.pin_toggle();
                 }
@@ -666,19 +674,26 @@ impl App {
     }
 }
 
-/// Clic droit sur l'encoche : accrocher la page de la fenêtre active, ou la décrocher.
+/// Clic droit sur l'encoche : accrocher la page de la fenêtre active, ou la décrocher ; et les
+/// réglages.
 pub(super) unsafe fn notch_menu(hwnd: HWND) {
     // Le menu prend le premier plan : on retient la fenêtre qu'on regardait.
     let foreground = GetForegroundWindow();
-    let Some(pinned) = with_app(|app| app.pin.url.is_some()) else { return };
-    let items = if pinned {
-        [(MENU_UNPIN, w!("Décrocher la page"))]
-    } else {
-        [(MENU_PIN, w!("Accrocher la page active\tCtrl+Alt+P"))]
-    };
+    let Some((available, pinned)) = with_app(|app| (app.features.active(Feature::Pin), app.pin_shown())) else { return };
+    let mut items = Vec::new();
+    if pinned {
+        items.push((MENU_UNPIN, w!("Décrocher la page")));
+    } else if available {
+        items.push((MENU_PIN, w!("Accrocher la page active\tCtrl+Alt+P")));
+    }
+    if available {
+        items.push((0, PCWSTR::null()));
+    }
+    items.push((MENU_SETTINGS, w!("Réglages…")));
     match popup(hwnd, &items, &[]) {
         MENU_PIN => with_app(|app| app.pin_window(foreground)),
         MENU_UNPIN => with_app(App::unpin),
+        MENU_SETTINGS => with_app(App::open_settings),
         _ => None,
     };
 }

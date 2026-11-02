@@ -191,7 +191,7 @@ impl App {
     }
 
     /// Ferme le lanceur ; `give_back` rend le premier plan à la fenêtre d'avant.
-    fn close_launcher(&mut self, give_back: bool) {
+    pub(super) fn close_launcher(&mut self, give_back: bool) {
         if !self.launcher.open {
             return;
         }

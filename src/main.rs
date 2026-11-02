@@ -9,6 +9,7 @@ mod media;
 mod dock;
 mod launcher;
 mod shell;
+mod settings;
 mod snapshot;
 mod taskbar;
 mod volume;
@@ -22,9 +23,10 @@ use windows::{
 };
 
 fn main() -> windows::core::Result<()> {
-    // Une seule instance à la fois.
+    // Une seule instance à la fois ; la relancer ouvre ses réglages.
     let _mutex = unsafe { CreateMutexW(None, true, w!("Local\\StageManagerForWindows"))? };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        app::show_running_settings();
         return Ok(());
     }
 

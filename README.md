@@ -63,11 +63,20 @@ cargo run --release
   `%APPDATA%\StageManager\dock.txt`. La barre des tâches de Windows passe en masquage
   automatique (remise comme avant en quittant) : poussez la souris tout en bas de l'écran
   pour retrouver l'horloge et les icônes de notification.
-- **Ctrl + Alt + S** : active ou désactive le Stage Manager (toutes les fenêtres sont restaurées).
-  Désactiver puis réactiver recrée les scènes, une par application.
-- **Icône dans la zone de notification** (clic droit) : activer/désactiver, lancer au
-  démarrage de Windows, quitter. Windows 11 la range d'abord dans les icônes cachées (^) :
-  glissez-la dans la barre des tâches pour la garder visible.
+- **Réglages** : chaque fonctionnalité s'active ou se désactive avec son interrupteur, à la
+  manière de macOS — le Stage Manager (les scènes et leur barre), le Dock, l'encoche, la page
+  accrochée (grisée sans l'encoche), le lanceur, les coins arrondis — ainsi que le lancement au
+  démarrage de Windows. Le changement est immédiat : sans les scènes, toutes les fenêtres
+  sont restaurées ; sans le Dock, la barre des tâches de Windows revient ; sans le lanceur,
+  Alt + Espace retrouve son rôle habituel. Les réglages s'ouvrent d'un clic sur l'icône de
+  notification, par le clic droit sur l'encoche, ou en relançant l'application. Ils sont
+  enregistrés dans `%APPDATA%\StageManager\settings.txt` (tout est activé par défaut).
+- **Ctrl + Alt + S** : active ou désactive le Stage Manager, c'est-à-dire les scènes (toutes
+  les fenêtres sont restaurées) ; le reste ne bouge pas. Réactiver recrée les scènes, une par
+  application.
+- **Icône dans la zone de notification** : clic pour les réglages ; clic droit pour les
+  réglages, le lancement au démarrage de Windows, quitter. Windows 11 la range d'abord dans
+  les icônes cachées (^) : glissez-la dans la barre des tâches pour la garder visible.
 
 ### Démarrage avec Windows
 
@@ -137,6 +146,8 @@ rafraîchissement de l'écran (`DwmFlush`).
 | `src/app/notch.rs` | Encoche en haut de l'écran : formes, animation, lecteur complet |
 | `src/app/pin.rs` | Page accrochée à l'encoche : fenêtre Chrome dédiée, garage hors écran, cours |
 | `src/app/corners.rs` | Coins arrondis de l'écran |
+| `src/settings.rs` | Fonctionnalités activées ou non, et leur enregistrement (testé) |
+| `src/app/settingsui.rs` | Fenêtre des réglages : une ligne et un interrupteur par fonctionnalité |
 | `src/volume.rs` | Volume de la sortie audio par défaut |
 | `src/media.rs` | Morceau en cours via les commandes multimédias de Windows (fil à part) |
 | `src/snapshot.rs` | Instantané de chaque fenêtre juste avant qu'elle soit réduite (`PrintWindow`) |

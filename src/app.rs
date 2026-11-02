@@ -27,6 +27,7 @@ use crate::{
     autostart,
     canvas::{Canvas, Image, Material},
     media::{Media, NowPlaying},
+    settings::{self, Feature, Features},
     snapshot, taskbar, wallpaper,
     stages::{Model, Transition, Wid},
     win::{self, hwnd_of, wid_of},
@@ -37,12 +38,14 @@ mod dockbar;
 mod launcherui;
 mod notch;
 mod pin;
+mod settingsui;
 
 use corners::Corners;
-use dockbar::{DockUi, DOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
+use dockbar::{DockUi, DOCK, TIMER_CLOCK, WM_DOCKBAR, WM_DOCK_LOADED, WM_DOCK_WALLPAPER};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 use notch::{NotchUi, NOTCH};
 use pin::{Pin, HOTKEY_PIN};
+use settingsui::{SettingsUi, SETTINGS, WM_SHOW_SETTINGS};
 
 const WM_WINEVENT: u32 = WM_APP + 1;
 const WM_TRAY: u32 = WM_APP + 2;
@@ -55,7 +58,7 @@ const TIMER_RESCAN: usize = 1;
 const TIMER_WINDOW_DRAG: usize = 2;
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_DETACH: i32 = 2;
-const MENU_TOGGLE: usize = 1;
+const MENU_SETTINGS: usize = 1;
 const MENU_QUIT: usize = 2;
 const MENU_SHOW: usize = 3;
 const MENU_MERGE: usize = 4;
@@ -89,8 +92,18 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
 }
 
-/// Restaure toutes les fenêtres qu'on a réduites (sortie, désactivation, panique).
+/// Remet tout en état (sortie, panique) : les fenêtres qu'on a réduites, la page accrochée,
+/// la barre des tâches.
 pub fn restore_hidden() {
+    restore_minimized();
+    // La page accrochée à l'encoche, si elle était garée hors de l'écran.
+    pin::restore_parked();
+    // Et la barre des tâches, si on l'avait passée en masquage automatique pour le Dock.
+    taskbar::restore();
+}
+
+/// Restaure les fenêtres réduites par les scènes.
+fn restore_minimized() {
     let windows = std::mem::take(&mut *HIDDEN.lock().unwrap_or_else(|e| e.into_inner()));
     for w in windows {
         let h = hwnd_of(w);
@@ -98,10 +111,18 @@ pub fn restore_hidden() {
             win::show(h, SW_SHOWNOACTIVATE);
         }
     }
-    // La page accrochée à l'encoche, si elle était garée hors de l'écran.
-    pin::restore_parked();
-    // Et la barre des tâches, si on l'avait passée en masquage automatique pour le Dock.
-    taskbar::restore();
+}
+
+/// Lancé une deuxième fois : on ouvre les réglages de celui qui tourne déjà.
+pub fn show_running_settings() {
+    unsafe {
+        let Ok(sidebar) = FindWindowW(w!("StageManagerSidebar"), None) else { return };
+        let mut pid = 0;
+        GetWindowThreadProcessId(sidebar, Some(&mut pid));
+        // Pour qu'il puisse passer sa fenêtre au premier plan.
+        let _ = AllowSetForegroundWindow(pid);
+        let _ = PostMessageW(sidebar, WM_SHOW_SETTINGS, WPARAM(0), LPARAM(0));
+    }
 }
 
 #[derive(Clone)]
@@ -144,7 +165,8 @@ struct App {
     hwnd: HWND,
     overlay: HWND,
     model: Model,
-    enabled: bool,
+    /// Fonctionnalités en service (les scènes, le Dock…), d'après les réglages.
+    features: Features,
     guard_until: Instant,
     /// Fenêtres qu'on vient de réduire : leur événement de réduction vient de nous.
     pending_minimize: HashSet<Wid>,
@@ -187,6 +209,8 @@ struct App {
     pin: Pin,
     /// Coins arrondis de l'écran.
     corners: Corners,
+    /// La fenêtre des réglages.
+    settings: SettingsUi,
     /// Fenêtre de la scène active qu'on déplace par sa barre de titre : la lâcher sur la barre
     /// la sort de sa scène.
     window_drag: Option<WindowDrag>,
@@ -205,13 +229,13 @@ struct WindowDrag {
 }
 
 impl App {
-    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND, notch: HWND, corners: Corners) -> Self {
+    fn new(hwnd: HWND, overlay: HWND, dock: HWND, launcher: HWND, notch: HWND, settings: HWND, corners: Corners) -> Self {
         let anim_ms = std::env::var("STAGE_MANAGER_ANIM_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ANIM_MS);
         Self {
             hwnd,
             overlay,
             model: Model::default(),
-            enabled: false,
+            features: Features::NONE,
             guard_until: Instant::now(),
             pending_minimize: HashSet::new(),
             last_rects: HashMap::new(),
@@ -241,6 +265,7 @@ impl App {
             notch: NotchUi::new(notch),
             pin: Pin::new(),
             corners,
+            settings: SettingsUi::new(settings),
             window_drag: None,
             drop_target: false,
             pending_placements: Vec::new(),
@@ -259,6 +284,7 @@ impl App {
             || self.handle_launcher_message(msg, wp)
             || self.handle_notch_message(msg, wp)
             || self.handle_pin_message(msg, wp)
+            || self.handle_settings_message(msg, wp)
         {
             return Some(LRESULT(0));
         }
@@ -282,17 +308,20 @@ impl App {
             WM_LBUTTONUP => self.release(point(lp)),
             // Capture perdue (Alt+Tab, Échap…) : on annule le glisser.
             WM_CAPTURECHANGED => self.cancel_drag(),
-            WM_HOTKEY if wp.0 == HOTKEY_TOGGLE as usize => self.toggle(),
-            WM_HOTKEY if wp.0 == HOTKEY_DETACH as usize => {
+            WM_HOTKEY if wp.0 == HOTKEY_TOGGLE as usize => self.set_feature(Feature::Scenes, !self.features.scenes),
+            WM_HOTKEY if wp.0 == HOTKEY_DETACH as usize && self.features.scenes => {
                 let foreground = wid_of(unsafe { GetForegroundWindow() });
                 self.detach(foreground, None);
             }
             WM_APPBAR => match wp.0 as u32 {
                 ABN_POSCHANGED => self.place_appbar(),
-                ABN_FULLSCREENAPP if self.enabled => {
+                // Reçu même quand la barre ne réserve aucune place (voir `register_appbar`).
+                ABN_FULLSCREENAPP => {
                     let fullscreen = lp.0 != 0 && win::fullscreen_app_in_front();
-                    unsafe {
-                        let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+                    if self.features.scenes {
+                        unsafe {
+                            let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+                        }
                     }
                     // L'encoche n'est pas une barre réservée : elle suit la barre latérale.
                     self.notch_fullscreen(fullscreen);
@@ -303,10 +332,11 @@ impl App {
                 _ => {}
             },
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
+                self.update_monitor();
                 self.place_appbar();
                 self.place_notch();
                 self.pin_displays_changed();
-                if self.enabled {
+                if self.features.corners {
                     self.corners.show(self.monitor);
                 }
             }
@@ -315,8 +345,9 @@ impl App {
             m if m == self.taskbar_created => {
                 // L'explorateur a redémarré : il a perdu notre icône et notre barre.
                 self.add_tray();
+                self.register_appbar();
                 if self.appbar.take().is_some() {
-                    self.register_appbar();
+                    self.reserve_bar();
                 }
                 self.reregister_dock();
             }
@@ -327,24 +358,117 @@ impl App {
 
     // --- Activation ---------------------------------------------------------------
 
-    fn toggle(&mut self) {
-        if self.enabled {
-            self.disable();
-        } else {
-            self.enable();
+    /// Démarrage : l'écran, la surveillance du plein écran, puis les fonctionnalités choisies.
+    fn start(&mut self) {
+        self.update_monitor();
+        self.register_appbar();
+        self.apply_features(settings::load());
+    }
+
+    /// Arrêt : tout est remis en état, sans toucher aux réglages enregistrés.
+    fn stop(&mut self) {
+        self.close_settings();
+        // La page accrochée reste ouverte, ramenée à l'écran.
+        if self.features.active(Feature::Pin) {
+            self.disable_pin(false);
+        }
+        self.features.pin = false;
+        self.apply_features(Features::NONE);
+        self.unregister_appbar();
+    }
+
+    /// Active ou désactive une fonctionnalité, et l'enregistre.
+    pub(super) fn set_feature(&mut self, f: Feature, on: bool) {
+        let mut wanted = self.features;
+        wanted.set(f, on);
+        self.apply_features(wanted);
+        settings::save(&self.features);
+    }
+
+    fn set_hotkey(&self, id: i32, on: bool, modifiers: HOT_KEY_MODIFIERS, key: u32) {
+        unsafe {
+            if on {
+                let _ = RegisterHotKey(self.hwnd, id, modifiers | MOD_NOREPEAT, key);
+            } else {
+                let _ = UnregisterHotKey(self.hwnd, id);
+            }
         }
     }
 
-    fn enable(&mut self) {
-        if self.enabled {
+    /// Met en route ou arrête ce qu'il faut pour passer aux fonctionnalités `wanted`.
+    fn apply_features(&mut self, wanted: Features) {
+        let old = self.features;
+        if old == wanted {
             return;
         }
-        self.enabled = true;
-        self.register_appbar();
-        self.enable_dock();
-        self.enable_notch();
-        self.corners.show(self.monitor);
-        self.preload_launcher();
+        self.features = wanted;
+        let off = |f: Feature| old.active(f) && !wanted.active(f);
+        let on = |f: Feature| !old.active(f) && wanted.active(f);
+        // D'abord les arrêts (la page avant l'encoche qui la montre)…
+        if off(Feature::Pin) {
+            self.set_hotkey(HOTKEY_PIN, false, MOD_CONTROL | MOD_ALT, 'P' as u32);
+            self.disable_pin(true);
+        }
+        if off(Feature::Scenes) {
+            self.disable_scenes();
+        }
+        if off(Feature::Dock) {
+            self.disable_dock();
+        }
+        if off(Feature::Notch) {
+            self.disable_notch();
+        }
+        if off(Feature::Corners) {
+            self.corners.hide();
+        }
+        if off(Feature::Launcher) {
+            self.set_hotkey(HOTKEY_LAUNCHER, false, MOD_ALT, VK_SPACE.0 as u32);
+            self.close_launcher(true);
+        }
+        // … puis les mises en route.
+        if on(Feature::Dock) {
+            self.enable_dock();
+        }
+        if on(Feature::Notch) {
+            self.enable_notch();
+        }
+        if on(Feature::Corners) {
+            self.corners.show(self.monitor);
+        }
+        if on(Feature::Launcher) {
+            self.set_hotkey(HOTKEY_LAUNCHER, true, MOD_ALT, VK_SPACE.0 as u32);
+            self.preload_launcher();
+        }
+        if on(Feature::Scenes) {
+            self.enable_scenes();
+        }
+        if on(Feature::Pin) {
+            self.set_hotkey(HOTKEY_PIN, true, MOD_CONTROL | MOD_ALT, 'P' as u32);
+            self.enable_pin();
+        }
+        // L'encoche change de forme avec la page accrochée.
+        if off(Feature::Pin) || on(Feature::Pin) {
+            self.notch_retarget();
+        }
+        unsafe {
+            // L'horloge sert au Dock (volume) et à l'encoche (heure) ; la surveillance des
+            // fenêtres, aux scènes et aux applis ouvertes du Dock.
+            if wanted.dock || wanted.notch {
+                SetTimer(self.hwnd, TIMER_CLOCK, 1000, None);
+            } else {
+                let _ = KillTimer(self.hwnd, TIMER_CLOCK);
+            }
+            if wanted.scenes || wanted.dock {
+                SetTimer(self.hwnd, TIMER_RESCAN, 1500, None);
+            } else {
+                let _ = KillTimer(self.hwnd, TIMER_RESCAN);
+            }
+        }
+        self.render_settings();
+    }
+
+    fn enable_scenes(&mut self) {
+        self.reserve_bar();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
@@ -357,19 +481,11 @@ impl App {
         let t = self.model.init(&windows, Some(wid_of(foreground)));
         self.apply(t, false);
         self.refresh();
-        self.enable_pin();
-        unsafe {
-            SetTimer(self.hwnd, TIMER_RESCAN, 1500, None);
-        }
     }
 
-    fn disable(&mut self) {
-        if !self.enabled {
-            return;
-        }
-        self.enabled = false;
+    /// Toutes les fenêtres sont restaurées, la barre rend le bord de l'écran.
+    fn disable_scenes(&mut self) {
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_RESCAN);
             let _ = KillTimer(self.hwnd, TIMER_WINDOW_DRAG);
         }
         self.cancel_drag();
@@ -378,8 +494,7 @@ impl App {
         // Termine l'animation (et replace les fenêtres détachées) avant de tout restaurer.
         self.finish_switch();
         self.slide_start = None;
-        self.disable_pin();
-        restore_hidden();
+        restore_minimized();
         self.model = Model::default();
         self.pending_minimize.clear();
         self.icons.clear();
@@ -391,10 +506,7 @@ impl App {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
-        self.remove_appbar();
-        self.disable_dock();
-        self.disable_notch();
-        self.corners.hide();
+        self.release_bar();
     }
 
     // --- Scènes ---------------------------------------------------------------------
@@ -420,14 +532,18 @@ impl App {
     }
 
     fn on_event(&mut self, event: u32, h: HWND) {
-        if !self.enabled {
-            return;
-        }
         if event == EVENT_SYSTEM_FOREGROUND {
             // Une fenêtre « toujours au premier plan » a pu passer devant les coins.
             self.corners.raise();
         }
         if self.pin_event(event, h) {
+            return;
+        }
+        if !self.features.scenes {
+            // Sans les scènes, le Dock suit quand même les applis qu'on ouvre.
+            if event == EVENT_SYSTEM_FOREGROUND {
+                self.update_running();
+            }
             return;
         }
         let w = wid_of(h);
@@ -571,7 +687,9 @@ impl App {
 
     /// Filet de sécurité : purge les fenêtres disparues et adopte celles apparues sans focus.
     fn rescan(&mut self) {
-        if !self.enabled {
+        // Le Dock suit les applis ouvertes, avec ou sans les scènes.
+        self.update_running();
+        if !self.features.scenes {
             return;
         }
         for w in self.model.windows() {
@@ -593,7 +711,6 @@ impl App {
         self.refresh();
         // Les titres des fenêtres ont pu changer.
         self.invalidate();
-        self.update_running();
     }
 
     fn show_stage(&mut self, stage: u64, merge: bool) {
@@ -870,10 +987,19 @@ impl App {
 
     // --- Barre latérale -------------------------------------------------------------
 
-    fn register_appbar(&mut self) {
-        if self.appbar.is_some() {
-            return;
+    /// Écran principal (la barre, l'encoche et les coins y sont).
+    fn update_monitor(&mut self) {
+        unsafe {
+            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
+            let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let _ = GetMonitorInfoW(monitor, &mut info);
+            self.monitor = info.rcMonitor;
         }
+    }
+
+    /// Inscrit la barre auprès de Windows, sans réserver de place : elle apprend ainsi
+    /// qu'une appli passe en plein écran, ce qui sert aussi à l'encoche et aux coins.
+    fn register_appbar(&mut self) {
         let mut abd = APPBARDATA {
             cbSize: size_of::<APPBARDATA>() as u32,
             hWnd: self.hwnd,
@@ -881,16 +1007,28 @@ impl App {
             ..Default::default()
         };
         unsafe { SHAppBarMessage(ABM_NEW, &mut abd) };
-        self.appbar = Some(RECT::default());
-        self.place_appbar();
     }
 
-    fn remove_appbar(&mut self) {
-        if self.appbar.take().is_none() {
-            return;
-        }
+    fn unregister_appbar(&mut self) {
+        self.appbar = None;
         let mut abd = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, hWnd: self.hwnd, ..Default::default() };
         unsafe { SHAppBarMessage(ABM_REMOVE, &mut abd) };
+    }
+
+    /// Réserve le bord gauche de l'écran pour la barre des scènes.
+    fn reserve_bar(&mut self) {
+        if self.appbar.is_none() {
+            self.appbar = Some(RECT::default());
+            self.place_appbar();
+        }
+    }
+
+    /// Rend le bord gauche de l'écran, en restant inscrit pour le plein écran.
+    fn release_bar(&mut self) {
+        if self.appbar.is_some() {
+            self.unregister_appbar();
+            self.register_appbar();
+        }
     }
 
     /// Réserve une bande sur le bord gauche de l'écran principal, comme la barre des tâches :
@@ -1207,7 +1345,7 @@ impl App {
     /// Redessine la barre. Fond transparent : seuls les cartes, le survol et les libellés
     /// sont visibles, posés directement sur le fond d'écran.
     fn render(&self) {
-        let Some(bar) = self.appbar.filter(|_| self.enabled) else { return };
+        let Some(bar) = self.appbar else { return };
         let (w, h) = (bar.right - bar.left, bar.bottom - bar.top);
         let dpi = self.dpi();
         let s = move |v: i32| v * dpi / 96;
@@ -1403,6 +1541,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let is_dock = hwnd.0 as isize == DOCK.load(Ordering::Relaxed);
     let is_launcher = hwnd.0 as isize == LAUNCHER.load(Ordering::Relaxed);
     let is_notch = hwnd.0 as isize == NOTCH.load(Ordering::Relaxed);
+    if hwnd.0 as isize == SETTINGS.load(Ordering::Relaxed) {
+        // Une vraie fenêtre, qui prend le premier plan comme les autres.
+        if msg == WM_MOUSEACTIVATE {
+            return LRESULT(MA_ACTIVATE as isize);
+        }
+        return match with_app(|app| app.settings_input(msg, wp, lp)) {
+            Some(Some(result)) => result,
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        };
+    }
     match msg {
         WM_RBUTTONUP if is_notch => {
             notch::notch_menu(hwnd);
@@ -1433,6 +1581,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mouse = (lp.0 & 0xFFFF) as u32;
             if mouse == WM_RBUTTONUP || mouse == WM_CONTEXTMENU {
                 tray_menu(hwnd);
+            } else if mouse == WM_LBUTTONUP {
+                with_app(App::open_settings);
             }
             return LRESULT(0);
         }
@@ -1484,21 +1634,22 @@ unsafe fn popup(hwnd: HWND, items: &[(usize, PCWSTR)], checked: &[usize]) -> usi
 }
 
 unsafe fn tray_menu(hwnd: HWND) {
-    let Some(enabled) = with_app(|app| app.enabled) else { return };
-    let toggle = if enabled { w!("Désactiver\tCtrl+Alt+S") } else { w!("Activer\tCtrl+Alt+S") };
     let autostart = autostart::is_enabled();
     let items = [
-        (MENU_TOGGLE, toggle),
+        (MENU_SETTINGS, w!("Réglages…")),
         (MENU_AUTOSTART, w!("Lancer au démarrage de Windows")),
         (0, PCWSTR::null()),
         (MENU_QUIT, w!("Quitter")),
     ];
     let checked = if autostart { vec![MENU_AUTOSTART] } else { vec![] };
     match popup(hwnd, &items, &checked) {
-        MENU_TOGGLE => {
-            with_app(App::toggle);
+        MENU_SETTINGS => {
+            with_app(App::open_settings);
         }
-        MENU_AUTOSTART => autostart::set(!autostart),
+        MENU_AUTOSTART => {
+            autostart::set(!autostart);
+            with_app(App::refresh_settings);
+        }
         MENU_QUIT => PostQuitMessage(0),
         _ => {}
     }
@@ -1617,8 +1768,29 @@ pub fn run() -> Result<()> {
             None,
         )?;
         NOTCH.store(notch.0 as isize, Ordering::Relaxed);
+        // Les réglages : une fenêtre ordinaire (barre des tâches, Alt+Tab), avec l'icône de l'appli.
+        let settings_class = w!("StageManagerSettings");
+        let settings_wc = WNDCLASSW { lpszClassName: settings_class, hIcon: win::app_icon(), ..wc };
+        if RegisterClassW(&settings_wc) == 0 {
+            return Err(Error::from_win32());
+        }
+        let settings = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_APPWINDOW,
+            settings_class,
+            w!("Réglages du Stage Manager"),
+            WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+        SETTINGS.store(settings.0 as isize, Ordering::Relaxed);
         let corners = Corners::create(instance)?;
-        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher, notch, corners)));
+        APP.with(|cell| *cell.borrow_mut() = Some(App::new(hwnd, overlay, dock, launcher, notch, settings, corners)));
 
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let hooks = [
@@ -1627,11 +1799,10 @@ pub fn run() -> Result<()> {
         ];
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S' as u32);
         let _ = RegisterHotKey(hwnd, HOTKEY_DETACH, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D' as u32);
-        let _ = RegisterHotKey(hwnd, HOTKEY_LAUNCHER, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
-        let _ = RegisterHotKey(hwnd, HOTKEY_PIN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'P' as u32);
+        // Ceux du lanceur et de la page accrochée suivent leur réglage (voir `apply_features`).
         with_app(|app| {
             app.add_tray();
-            app.enable();
+            app.start();
         });
 
         let mut msg = MSG::default();
@@ -1661,7 +1832,7 @@ pub fn run() -> Result<()> {
             let _ = UnhookWinEvent(hook);
         }
         with_app(|app| {
-            app.disable();
+            app.stop();
             app.remove_tray();
         });
         let _ = DestroyWindow(hwnd);

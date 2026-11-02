@@ -121,12 +121,25 @@ impl App {
         }
     }
 
-    pub(super) fn disable_pin(&mut self) {
+    /// `close` : la fonctionnalité est désactivée, la fenêtre de la page est fermée. Sinon
+    /// (on quitte), elle est ramenée à l'écran : plus rien ne l'y ramènerait.
+    pub(super) fn disable_pin(&mut self, close: bool) {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_PIN);
         }
-        // Le Stage Manager arrêté, plus rien ne la ramènerait à l'écran.
+        if close {
+            if let Some(h) = self.find_pin_window() {
+                self.pin.hwnd = Some(h);
+            }
+            self.close_pin_window();
+        }
+        self.pin.launching = None;
         restore_parked();
+    }
+
+    /// Une page est accrochée, et la fonctionnalité en service.
+    pub(super) fn pin_shown(&self) -> bool {
+        self.features.active(Feature::Pin) && self.pin.url.is_some()
     }
 
     // --- Reconnaître la fenêtre ----------------------------------------------------------
@@ -165,7 +178,7 @@ impl App {
     // --- Surveillance ----------------------------------------------------------------
 
     fn pin_poll(&mut self) {
-        if !self.enabled || self.pin.url.is_none() {
+        if !self.pin_shown() {
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_PIN);
             }
@@ -234,7 +247,7 @@ impl App {
     /// Événement Windows sur la fenêtre accrochée, ou qui la concerne. Renvoie `true` s'il
     /// est traité (il ne doit pas toucher aux scènes).
     pub(super) fn pin_event(&mut self, event: u32, h: HWND) -> bool {
-        let Some(pinned) = self.pin.hwnd else { return false };
+        let Some(pinned) = self.pin.hwnd.filter(|_| self.features.active(Feature::Pin)) else { return false };
         if h != pinned {
             // Une autre appli passe au premier plan : la page retourne au garage.
             if event == EVENT_SYSTEM_FOREGROUND && self.pin.peek && win::pid(h) != win::pid(pinned) && win::is_app_window(h) {
@@ -264,7 +277,7 @@ impl App {
 
     /// Les écrans ont changé : la fenêtre garée est peut-être devenue visible.
     pub(super) fn pin_displays_changed(&mut self) {
-        if self.enabled && self.pin.url.is_some() {
+        if self.pin_shown() {
             self.pin_poll();
         }
     }
@@ -345,7 +358,7 @@ impl App {
     /// Ctrl + Alt + P : accroche la page affichée dans la fenêtre `h` (ou l'adresse copiée).
     /// Sur la page déjà accrochée, la décroche.
     pub(super) fn pin_window(&mut self, h: HWND) {
-        if !self.enabled {
+        if !self.features.active(Feature::Pin) {
             return;
         }
         if !h.is_invalid() && (self.pin.hwnd == Some(h) || self.is_pin_window(h)) {
