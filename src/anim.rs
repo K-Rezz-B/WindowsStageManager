@@ -106,6 +106,19 @@ pub fn fit(area: RECT, src: SIZE) -> RECT {
     RECT { left, top: area.bottom - h, right: left + w, bottom: area.bottom }
 }
 
+/// Partie visible d'une fenêtre de rectangle `r`, connaissant la taille de sa miniature
+/// (`visible`) : Windows ajoute autour des bordures invisibles, sur les côtés et en bas (en
+/// haut aussi pour une fenêtre agrandie, qui déborde de l'écran de tous les côtés).
+pub fn visible_part(r: RECT, visible: SIZE) -> RECT {
+    let (dx, dy) = ((r.right - r.left) - visible.cx, (r.bottom - r.top) - visible.cy);
+    if visible.cx <= 0 || visible.cy <= 0 || dx < 0 || dy < 0 {
+        return r;
+    }
+    let side = dx / 2;
+    let bottom = side.min(dy);
+    RECT { left: r.left + side, top: r.top + dy - bottom, right: r.right - (dx - side), bottom: r.bottom - bottom }
+}
+
 pub fn offset(r: RECT, dx: i32, dy: i32) -> RECT {
     RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy }
 }

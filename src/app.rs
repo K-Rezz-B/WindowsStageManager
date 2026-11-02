@@ -922,23 +922,28 @@ impl App {
         let quiet: Vec<Wid> = outgoing.iter().chain(&arriving).map(|(w, _)| *w).collect();
 
         let mut flights = Vec::new();
-        let mut fly = |w: Wid, from: RECT, to: RECT, fade_in: bool| unsafe {
+        // `window` : la fenêtre à l'écran ; `icon` : là où elle rapetisse (ou d'où elle part).
+        let mut fly = |w: Wid, window: RECT, icon: Option<RECT>, fade_in: bool| unsafe {
             if let Ok(thumb) = DwmRegisterThumbnail(overlay, hwnd_of(w)) {
+                // La miniature ne montre que la partie visible de la fenêtre, sans ses bordures
+                // invisibles : elle doit se poser exactement dessus.
+                let real = anim::visible_part(window, DwmQueryThumbnailSourceSize(thumb).unwrap_or_default());
+                let small = match icon {
+                    Some(icon) => fit(icon, size(real)),
+                    None => inflate(real, -(real.right - real.left) / 10),
+                };
+                let (from, to) = if fade_in { (small, real) } else { (real, small) };
                 anim::place_thumb(thumb, from, true, if fade_in { 0 } else { 255 });
                 flights.push(Flight { thumb, from, to, fade_in });
             }
         };
         // Seules les fenêtres visibles volent, enregistrées de l'arrière vers l'avant
         // pour que la fenêtre de devant reste dessus.
-        for (w, from) in anim::visible_layers(&outgoing).into_iter().rev() {
-            fly(w, from, fit(target, size(from)), false);
+        for (w, window) in anim::visible_layers(&outgoing).into_iter().rev() {
+            fly(w, window, Some(target), false);
         }
-        for (w, to) in anim::visible_layers(&arriving).into_iter().rev() {
-            let from = match source {
-                Some(card) => fit(card, size(to)),
-                None => inflate(to, -(to.right - to.left) / 10),
-            };
-            fly(w, from, to, true);
+        for (w, window) in anim::visible_layers(&arriving).into_iter().rev() {
+            fly(w, window, source, true);
         }
         if flights.is_empty() {
             self.screens[s].departing = None;
