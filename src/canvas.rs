@@ -249,6 +249,14 @@ impl Canvas {
     /// Arc de cercle ouvert vers la droite (les ondes d'un haut-parleur), bords lissés.
     /// `half_angle` : demi-ouverture en radians ; `width` : épaisseur du trait.
     pub fn arc(&mut self, center: (f32, f32), radius: f32, half_angle: f32, width: f32, rgb: (u8, u8, u8), alpha: u8) {
+        self.arc_toward(center, radius, 0.0, half_angle, width, rgb, alpha);
+    }
+
+    /// Arc de cercle ouvert dans la direction `toward` (en radians, 0 vers la droite, -PI/2 vers
+    /// le haut), comme `arc`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn arc_toward(&mut self, center: (f32, f32), radius: f32, toward: f32, half_angle: f32, width: f32, rgb: (u8, u8, u8), alpha: u8) {
+        use std::f32::consts::{PI, TAU};
         let reach = radius + width;
         let x0 = ((center.0 - reach).floor() as i32).max(0);
         let x1 = ((center.0 + reach).ceil() as i32).min(self.w);
@@ -261,7 +269,8 @@ impl Canvas {
                 let d = dx.hypot(dy);
                 let ring = (width / 2.0 - (d - radius).abs() + 0.5).clamp(0.0, 1.0);
                 // Extrémités arrondies en douceur : on mesure le dépassement de l'angle en pixels.
-                let ends = ((half_angle - dy.atan2(dx).abs()) * d + 0.5).clamp(0.0, 1.0);
+                let angle = (dy.atan2(dx) - toward + PI).rem_euclid(TAU) - PI;
+                let ends = ((half_angle - angle.abs()) * d + 0.5).clamp(0.0, 1.0);
                 let cover = ring * ends;
                 if cover > 0.0 {
                     let i = (y * self.w + x) as usize;
@@ -292,6 +301,12 @@ impl Canvas {
         let opacity = alpha as f32 / 255.0;
         let light = (255 - shade) as u32;
         let (iw, ih) = (img.w as f32, img.h as f32);
+        // Image réduite (une icône de 128 px dessinée sur 20) : un seul échantillon par pixel
+        // sauterait des pans entiers de l'image et crénelerait le dessin. On moyenne alors
+        // n × n échantillons répartis sur le pixel, de quoi couvrir tout ce qu'il recouvre.
+        let n = ((iw / qw.max(1.0)).max(ih / qh.max(1.0)).ceil() as i32).clamp(1, 8);
+        let steps: Vec<f32> = (0..n).map(|k| (k as f32 + 0.5) / n as f32).collect();
+        let sample_at = |x: f32, y: f32| inv.apply(x, y).map(|(u, v)| img.sample(u * iw - 0.5, v * ih - 0.5));
         self.touch(x0, y0, x1, y1);
         for y in y0..y1 {
             let row = (y * self.w) as usize;
@@ -302,7 +317,21 @@ impl Canvas {
                 if cover <= 0.0 {
                     continue;
                 }
-                let mut src = img.sample(u * iw - 0.5, v * ih - 0.5);
+                let mut src = if n == 1 {
+                    img.sample(u * iw - 0.5, v * ih - 0.5)
+                } else {
+                    let mut sum = [0u32; 4];
+                    for &dy in &steps {
+                        for &dx in &steps {
+                            let p = sample_at(x as f32 + dx, y as f32 + dy).unwrap_or(0);
+                            for (c, s) in sum.iter_mut().enumerate() {
+                                *s += (p >> (8 * c)) & 0xFF;
+                            }
+                        }
+                    }
+                    let count = (n * n) as u32;
+                    sum.iter().enumerate().fold(0, |acc, (c, s)| acc | ((s + count / 2) / count) << (8 * c))
+                };
                 if src == 0 {
                     continue;
                 }
@@ -582,6 +611,28 @@ impl Canvas {
             for x in 0..self.w {
                 let d = (x as f32 + 0.5 - center.0).hypot(y as f32 + 0.5 - center.1);
                 let cover = (d - radius + 0.5).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    let i = (y * self.w + x) as usize;
+                    self.px[i] = over(premul(rgb, (alpha as f32 * cover).round() as u8), self.px[i]);
+                }
+            }
+        }
+    }
+
+    /// Croissant : le disque (`center`, `radius`) privé du disque (`cut`, `cut_radius`), bords
+    /// lissés.
+    pub fn crescent(&mut self, center: (f32, f32), radius: f32, cut: (f32, f32), cut_radius: f32, rgb: (u8, u8, u8), alpha: u8) {
+        let x0 = ((center.0 - radius).floor() as i32).max(0);
+        let x1 = ((center.0 + radius).ceil() as i32).min(self.w);
+        let y0 = ((center.1 - radius).floor() as i32).max(0);
+        let y1 = ((center.1 + radius).ceil() as i32).min(self.h);
+        self.touch(x0, y0, x1, y1);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let inside = (radius - (px - center.0).hypot(py - center.1) + 0.5).clamp(0.0, 1.0);
+                let outside_cut = ((px - cut.0).hypot(py - cut.1) - cut_radius + 0.5).clamp(0.0, 1.0);
+                let cover = inside * outside_cut;
                 if cover > 0.0 {
                     let i = (y * self.w + x) as usize;
                     self.px[i] = over(premul(rgb, (alpha as f32 * cover).round() as u8), self.px[i]);
@@ -906,6 +957,22 @@ mod tests {
         c.draw_quad(&img, [(5.0, 10.0), (35.0, 5.0), (35.0, 35.0), (5.0, 30.0)], 255, 0);
         assert_eq!(c.px[(20 * 40 + 20) as usize], premul((255, 0, 0), 255), "le centre est rempli");
         assert_eq!(c.px[(6 * 40 + 6) as usize] >> 24, 0, "le coin rogné par la perspective est vide");
+    }
+
+    #[test]
+    fn une_image_reduite_est_moyennee() {
+        // Une colonne blanche sur huit, réduite huit fois : un gris sombre partout, alors qu'un
+        // seul échantillon par pixel tomberait toujours entre deux colonnes et ne verrait que du noir.
+        let px = (0..64 * 64).map(|i| if i % 64 % 8 == 0 { 0xFFFF_FFFF } else { 0xFF00_0000 }).collect();
+        let img = Image { w: 64, h: 64, px };
+        let mut c = Canvas::new(8, 8);
+        c.draw_quad(&img, [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)], 255, 0);
+        for y in 2..6 {
+            for x in 2..6 {
+                let red = channel(c.px[(y * 8 + x) as usize], 16);
+                assert!((20..=45).contains(&red), "gris sombre attendu en ({x}, {y}), reçu {red}");
+            }
+        }
     }
 
     #[test]

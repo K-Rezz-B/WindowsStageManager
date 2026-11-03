@@ -34,21 +34,26 @@ use crate::{
     win::{self, hwnd_of, wid_of},
 };
 
+mod activity;
 mod corners;
 mod dockbar;
 mod float;
 mod launcherui;
 mod notch;
 mod pin;
+mod quickbar;
 mod screens;
 mod settingsui;
+mod timer;
 
+use activity::{ActivityUi, WM_LIVE};
 use corners::Corners;
 use float::Float;
 use dockbar::{apps_proc, DockUi, TIMER_CLOCK, WM_DOCK_LOADED};
 use launcherui::{LauncherUi, HOTKEY_LAUNCHER, LAUNCHER, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON};
 use notch::NotchUi;
 use pin::{Pin, HOTKEY_PIN};
+use quickbar::{quick_proc, QuickUi, QUICK_CLASS, WM_QUICK};
 use screens::{Screen, APPS_CLASS, BAR_CLASS, NOTCH_CLASS};
 use settingsui::{SettingsUi, SETTINGS, WM_SHOW_SETTINGS};
 
@@ -71,7 +76,7 @@ const MENU_AUTOSTART: usize = 5;
 const MENU_SPLIT: usize = 6;
 
 /// Barre des scènes : une petite pastille noire d'icônes collée en haut de l'écran, à droite de
-/// l'encoche (la barre d'applis est à gauche). Mesures en pixels à 100 %.
+/// l'encoche (la barre d'applis est dans le coin gauche, les contrôles dans le coin droit). Mesures en pixels à 100 %.
 const BAR_H: i32 = 32;
 const ICON: i32 = 20;
 const ICON_GAP: i32 = 10;
@@ -81,6 +86,9 @@ const PILL_RADIUS: i32 = 10;
 const PILL_SHOULDER: i32 = 6;
 /// Écart entre la pastille et l'encoche (congés compris).
 const NOTCH_GAP: i32 = 18;
+/// Écart entre les pastilles des coins (applis à gauche, contrôles à droite) et le bord de
+/// l'écran, congés compris.
+const EDGE_GAP: i32 = 10;
 /// Nombre d'icônes au plus.
 const MAX_ICONS: i32 = 8;
 /// Taille de la fenêtre de la barre : la pastille la plus large, et un peu de marge.
@@ -89,6 +97,10 @@ const BAR_WIN_H: i32 = BAR_H + 8;
 /// Grossissement de l'icône survolée, et durée de son ressort.
 const HOVER_SCALE: f64 = 0.35;
 const HOVER_ANIM: Duration = Duration::from_millis(280);
+/// Barres des coins : écart entre leurs icônes, un peu plus large que dans la barre des scènes.
+const CORNER_GAP: i32 = 15;
+/// Barres des coins : opacité du halo qui glisse sous l'icône survolée.
+const HALO_ALPHA: f32 = 40.0;
 /// La pastille rentre dans le bord de l'écran quand l'encoche s'ouvre par-dessus.
 const VEIL_ANIM: Duration = Duration::from_millis(260);
 /// Après un changement de scène, on ignore les événements parasites qu'il provoque.
@@ -222,12 +234,18 @@ struct App {
     screens: Vec<Screen>,
     /// Dernier identifiant d'écran attribué.
     next_screen: ScreenId,
-    /// L'écran principal (le Dock, le lanceur, les réglages et les coins y sont).
+    /// L'écran principal (le Dock, le lanceur et les réglages y sont).
     monitor: RECT,
     taskbar_created: u32,
     anim_duration: Duration,
     /// Le Dock, en bas de l'écran principal.
     dock: DockUi,
+    /// Les contrôles rapides (Wi-Fi, Bluetooth, son), à droite de l'encoche.
+    quick: QuickUi,
+    /// Les activités en direct de l'encoche (volume, batterie, Bluetooth…).
+    activity: ActivityUi,
+    /// Minuteur ou Pomodoro en cours, lancé du clic droit sur l'encoche.
+    timer: Option<timer::Timer>,
     /// Le lanceur façon Spotlight (Alt + Espace).
     launcher: LauncherUi,
     /// Page accrochée aux encoches, qu'elles montrent en direct.
@@ -275,6 +293,9 @@ impl App {
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             anim_duration: Duration::from_millis(anim_ms),
             dock: DockUi::new(hwnd),
+            quick: QuickUi::new(hwnd),
+            activity: ActivityUi::new(hwnd),
+            timer: None,
             launcher: LauncherUi::new(launcher),
             pin: Pin::new(),
             float: Float::new(),
@@ -287,6 +308,9 @@ impl App {
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         if self.handle_dock_message(msg, wp, lp)
+            || self.handle_quick_message(msg)
+            || self.handle_activity_message(msg, wp, lp)
+            || self.handle_timer_message(msg, wp)
             || self.handle_launcher_message(msg, wp)
             || self.handle_pin_message(msg, wp)
             || self.handle_float_message(msg, wp)
@@ -453,7 +477,7 @@ impl App {
             self.enable_notch();
         }
         if on(Feature::Corners) {
-            self.corners.show(self.monitor);
+            self.show_corners();
         }
         if on(Feature::Launcher) {
             self.set_hotkey(HOTKEY_LAUNCHER, true, MOD_ALT, VK_SPACE.0 as u32);
@@ -1021,6 +1045,7 @@ impl App {
             .iter()
             .any(|sc| sc.switch.is_some() || sc.slide_start.is_some() || sc.hover_start.is_some() || sc.veil_start.is_some())
             || self.dock_animating()
+            || self.quick_animating()
             || self.notch_animating()
     }
 
@@ -1030,10 +1055,14 @@ impl App {
         // Les barres d'applis bougent toutes avec le Dock, ou chacune avec la pastille des
         // scènes de son écran (voir `tick_screen`).
         let apps = self.dock_tick(now);
+        let quick = self.quick_tick(now);
         for s in 0..self.screens.len() {
             let veiling = self.tick_screen(s, now);
             if apps || veiling {
                 self.render_apps(s);
+            }
+            if quick || veiling {
+                self.render_quick(s);
             }
         }
         self.notch_tick(now);
@@ -1212,7 +1241,7 @@ impl App {
     }
 
     /// Place la barre en haut de son écran : collée à droite de l'encoche (ou du milieu de
-    /// l'écran, face à la barre d'applis), ou centrée quand elle est seule.
+    /// l'écran), ou centrée quand elle est seule.
     fn place_appbar(&mut self, s: usize) {
         let Some(current) = self.screens[s].appbar else { return };
         let edge = self.notch_edge(s).or(self.dock.enabled.then_some(0));
@@ -1255,6 +1284,7 @@ impl App {
         }
         self.place_appbar(s);
         self.place_apps(s);
+        self.place_quick(s);
     }
 
     /// Part visible de la pastille : 0 rentrée dans le bord de l'écran, 1 sortie.
@@ -1718,6 +1748,10 @@ unsafe fn make_font(face: &str, points: i32, weight: i32, dpi: i32) -> HFONT {
 
 /// Texte avec une ombre portée, pour rester lisible sur n'importe quel fond d'écran.
 unsafe fn draw_text(dc: HDC, text: &str, rect: RECT, flags: DRAW_TEXT_FORMAT, color: COLORREF, shadow: i32) {
+    // Un texte vide donnerait à DrawTextW un pointeur bidon (celui d'un Vec vide) : plantage.
+    if text.is_empty() {
+        return;
+    }
     let mut text: Vec<u16> = text.encode_utf16().collect();
     if shadow > 0 {
         let mut shadow_rect = offset(rect, shadow, shadow);
@@ -1802,7 +1836,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Some(None) => DefWindowProcW(hwnd, msg, wp, lp),
         None => {
             // Occupé : on remet l'événement à plus tard plutôt que de le perdre.
-            if [WM_WINEVENT, WM_MEDIA, WM_DOCK_LOADED, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
+            if [WM_WINEVENT, WM_MEDIA, WM_DOCK_LOADED, WM_QUICK, WM_LIVE, WM_LAUNCHER_APPS, WM_LAUNCHER_ICON]
                 .contains(&msg)
             {
                 let _ = PostMessageW(hwnd, msg, wp, lp);
@@ -1967,8 +2001,12 @@ pub fn run() -> Result<()> {
         MAIN.store(hwnd.0 as isize, Ordering::Relaxed);
         // Les barres des scènes, les barres d'applis et les encoches : une de chaque par écran
         // (voir `screens`).
-        let procs: [(PCWSTR, WNDPROC); 3] =
-            [(BAR_CLASS, Some(bar_proc)), (APPS_CLASS, Some(apps_proc)), (NOTCH_CLASS, Some(notch_proc))];
+        let procs: [(PCWSTR, WNDPROC); 4] = [
+            (BAR_CLASS, Some(bar_proc)),
+            (APPS_CLASS, Some(apps_proc)),
+            (QUICK_CLASS, Some(quick_proc)),
+            (NOTCH_CLASS, Some(notch_proc)),
+        ];
         for (name, proc) in procs {
             let screen_wc = WNDCLASSW { lpszClassName: name, lpfnWndProc: proc, ..wc };
             if RegisterClassW(&screen_wc) == 0 {
@@ -2065,4 +2103,17 @@ pub fn run() -> Result<()> {
         let _ = DestroyWindow(hwnd);
     }
     Ok(())
+}
+
+/// Halo sous l'icône survolée d'une rangée : il apparaît, glisse d'une icône à l'autre, puis
+/// s'efface. Renvoie sa case et son opacité (0 à 1), `t` allant de 0 à 1 depuis le changement.
+fn hover_halo(rects: &[RECT], hover: Option<usize>, prev: Option<usize>, t: f64) -> Option<(RECT, f32)> {
+    let at = |i: Option<usize>| i.and_then(|i| rects.get(i).copied());
+    let lerp = |a: i32, b: i32| a + ((b - a) as f64 * t).round() as i32;
+    match (at(hover), at(prev)) {
+        (Some(h), Some(p)) => Some((RECT { left: lerp(p.left, h.left), top: h.top, right: lerp(p.right, h.right), bottom: h.bottom }, 1.0)),
+        (Some(h), None) => Some((h, t as f32)),
+        (None, Some(p)) => Some((p, 1.0 - t as f32)),
+        (None, None) => None,
+    }
 }

@@ -59,6 +59,25 @@ cargo run --release
   titre, artiste, temps écoulé et restant, précédent / lecture-pause / suivant. Il suit le
   morceau en cours (Apple Music ou YouTube dans le navigateur, Spotify, Deezer…). Elle se
   referme quand la souris s'en va, et s'efface devant un jeu ou une vidéo en plein écran.
+- **Activités en direct** dans l'encoche fermée, qui s'allonge un instant vers le bas : le
+  volume et la luminosité quand on les règle (jauge et pourcentage), le chargeur qu'on branche,
+  la batterie faible (20 % puis 10 %), un appareil Bluetooth qui se connecte, le verrouillage
+  des majuscules, une appli qui se sert de la caméra ou du micro. De petites marques restent
+  dans l'encoche fermée tant que les majuscules sont verrouillées (⇪) ou que la caméra (point
+  vert) ou le micro (point orange) sont en service.
+- **Chats Claude Code** dans l'encoche fermée : le logo de Claude suivi d'une pastille par chat
+  récent (actif depuis moins de 24 h dans l'appli Claude, SSH compris, ou ouvert dans un
+  terminal), bleue en cours, orange quand il attend une réponse (question, autorisation),
+  verte quand il a fini. Quand un chat pose une question ou finit, l'encoche s'allonge avec son
+  nom. Ouverte, elle les liste : questions d'abord, puis les plus récemment actifs, avec le
+  projet ou ce que le chat attend ; un clic ramène Claude (ou le terminal) au premier plan.
+  L'état est lu dans `%APPDATA%\Claude\claude-code-sessions` et `%USERPROFILE%\.claude\sessions`,
+  des formats internes à Claude qui peuvent changer d'une version à l'autre.
+- **Minuteur et Pomodoro** : clic droit sur l'encoche → « Minuteur : 5 min » (10, 15, 30 min,
+  1 h) ou « Pomodoro » (25 min de travail, 5 min de pause, 15 min toutes les quatre séances,
+  enchaînés jusqu'à l'arrêt). Le compte à rebours s'affiche dans l'encoche fermée, avec un
+  anneau qui se vide ; à la fin, l'encoche l'annonce avec le son de notification de Windows. Le
+  même menu le met en pause ou l'arrête.
 - **Page accrochée à l'encoche** (un graphique TradingView, par exemple) : **Ctrl + Alt + P**
   sur une fenêtre de navigateur accroche la page affichée (adresse lue dans la barre
   d'adresse, ou à défaut copiée dans le presse-papiers) ; clic droit sur l'encoche →
@@ -97,10 +116,10 @@ cargo run --release
   Échap pour fermer. Il trouve toutes les applis installées, y compris celles du Store.
 - Le lanceur et les panneaux suivent le style de macOS d'avant Tahoe (mode sombre) :
   panneaux gris foncé presque pleins, avec un fin liseré.
-- **Barre d'applis** en haut de chaque écran, collée à gauche de l'encoche, à la place du
-  Dock (elle ne prend aucune place à l'écran) : une loupe qui ouvre le lanceur, les applis
-  épinglées (reprises au départ de la barre des tâches), les applis ouvertes à la suite, puis
-  la corbeille et le volume. L'icône survolée grossit et son nom s'affiche dessous, un point
+- **Barre d'applis** dans le coin haut gauche de chaque écran, à la place du Dock (elle ne
+  prend aucune place à l'écran) : la corbeille, les applis épinglées (reprises au départ de la
+  barre des tâches), les applis ouvertes à la suite, puis une loupe qui ouvre le lanceur. Un
+  halo glisse sous l'icône survolée et son nom s'affiche dessous, un point
   marque les applis ouvertes. Clic : lance l'appli (l'icône sautille) ou affiche sa scène.
   Clic droit : garder dans la barre, quitter ; vider la corbeille. Les applis épinglées sont
   enregistrées dans `%APPDATA%\StageManager\dock.txt`. Le volume : un clic ouvre un curseur

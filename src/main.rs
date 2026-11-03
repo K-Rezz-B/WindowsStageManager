@@ -4,10 +4,14 @@
 mod anim;
 mod app;
 mod autostart;
+mod brightness;
 mod canvas;
+mod claude;
 mod media;
 mod dock;
 mod launcher;
+mod live;
+mod quick;
 mod shell;
 mod snapbar;
 mod settings;

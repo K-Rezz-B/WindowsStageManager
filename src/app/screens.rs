@@ -70,6 +70,8 @@ pub(super) struct Screen {
     /// La barre d'applis de cet écran, à gauche de l'encoche, et sa position à l'écran.
     pub apps: HWND,
     pub apps_rect: RECT,
+    /// Les contrôles rapides de cet écran, à droite de l'encoche (voir `quickbar`).
+    pub quick: HWND,
     /// Largeur de la pastille au début et à la fin de son animation.
     pub pill_from: i32,
     pub pill_to: i32,
@@ -126,6 +128,7 @@ impl Screen {
         let hwnd = popup(BAR_CLASS, w!("Stage Manager"))?;
         let notch = popup(NOTCH_CLASS, w!("Encoche"))?;
         let apps = popup(APPS_CLASS, w!("Applis"))?;
+        let quick = popup(super::QUICK_CLASS, w!("Contrôles rapides"))?;
         let overlay = anim::create_overlay(instance)?;
         Ok(Self {
             id,
@@ -142,6 +145,7 @@ impl Screen {
             bar_anchored: false,
             apps,
             apps_rect: RECT::default(),
+            quick,
             pill_from: 0,
             pill_to: 0,
             // Inter, la police libre la plus proche de celle d'Apple (voir `load_fonts`).
@@ -171,6 +175,7 @@ impl Screen {
         let _ = DestroyWindow(self.hwnd);
         let _ = DestroyWindow(self.notch.hwnd);
         let _ = DestroyWindow(self.apps);
+        let _ = DestroyWindow(self.quick);
         let _ = DestroyWindow(self.overlay);
         if !self.font.is_invalid() {
             let _ = DeleteObject(self.font);
@@ -262,9 +267,10 @@ impl App {
                 self.enable_notch_on(s);
             }
             self.place_apps(s);
+            self.place_quick(s);
         }
         if self.features.corners {
-            self.corners.show(self.monitor);
+            self.show_corners();
         }
         self.pin_displays_changed();
         // La vignette de la fenêtre épinglée regagne son coin (celui de l'écran principal, si
@@ -312,14 +318,20 @@ impl App {
             }
         }
         self.place_apps(s);
+        self.place_quick(s);
         // L'encoche suit la barre de son écran (sa bande reste réservée). La vignette
         // de la fenêtre épinglée aussi, si elle est dans son coin.
         self.notch_fullscreen(s, fullscreen);
         self.render_vignette();
         // Les coins aussi : posés sur un jeu, ils l'obligeraient à passer par la composition du
         // bureau (un peu plus de latence).
-        if self.screens[s].primary {
-            self.corners.set_visible(!fullscreen);
-        }
+        let rect = self.screens[s].rect;
+        self.corners.set_visible(rect, !fullscreen);
+    }
+
+    /// Pose les coins arrondis aux angles de chaque écran.
+    pub(super) fn show_corners(&mut self) {
+        let monitors: Vec<(RECT, bool)> = self.screens.iter().map(|sc| (sc.rect, sc.fullscreen)).collect();
+        self.corners.show(&monitors);
     }
 }

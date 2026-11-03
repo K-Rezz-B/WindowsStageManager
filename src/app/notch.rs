@@ -3,18 +3,34 @@
 //! symbole de lecture. Au survol, elle s'agrandit et montre le lecteur complet.
 //! Une page peut y être accrochée (voir `pin`) : fermée, l'encoche affiche alors son cours ;
 //! ouverte, la page elle-même, en direct.
+//! Fermée, elle s'allonge aussi un instant vers le bas pour une activité (voir `activity`), et
+//! montre le compte à rebours du minuteur (voir `timer`).
+//! Ouverte, elle liste aussi les chats Claude Code ouverts (voir `claude`) : un clic sur l'un
+//! d'eux le ramène au premier plan.
 
 use super::{
+    activity::{chat_color, draw_activity, draw_marks, marks_width},
+    timer::{draw_timer, timer_width},
     dockbar::{clock_text, text_width},
     pin::parse_ticker,
     *,
 };
-use crate::{canvas::round_corners, media::filetime_now};
+use crate::{
+    canvas::round_corners,
+    claude::{now_ms, Place, Status},
+    media::filetime_now,
+};
 
 const TIMER_NOTCH_HOVER: usize = 5;
 const TIMER_NOTCH_EQ: usize = 6;
 const MENU_PIN: usize = 30;
 const MENU_UNPIN: usize = 31;
+const MENU_TIMER: usize = 40;
+const MENU_POMODORO: usize = 46;
+const MENU_TIMER_PAUSE: usize = 47;
+const MENU_TIMER_STOP: usize = 48;
+/// Durées du minuteur proposées dans le menu, en minutes, dans l'ordre des entrées.
+const TIMER_PRESETS: [u64; 5] = [5, 10, 15, 30, 60];
 
 /// Temps de survol avant l'ouverture : passer en coup de vent en haut de l'écran (vers les
 /// onglets du navigateur…) ne l'ouvre pas.
@@ -27,6 +43,10 @@ const REST: Shape = Shape { w: 190.0, h: 32.0, radius: 10.0 };
 const LIVE: Shape = Shape { w: 220.0, h: 32.0, radius: 10.0 };
 const OPEN: Shape = Shape { w: 440.0, h: 186.0, radius: 30.0 };
 const EMPTY: Shape = Shape { w: 320.0, h: 84.0, radius: 24.0 };
+/// Hauteur de l'encoche fermée pendant une activité (volume, batterie…) : une bande de plus
+/// sous l'heure. Sa largeur reste celle de l'encoche fermée, pour ne pas toucher aux barres.
+const ACTIVITY_H: f32 = 68.0;
+const ACTIVITY_RADIUS: f32 = 18.0;
 /// Zone de dépôt, quand on fait glisser une fenêtre vers le haut de l'écran : elle invite à la
 /// lâcher, puis grandit quand la fenêtre est dessus.
 const DROP: Shape = Shape { w: 300.0, h: 62.0, radius: 22.0 };
@@ -43,6 +63,11 @@ const CHART_W: f32 = 520.0;
 const CHART_H: (f32, f32) = (200.0, 420.0);
 const CHART_PAD: f32 = 16.0;
 const CHART_TOP: f32 = 40.0;
+/// Chats Claude Code dans l'encoche ouverte : hauteur d'une ligne, marge sous la liste, et
+/// nombre de lignes au plus.
+const CHAT_ROW: f32 = 44.0;
+const CHAT_PAD: f32 = 10.0;
+pub(super) const CHAT_MAX: usize = 6;
 /// Hausse et baisse du cours, aux couleurs d'Apple.
 const UP: COLORREF = rgb(48, 209, 88);
 const DOWN: COLORREF = rgb(255, 69, 58);
@@ -79,6 +104,8 @@ enum Control {
     Previous,
     PlayPause,
     Next,
+    /// Une ligne de la liste des chats Claude Code.
+    Chat(usize),
 }
 
 /// Emplacement des éléments du lecteur dans l'encoche ouverte.
@@ -387,22 +414,30 @@ impl App {
         let k = n.dpi as f32 / 96.0;
         let mut closed = if playing { LIVE } else { REST };
         let ticker = self.ticker_width(s);
-        if ticker > 0 {
-            // L'heure à gauche, le cours à droite (avant le symbole de lecture). Arrondie, la
-            // largeur ne suit pas chaque petit mouvement du cours.
+        let marks = marks_width(&self.activity.marks(), k);
+        let timer = self.timer_view().map_or(0, |v| timer_width(&v, n.font_time, k));
+        if ticker > 0 || marks > 0 || timer > 0 {
+            // L'heure à gauche, le cours et les marques à droite (avant le symbole de lecture).
+            // Arrondie, la largeur ne suit pas chaque petit mouvement du cours.
             let (time, _) = clock_text();
             let px = |v: i32| n.s(v);
             let play = if playing { px(20) } else { 0 };
-            let w = (px(16) + text_width(n.font_time, &time) + px(18) + ticker + px(16) + play) as f32 / k;
+            let parts = [ticker, timer, marks];
+            let gaps = px(10) * (parts.iter().filter(|&&w| w > 0).count() as i32 - 1).max(0);
+            let w = (px(16) + text_width(n.font_time, &time) + px(18) + parts.iter().sum::<i32>() + gaps + px(16) + play) as f32 / k;
             closed.w = closed.w.max((w / 16.0).ceil() * 16.0);
         }
+        // Le lecteur, puis les chats, puis la page accrochée.
+        let chats = self.chats_height();
+        let list = media || chats > 0.0;
+        let top = self.chats_top() + chats;
         let open = match self.pin_chart_size() {
             Some((w, h)) => Shape {
-                w: (w + 2.0 * CHART_PAD).max(if media { OPEN.w } else { 0.0 }),
-                h: if media { OPEN.h } else { CHART_TOP } + h + CHART_PAD,
+                w: (w + 2.0 * CHART_PAD).max(if list { OPEN.w } else { 0.0 }),
+                h: top + h + CHART_PAD,
                 radius: OPEN.radius,
             },
-            None if media => OPEN,
+            None if list => Shape { h: top, ..OPEN },
             None => EMPTY,
         };
         (closed, open)
@@ -419,11 +454,13 @@ impl App {
     fn retarget_notch(&mut self, s: usize) {
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
         let (closed, open) = self.notch_shapes(s);
+        let activity = self.activity.active && self.activity.current.is_some();
         let n = &mut self.screens[s].notch;
         let target = match n.drop {
             Some(DropZone::Near { .. }) => DROP,
             Some(_) => DROP_HOT,
             None if n.open => open,
+            None if activity => Shape { w: closed.w.max(LIVE.w), h: ACTIVITY_H, radius: ACTIVITY_RADIUS },
             None => closed,
         };
         if target != n.target {
@@ -496,8 +533,12 @@ impl App {
         let np = self.now_playing.as_ref();
         let (_, full) = self.notch_shapes(s);
         let pinned = self.pin_shown();
+        // L'encoche passe par une activité (elle y va, ou en revient) : la bande de l'activité
+        // n'est pas un début d'ouverture.
+        let activity = n.target.h == ACTIVITY_H || (n.start.is_some() && n.from.h == ACTIVITY_H);
+        let base = if activity { ACTIVITY_H } else { REST.h };
         // 0 au repos, 1 ouverte.
-        let opened = ((shape.h - REST.h) / (full.h - REST.h)).clamp(0.0, 1.0);
+        let opened = ((shape.h - base) / (full.h - base)).clamp(0.0, 1.0);
         let playing = np.is_some_and(|np| np.playing);
         let white = (255, 255, 255);
         let art = n.art.as_ref().map(|a| Rc::clone(&a.1));
@@ -531,10 +572,13 @@ impl App {
             let band = px(REST.h as i32);
             let live = if playing { ((shape.w - REST.w) / (LIVE.w - REST.w)).clamp(0.0, 1.0) } else { 0.0 };
             let ticker = self.ticker_parts(s);
+            let marks = self.activity.marks();
+            let marks_w = marks_width(&marks, k);
             let (time, _) = clock_text();
             let tw = text_width(n.font_time, &time);
             let middle = (r.left + r.right - tw) / 2;
-            let slide = if ticker.is_empty() { live } else { 1.0 };
+            let timer = self.timer_view();
+            let slide = if ticker.is_empty() && marks.is_empty() && timer.is_none() { live } else { 1.0 };
             let x = middle + ((r.left + px(16) - middle) as f32 * slide).round() as i32;
             if live > 0.0 {
                 let (cx, cy) = ((r.right - px(20)) as f32, band as f32 / 2.0);
@@ -544,8 +588,17 @@ impl App {
                 layer.fill_convex(&round_corners(&triangle, 1.5 * k), accent, (255.0 * live) as u8);
             }
             let text = RECT { left: x, top: 0, right: x + tw + px(4), bottom: band };
-            // Le cours, calé à droite : symbole, prix, variation.
-            let right = r.right - px(16) - (px(20) as f32 * live).round() as i32;
+            // Calés à droite : les marques (majuscules, caméra, micro), le compte à rebours, puis
+            // le cours (symbole, prix, variation).
+            let mut right = r.right - px(16) - (px(20) as f32 * live).round() as i32;
+            if marks_w > 0 {
+                draw_marks(&mut layer, &marks, right, band as f32 / 2.0, k, 255);
+                right -= marks_w + px(10);
+            }
+            if let Some(view) = &timer {
+                draw_timer(&mut layer, view, right, band, n.font_time, k);
+                right -= timer_width(view, n.font_time, k) + px(10);
+            }
             let start = right - ticker.iter().map(|p| p.3).sum::<i32>() - px(6) * (ticker.len() as i32 - 1).max(0);
             layer.gdi(|dc| unsafe {
                 SetBkMode(dc, TRANSPARENT);
@@ -562,6 +615,18 @@ impl App {
             canvas.overlay_inside(&layer, closed);
         }
 
+        // Activité : sous l'heure, à mesure que l'encoche s'allonge.
+        if let (true, Some(current)) = (activity, &self.activity.current) {
+            let lift = ((shape.h - REST.h) / (ACTIVITY_H - REST.h)).clamp(0.0, 1.0) * closed;
+            let shown = ((lift - 0.4) / 0.6).clamp(0.0, 1.0);
+            if shown > 0.0 {
+                let mut layer = Canvas::new(size.cx, size.cy);
+                let row = RECT { left: r.left + px(16), top: px(REST.h as i32), right: r.right - px(16), bottom: px(ACTIVITY_H as i32) - px(8) };
+                draw_activity(&mut layer, row, current, n.font_artist, n.font_time, k);
+                canvas.overlay_inside(&layer, shown);
+            }
+        }
+
         // Encoche ouverte : le lecteur complet, qui apparaît en fin d'ouverture.
         let content = ((opened - 0.7) / 0.3).clamp(0.0, 1.0);
         let mut thumb = None;
@@ -569,8 +634,8 @@ impl App {
             let mut layer = Canvas::new(size.cx, size.cy);
             let centered = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
             match np {
-                // Rien à lire : la page accrochée occupe toute l'encoche.
-                None if pinned => {}
+                // Rien à lire : les chats et la page accrochée occupent toute l'encoche.
+                None if pinned || !self.activity.chats.is_empty() => {}
                 None => {
                     let text = RECT { top: r.top + px(28), bottom: r.bottom - px(6), ..r };
                     layer.gdi(|dc| unsafe {
@@ -622,10 +687,12 @@ impl App {
                     });
                 }
             }
-            // La page accrochée, sous le lecteur. Sa miniature DWM se pose par-dessus une fois
-            // l'encoche dessinée ; fermée, la page laisse place à une invitation à la rouvrir.
+            self.draw_chats(&mut layer, s, r);
+            // La page accrochée, sous le lecteur et les chats. Sa miniature DWM se pose par-dessus
+            // une fois l'encoche dessinée ; fermée, la page laisse place à une invitation à la
+            // rouvrir.
             if pinned {
-                let top = if np.is_some() { OPEN.h } else { CHART_TOP };
+                let top = self.chats_top() + self.chats_height();
                 let pad = px(CHART_PAD as i32);
                 let area = RECT { left: r.left + pad, top: r.top + px(top as i32), right: r.right - pad, bottom: r.bottom - pad };
                 match self.pin_source() {
@@ -652,6 +719,94 @@ impl App {
         canvas.present(n.hwnd, pos);
         self.screens[s].notch.window = RECT { left: pos.x, top: pos.y, right: pos.x + size.cx, bottom: pos.y + size.cy };
         self.place_notch_thumb(s, thumb);
+    }
+
+    // --- Chats Claude Code -------------------------------------------------------------
+
+    /// Hauteur de la liste des chats dans l'encoche ouverte, en pixels à 100 %.
+    fn chats_height(&self) -> f32 {
+        match self.activity.chats.len().min(CHAT_MAX) {
+            0 => 0.0,
+            n => n as f32 * CHAT_ROW + CHAT_PAD,
+        }
+    }
+
+    /// Haut de la liste des chats, en pixels à 100 % : sous le lecteur, ou sous la bande de
+    /// l'encoche fermée.
+    fn chats_top(&self) -> f32 {
+        if self.now_playing.is_some() {
+            OPEN.h
+        } else {
+            CHART_TOP
+        }
+    }
+
+    /// Une ligne par chat, dans l'encoche ouverte `r`.
+    fn chat_rows(&self, s: usize, r: RECT) -> Vec<RECT> {
+        let k = self.screens[s].notch.dpi as f32 / 96.0;
+        let px = |v: f32| (v * k).round() as i32;
+        let top = r.top + px(self.chats_top());
+        (0..self.activity.chats.len().min(CHAT_MAX))
+            .map(|i| RECT {
+                left: r.left + px(12.0),
+                top: top + px(i as f32 * CHAT_ROW),
+                right: r.right - px(12.0),
+                bottom: top + px((i + 1) as f32 * CHAT_ROW),
+            })
+            .collect()
+    }
+
+    /// La liste des chats : pastille, nom, projet et depuis quand, et l'état en clair.
+    fn draw_chats(&self, layer: &mut Canvas, s: usize, r: RECT) {
+        let rows = self.chat_rows(s, r);
+        let Some(first) = rows.first() else { return };
+        let n = &self.screens[s].notch;
+        let px = |v: i32| n.s(v);
+        if self.now_playing.is_some() {
+            // Un filet sépare le lecteur des chats.
+            let y = first.top - px(2);
+            layer.round_rect(RECT { left: r.left + px(24), top: y, right: r.right - px(24), bottom: y + px(1).max(1) }, 0, (255, 255, 255), 28);
+        }
+        let now = now_ms();
+        let line = DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+        let mut texts = Vec::new();
+        for (i, (row, chat)) in rows.iter().zip(&self.activity.chats).enumerate() {
+            if n.hover_control == Some(Control::Chat(i)) {
+                layer.round_rect(*row, px(12), (255, 255, 255), 22);
+            }
+            let color = chat_color(chat.status);
+            let (cy, d) = ((row.top + row.bottom) / 2, px(8));
+            let dot = RECT { left: row.left + px(12), top: cy - d / 2, right: row.left + px(12) + d, bottom: cy - d / 2 + d };
+            layer.round_rect(dot, d / 2, color, 255);
+            let label = match chat.status {
+                Status::Busy => "En cours",
+                Status::Waiting => "Question",
+                Status::Idle => "Terminé",
+            };
+            let status = RECT { left: row.right - px(88), right: row.right - px(12), ..*row };
+            let name = RECT { left: dot.right + px(12), top: row.top + px(5), right: status.left - px(8), bottom: cy + px(2) };
+            let detail = RECT { top: cy + px(1), bottom: row.bottom - px(5), ..name };
+            let place = match chat.place {
+                Place::Desktop => "Claude",
+                Place::Ssh => "SSH",
+                Place::Terminal => "Terminal",
+            };
+            // Ce que le chat attend de nous, s'il le dit ; sinon où et depuis quand.
+            let below = match &chat.detail {
+                Some(wanted) => wanted.clone(),
+                None => format!("{} · {} · {}", chat.project, place, ago(now, chat.since)),
+            };
+            texts.push((chat.name.clone(), name, n.font_title, TEXT, DT_LEFT));
+            texts.push((below, detail, n.font_small, TEXT_DIM, DT_LEFT));
+            texts.push((label.to_owned(), status, n.font_artist, rgb(color.0, color.1, color.2), DT_RIGHT));
+        }
+        layer.gdi(|dc| unsafe {
+            SetBkMode(dc, TRANSPARENT);
+            for (text, rect, font, color, align) in &texts {
+                SelectObject(dc, *font);
+                draw_text(dc, text, *rect, line | *align, *color, 0);
+            }
+        });
     }
 
     // --- Page accrochée -----------------------------------------------------------------
@@ -767,15 +922,20 @@ impl App {
 
     fn notch_control_at(&self, s: usize, pt: POINT) -> Option<Control> {
         let n = &self.screens[s].notch;
-        if !n.open || self.now_playing.is_none() {
+        if !n.open {
             return None;
         }
         let (r, _) = n.frame(n.shape(Instant::now()));
-        let l = n.layout(r);
-        [(l.previous, Control::Previous), (l.button, Control::PlayPause), (l.next, Control::Next)]
-            .into_iter()
-            .find(|&(rect, _)| contains(rect, pt))
-            .map(|(_, control)| control)
+        if self.now_playing.is_some() {
+            let l = n.layout(r);
+            let control = [(l.previous, Control::Previous), (l.button, Control::PlayPause), (l.next, Control::Next)]
+                .into_iter()
+                .find(|&(rect, _)| contains(rect, pt));
+            if let Some((_, control)) = control {
+                return Some(control);
+            }
+        }
+        self.chat_rows(s, r).iter().position(|&row| contains(row, pt)).map(Control::Chat)
     }
 
     pub(super) fn notch_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) {
@@ -826,6 +986,20 @@ impl App {
                 }
                 Some(Control::Previous) => self.media.previous(),
                 Some(Control::Next) => self.media.next(),
+                // Un chat de la liste : il revient au premier plan, l'encoche se referme.
+                Some(Control::Chat(i)) => {
+                    if let Some(session) = self.activity.chats.get(i).map(|c| c.session.clone()) {
+                        self.set_notch_open(s, false);
+                        self.show_chat(&session);
+                    }
+                }
+                // Un chat Claude Code s'annonce : un clic le ramène.
+                None if self.claude_activity_session().is_some() => {
+                    let session = self.claude_activity_session().unwrap_or_default();
+                    self.activity.active = false;
+                    self.notch_retarget();
+                    self.show_chat(&session);
+                }
                 // Ailleurs, un clic montre la page accrochée sur cet écran (ou la regare) :
                 // l'encoche se referme pour ne pas la masquer.
                 None if self.pin_shown() => {
@@ -856,10 +1030,27 @@ pub(super) unsafe fn notch_menu(hwnd: HWND) {
     if available {
         items.push((0, PCWSTR::null()));
     }
+    // Le minuteur : sa pause et son arrêt quand il tourne, sinon ses durées et le Pomodoro.
+    match with_app(|app| app.timer_state()).flatten() {
+        Some(paused) => {
+            items.push((MENU_TIMER_PAUSE, if paused { w!("Reprendre le minuteur") } else { w!("Mettre le minuteur en pause") }));
+            items.push((MENU_TIMER_STOP, w!("Arrêter le minuteur")));
+        }
+        None => {
+            let labels = [w!("Minuteur : 5 min"), w!("Minuteur : 10 min"), w!("Minuteur : 15 min"), w!("Minuteur : 30 min"), w!("Minuteur : 1 h")];
+            items.extend(labels.into_iter().enumerate().map(|(i, label)| (MENU_TIMER + i, label)));
+            items.push((MENU_POMODORO, w!("Pomodoro (25 min + pause)")));
+        }
+    }
+    items.push((0, PCWSTR::null()));
     items.push((MENU_SETTINGS, w!("Réglages…")));
     match popup(hwnd, &items, &[]) {
         MENU_PIN => with_app(|app| app.pin_window(foreground)),
         MENU_UNPIN => with_app(App::unpin),
+        id @ MENU_TIMER..MENU_POMODORO => with_app(|app| app.start_timer(TIMER_PRESETS[id - MENU_TIMER])),
+        MENU_POMODORO => with_app(App::start_pomodoro),
+        MENU_TIMER_PAUSE => with_app(App::toggle_timer_pause),
+        MENU_TIMER_STOP => with_app(App::stop_timer),
         MENU_SETTINGS => with_app(App::open_settings),
         _ => None,
     };
@@ -1030,6 +1221,16 @@ fn accent(img: &Image) -> (u8, u8, u8) {
 }
 
 /// Durée au format « 3:07 ».
+/// Depuis quand, en clair : « à l'instant », « il y a 3 min »… (dates en millisecondes).
+fn ago(now: u64, since: u64) -> String {
+    match now.saturating_sub(since) / 1000 {
+        s if since == 0 || s < 60 => "à l'instant".to_owned(),
+        s if s < 3600 => format!("il y a {} min", s / 60),
+        s if s < 86_400 => format!("il y a {} h", s / 3600),
+        s => format!("il y a {} j", s / 86_400),
+    }
+}
+
 fn clock(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     format!("{}:{:02}", s / 60, s % 60)
@@ -1053,6 +1254,16 @@ mod tests {
         assert!(r > 200 && g < 60 && b < 60, "{r} {g} {b}");
         let black = Image { w: 4, h: 4, px: vec![0xFF_00_00_00; 16] };
         assert_eq!(accent(&black), (235, 235, 240), "une pochette noire donne du blanc");
+    }
+
+    #[test]
+    fn depuis_quand_en_clair() {
+        let now = 10_000_000_000;
+        assert_eq!(ago(now, now - 20_000), "à l'instant");
+        assert_eq!(ago(now, now - 3 * 60_000 - 5_000), "il y a 3 min");
+        assert_eq!(ago(now, now - 2 * 3_600_000), "il y a 2 h");
+        assert_eq!(ago(now, now - 3 * 86_400_000), "il y a 3 j");
+        assert_eq!(ago(now, 0), "à l'instant");
     }
 
     #[test]
